@@ -1,0 +1,67 @@
+export type NodeStatus = 'running' | 'done' | 'error' | 'stopped'
+
+export interface BoardNode {
+  id: string
+  /** parent node this one branches from; null for root nodes */
+  parentId: string | null
+  prompt: string
+  aspect: string
+  /** snapshot of the parent images this node was generated from (server /images/... urls) */
+  sourceImages: string[]
+  /** user-uploaded reference images for this node (server /images/... urls) */
+  attachments: string[]
+  /** generated outputs */
+  images: string[]
+  /** codex's one-line description(s) */
+  text: string
+  status: NodeStatus
+  error?: string
+  /** manual canvas position; auto-layout applies when absent */
+  x?: number
+  y?: number
+  createdAt: number
+  finishedAt?: number
+  usage?: Record<string, number>
+}
+
+export interface Board {
+  id: string
+  title: string
+  createdAt: number
+  nodes: BoardNode[]
+  /** ids of nodes currently generating (populated on GET) */
+  generating?: string[]
+}
+
+export interface BoardSummary {
+  id: string
+  title: string
+  createdAt: number
+  updatedAt: number
+  imageCount: number
+  lastImage: string | null
+  generating: boolean
+}
+
+export interface AttachmentUpload {
+  name: string
+  /** base64-encoded file content */
+  data: string
+}
+
+export interface NewNodesPayload {
+  prompt: string
+  parentId?: string | null
+  /** explicit source images to branch from (defaults to all parent images) */
+  sourceImages?: string[]
+  aspect: string
+  count: number
+  attachments?: AttachmentUpload[]
+}
+
+export type ServerEvent =
+  | { type: 'hello'; generating: string[] }
+  | { type: 'node'; node: BoardNode }
+  | { type: 'nodesDeleted'; ids: string[] }
+  | { type: 'activity'; nodeId: string; text: string }
+  | { type: 'done'; nodeId: string }

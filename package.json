@@ -1,0 +1,31 @@
+{
+  "name": "codeximage",
+  "version": "2.0.0",
+  "description": "Local image-generation studio: chat UI on top of Codex CLI (uses your ChatGPT subscription)",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -n server,web -c blue,magenta \"node --watch server.ts\" \"vite\"",
+    "build": "tsc --noEmit && vite build",
+    "start": "node server.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@xyflow/react": "^12.11.2",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.2",
+    "@types/node": "^26.1.0",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.3",
+    "concurrently": "^10.0.3",
+    "tailwindcss": "^4.3.2",
+    "typescript": "^6.0.3",
+    "vite": "^8.1.3"
+  },
+  "engines": {
+    "node": ">=22.7"
+  }
+}
