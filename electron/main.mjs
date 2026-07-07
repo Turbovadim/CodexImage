@@ -1,4 +1,5 @@
 import { app, BrowserWindow, nativeTheme, shell } from 'electron'
+import { execSync } from 'node:child_process'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
@@ -12,13 +13,29 @@ const ROOT = app.isPackaged
 if (app.isPackaged) {
   process.env.CODEXIMAGE_DATA = path.join(app.getPath('userData'), 'data')
 }
-const PORT = Number(process.env.PORT || 4750)
+// Packaged app gets its own port so it never attaches to (or serves) a dev
+// server's state — dev mode (4750) and the installed app (4751) stay isolated.
+const PORT = Number(process.env.PORT || (app.isPackaged ? 4751 : 4750))
+process.env.PORT = String(PORT)
 const APP_URL = `http://127.0.0.1:${PORT}`
 
-// When launched from Finder/Dock the process gets launchd's minimal PATH, and
-// the server needs to find `codex`. Extend PATH with the usual install spots.
+// When launched from Finder/Dock the process gets launchd's minimal PATH.
+// The server needs `codex` AND whatever its shebang points at (`env node`,
+// which usually lives in an nvm dir), so import the real PATH from the user's
+// login shell; fall back to common install spots if that fails.
+function loginShellPath() {
+  try {
+    const sh = process.env.SHELL || '/bin/zsh'
+    const out = execSync(`${sh} -ilc env`, { encoding: 'utf8', timeout: 4000, stdio: ['ignore', 'pipe', 'ignore'] })
+    const line = out.split('\n').find(l => l.startsWith('PATH='))
+    return line ? line.slice(5) : null
+  } catch {
+    return null
+  }
+}
 const home = os.homedir()
 process.env.PATH = [
+  loginShellPath(),
   process.env.PATH,
   `${home}/.bun/bin`,
   `${home}/.local/bin`,

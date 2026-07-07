@@ -1,17 +1,18 @@
 {
   "name": "codeximage",
   "version": "2.0.0",
-  "description": "Local image-generation studio: node-canvas UI on top of Codex CLI (uses your ChatGPT subscription)",
-  "type": "module",
   "main": "electron/main.mjs",
-  "scripts": {
-    "dev": "concurrently -n server,web -c blue,magenta \"node --watch server.ts\" \"vite\"",
-    "build": "tsc --noEmit && vite build",
-    "build:server": "esbuild server.ts --bundle --platform=node --format=esm --outfile=dist-electron/server.mjs",
-    "app": "npm run build && npm run build:server && electron .",
-    "app:dist": "npm run build && npm run build:server && electron-builder --mac dir",
-    "start": "node server.ts",
-    "typecheck": "tsc --noEmit"
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^7.2.0",
+    "@tailwindcss/vite": "^4.3.2",
+    "@types/node": "^26.1.0",
+    "concurrently": "^10.0.3",
+    "electron": "^43.1.0",
+    "electron-builder": "^26.15.3",
+    "svelte-check": "^4.7.2",
+    "tailwindcss": "^4.3.2",
+    "typescript": "^6.0.3",
+    "vite": "^8.1.3"
   },
   "build": {
     "appId": "com.yolki.codeximage",
@@ -32,25 +33,23 @@
       "icon": "buildResources/icon.icns"
     }
   },
-  "dependencies": {
-    "@xyflow/react": "^12.11.2",
-    "react": "^19.2.7",
-    "react-dom": "^19.2.7"
-  },
-  "devDependencies": {
-    "@tailwindcss/vite": "^4.3.2",
-    "@types/node": "^26.1.0",
-    "@types/react": "^19.2.17",
-    "@types/react-dom": "^19.2.3",
-    "@vitejs/plugin-react": "^6.0.3",
-    "concurrently": "^10.0.3",
-    "electron": "^43.0.0",
-    "electron-builder": "^26.15.3",
-    "tailwindcss": "^4.3.2",
-    "typescript": "^6.0.3",
-    "vite": "^8.1.3"
-  },
+  "description": "Local image-generation studio: node-canvas UI on top of Codex CLI (uses your ChatGPT subscription)",
   "engines": {
     "node": ">=22.7"
+  },
+  "scripts": {
+    "dev": "concurrently -n server,web -c blue,magenta \"node --watch server.ts\" \"vite\"",
+    "build": "svelte-check --tsconfig ./tsconfig.json && vite build",
+    "build:server": "esbuild server.ts --bundle --platform=node --format=esm --outfile=dist-electron/server.mjs",
+    "app": "npm run build && npm run build:server && electron .",
+    "app:dist": "npm run build && npm run build:server && electron-builder --mac dir",
+    "app:install": "npm run app:dist && rm -rf /Applications/CodexImage.app && cp -R release/mac-arm64/CodexImage.app /Applications/",
+    "start": "node server.ts",
+    "typecheck": "svelte-check --tsconfig ./tsconfig.json"
+  },
+  "type": "module",
+  "dependencies": {
+    "@xyflow/svelte": "^1.6.2",
+    "svelte": "^5.56.4"
   }
 }

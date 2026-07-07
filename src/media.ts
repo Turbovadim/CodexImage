@@ -8,10 +8,10 @@ export function thumbUrl(src: string): string {
   return `${src.slice(0, i + 1)}t_${src.slice(i + 1)}`
 }
 
-/** onError handler that swaps a failed thumb for the original, exactly once. */
+/** onerror handler that swaps a failed thumb for the original, exactly once. */
 export function thumbFallback(original: string) {
-  return (e: React.SyntheticEvent<HTMLImageElement>) => {
-    const img = e.currentTarget
+  return (e: Event) => {
+    const img = e.currentTarget as HTMLImageElement
     if (img.dataset.fb !== '1') {
       img.dataset.fb = '1'
       img.src = original
