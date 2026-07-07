@@ -18,3 +18,28 @@ export function thumbFallback(original: string) {
     }
   }
 }
+
+/** Copy an image to the clipboard. ClipboardItem only takes PNG, so transcode. */
+export async function copyImage(src: string): Promise<void> {
+  const blob = await fetch(src).then(r => r.blob())
+  if (blob.type === 'image/png') {
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })])
+    return
+  }
+  const bmp = await createImageBitmap(blob)
+  const canvas = document.createElement('canvas')
+  canvas.width = bmp.width
+  canvas.height = bmp.height
+  canvas.getContext('2d')!.drawImage(bmp, 0, 0)
+  const png = await new Promise<Blob>((resolve, reject) =>
+    canvas.toBlob(b => (b ? resolve(b) : reject(new Error('PNG encode failed'))), 'image/png'),
+  )
+  await navigator.clipboard.write([new ClipboardItem({ 'image/png': png })])
+}
+
+/** "870" / "12.4k" / "1.2M" */
+export function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`
+  return String(n)
+}

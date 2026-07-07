@@ -29,7 +29,7 @@ each its own branchable node.
 
 - `server.ts` — zero-dependency Node HTTP server (Node ≥ 22.7 runs TypeScript natively).
   API + SSE progress events + codex process management.
-- `src/` — React 19 + TypeScript + Tailwind 4, built with Vite.
+- `src/` — Svelte 5 (runes) + TypeScript + Tailwind 4 on @xyflow/svelte, built with Vite.
 
 ## Usage
 
@@ -65,5 +65,12 @@ npm run dev
 
 - Simple object/illustration images take ~20–40 s; photorealistic people are the slow
   path (~3–4 min per image on OpenAI's side).
+- Deleting a node moves its subtree to an in-memory trash for 5 minutes — the
+  toast's Undo restores it. Deleting a board is permanent.
+- Card thumbnails are generated with `sips`, which ships with macOS only; on other
+  platforms the app still works but loads full-size images everywhere.
 - Per-board codex event logs live in `data/logs/<board-id>.jsonl` for debugging.
+- `boards.json` is written atomically (temp file + rename); if it's ever unreadable
+  at startup, a copy is preserved as `boards.json.corrupt-<ts>` instead of being
+  overwritten.
 - `PORT` and `CODEX_BIN` env vars override the defaults (4750, `codex`).

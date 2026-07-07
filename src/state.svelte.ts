@@ -27,9 +27,15 @@ class AppState {
   lightbox = $state<{ src: string; node: BoardNode } | null>(null)
   /** node whose prompt is being edited in the modal */
   editing = $state<BoardNode | null>(null)
+  /** flat grid of every image on the board */
+  gallery = $state(false)
+  /** node the canvas should glide to (set by the gallery's locate button) */
+  focusNodeId = $state<string | null>(null)
+  toast = $state<{ text: string; action?: { label: string; fn: () => void } } | null>(null)
 
   #es: EventSource | null = null
   #activeBoardId: string | null = null
+  #toastTimer: ReturnType<typeof setTimeout> | null = null
 
   async init() {
     const list = await api.listBoards()
@@ -45,11 +51,18 @@ class AppState {
     this.#es?.close()
     const es = new EventSource(`/api/boards/${boardId}/events`)
     this.#es = es
+    // The server greets every (re)connect with 'hello'. The first one follows
+    // a fresh board fetch; later ones mean the connection dropped (server
+    // restart, sleep) and events were missed, so refetch to resync.
+    let greeted = false
     es.onmessage = e => {
       if (this.#activeBoardId !== boardId) return
       const ev: ServerEvent = JSON.parse(e.data)
       const board = this.board
-      if (ev.type === 'node') {
+      if (ev.type === 'hello') {
+        if (greeted) void this.#resync(boardId)
+        greeted = true
+      } else if (ev.type === 'node') {
         if (!board || board.id !== boardId) return
         const existing = board.nodes.find(n => n.id === ev.node.id)
         if (existing) {
@@ -76,6 +89,18 @@ class AppState {
     }
   }
 
+  /** refetch the board after a missed-events gap and drop stale activity */
+  async #resync(boardId: string) {
+    const full = await api.getBoard(boardId)
+    if (this.#activeBoardId !== boardId) return
+    this.board = full
+    const generating = new Set(full.generating ?? [])
+    for (const id of Object.keys(this.activity)) {
+      if (!generating.has(id)) delete this.activity[id]
+    }
+    void this.refreshBoards()
+  }
+
   async openBoard(id: string) {
     this.#activeBoardId = id
     const full = await api.getBoard(id)
@@ -85,6 +110,7 @@ class AppState {
     this.target = null
     this.lightbox = null
     this.editing = null
+    this.gallery = false
     this.#connectEvents(id)
   }
 
@@ -97,13 +123,36 @@ class AppState {
   async deleteBoard(id: string) {
     if (!confirm('Delete this board and its images?')) return
     await api.deleteBoard(id)
-    if (this.#activeBoardId === id) {
+    const wasActive = this.#activeBoardId === id
+    if (wasActive) {
       this.#activeBoardId = null
       this.#es?.close()
       this.board = null
       this.target = null
     }
     await this.refreshBoards()
+    if (wasActive && this.boards.length) await this.openBoard(this.boards[0].id)
+  }
+
+  async renameBoard(id: string, title: string) {
+    const t = title.trim().slice(0, 120)
+    if (!t) return
+    await api.renameBoard(id, t)
+    const summary = this.boards.find(b => b.id === id)
+    if (summary) summary.title = t
+    if (this.board?.id === id) this.board.title = t
+  }
+
+  showToast(text: string, action?: { label: string; fn: () => void }, ms = 8000) {
+    if (this.#toastTimer) clearTimeout(this.#toastTimer)
+    this.toast = { text, action }
+    this.#toastTimer = setTimeout(() => (this.toast = null), ms)
+  }
+
+  dismissToast() {
+    if (this.#toastTimer) clearTimeout(this.#toastTimer)
+    this.#toastTimer = null
+    this.toast = null
   }
 
   async send(
@@ -155,11 +204,27 @@ class AppState {
     api.regenerateNode(boardId, node.id).catch(err => alert((err as Error).message))
   }
 
-  /** update the prompt and regenerate in a fresh session */
-  edit(node: BoardNode, prompt: string) {
+  /** update the prompt (and optionally aspect) and regenerate in a fresh session */
+  edit(node: BoardNode, prompt: string, aspect?: string) {
     const boardId = this.#activeBoardId
     if (!boardId) return
-    api.regenerateNode(boardId, node.id, { prompt }).catch(err => alert((err as Error).message))
+    api.regenerateNode(boardId, node.id, { prompt, aspect }).catch(err => alert((err as Error).message))
+  }
+
+  /** branch straight from an image with a one-off prompt (lightbox quick continue) */
+  async continueFrom(node: BoardNode, src: string, text: string) {
+    const boardId = this.#activeBoardId
+    const prompt = text.trim()
+    if (!boardId || !prompt) return
+    const { nodes } = await api.addNodes(boardId, {
+      prompt,
+      parentId: node.id,
+      sourceImages: [src],
+      aspect: node.aspect,
+      count: 1,
+    })
+    if (this.board && this.board.id === boardId) this.board.nodes.push(...nodes)
+    void this.refreshBoards()
   }
 
   stop(node: BoardNode) {
@@ -168,11 +233,28 @@ class AppState {
     void api.stopNode(boardId, node.id)
   }
 
+  // No confirm: the server keeps the subtree in a trash for a few minutes,
+  // so the toast's Undo covers mistakes.
   remove(node: BoardNode) {
     const boardId = this.#activeBoardId
     if (!boardId) return
-    if (!confirm('Delete this node and all branches under it?')) return
-    api.deleteNode(boardId, node.id).catch(err => alert((err as Error).message))
+    api.deleteNode(boardId, node.id).then(({ deleted, undoId }) => {
+      this.showToast(deleted.length === 1 ? 'Node deleted' : `${deleted.length} nodes deleted`, {
+        label: 'Undo',
+        fn: () => {
+          this.dismissToast()
+          // restored nodes flow back in through SSE 'node' events
+          api.undoDelete(boardId, undoId).catch(err => alert((err as Error).message))
+        },
+      })
+    }).catch(err => alert((err as Error).message))
+  }
+
+  /** close overlays and glide the canvas to a node */
+  locateNode(id: string) {
+    this.gallery = false
+    this.lightbox = null
+    this.focusNodeId = id
   }
 
   openImage(src: string, node: BoardNode) {

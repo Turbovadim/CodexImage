@@ -16,6 +16,10 @@ export const api = {
   createBoard: () => request<Board>('POST', '/api/boards'),
   getBoard: (id: string) => request<Board>('GET', `/api/boards/${id}`),
   deleteBoard: (id: string) => request<{ ok: boolean }>('DELETE', `/api/boards/${id}`),
+  renameBoard: (id: string, title: string) =>
+    request<BoardSummary>('PATCH', `/api/boards/${id}`, { title }),
+  undoDelete: (boardId: string, undoId: string) =>
+    request<{ restored: string[] }>('POST', `/api/boards/${boardId}/undo/${undoId}`),
   addNodes: (boardId: string, payload: NewNodesPayload) =>
     request<{ nodes: BoardNode[] }>('POST', `/api/boards/${boardId}/nodes`, payload),
   regenerateNode: (boardId: string, nodeId: string, edits?: { prompt?: string; aspect?: string }) =>
@@ -23,7 +27,7 @@ export const api = {
   stopNode: (boardId: string, nodeId: string) =>
     request<{ ok: boolean }>('POST', `/api/boards/${boardId}/nodes/${nodeId}/stop`),
   deleteNode: (boardId: string, nodeId: string) =>
-    request<{ deleted: string[] }>('DELETE', `/api/boards/${boardId}/nodes/${nodeId}`),
+    request<{ deleted: string[]; undoId: string }>('DELETE', `/api/boards/${boardId}/nodes/${nodeId}`),
   moveNode: (boardId: string, nodeId: string, x: number, y: number) =>
     request<{ node: BoardNode }>('PATCH', `/api/boards/${boardId}/nodes/${nodeId}`, { x, y }),
 }

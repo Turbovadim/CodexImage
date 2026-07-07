@@ -103,9 +103,16 @@ let boards: Board[] = []
 try {
   boards = JSON.parse(fs.readFileSync(BOARDS_FILE, 'utf8'))
 } catch {
+  // Unparseable (e.g. crash mid-write) is different from missing: preserve the
+  // bytes so the boards aren't silently clobbered by the next save.
+  if (fs.existsSync(BOARDS_FILE)) {
+    const backup = `${BOARDS_FILE}.corrupt-${Date.now()}`
+    fs.copyFileSync(BOARDS_FILE, backup)
+    console.error(`boards.json is unreadable; saved a copy to ${backup}`)
+  }
   try {
     boards = migrateLegacyChats()
-    fs.writeFileSync(BOARDS_FILE, JSON.stringify(boards, null, 2))
+    writeBoardsFile()
   } catch { /* first run */ }
 }
 // A crash mid-generation leaves nodes stuck in 'running'
@@ -116,6 +123,21 @@ for (const board of boards) {
 const jobs = new Map<string, Job>() // keyed by nodeId
 const sseClients = new Map<string, Set<http.ServerResponse>>() // keyed by boardId
 
+// Deleted subtrees are held here for a grace period so the client can offer
+// Undo. Image files are untouched by node deletion (only board deletion
+// removes them), so restoring is purely reinserting the node records.
+const TRASH_TTL_MS = 5 * 60 * 1000
+interface TrashEntry { boardId: string; nodes: BoardNode[]; timer: NodeJS.Timeout }
+const trash = new Map<string, TrashEntry>() // keyed by undoId
+
+// Write-to-temp + rename so a crash mid-write can never leave boards.json
+// half-written (fs.writeFileSync alone is not atomic).
+function writeBoardsFile(): void {
+  const tmp = `${BOARDS_FILE}.tmp`
+  fs.writeFileSync(tmp, JSON.stringify(boards, null, 2))
+  fs.renameSync(tmp, BOARDS_FILE)
+}
+
 // Debounced: on large boards, image-collect polls and SSE bursts would
 // otherwise rewrite the whole JSON file many times per second.
 let saveTimer: NodeJS.Timeout | null = null
@@ -123,12 +145,12 @@ function saveBoards(): void {
   if (saveTimer) return
   saveTimer = setTimeout(() => {
     saveTimer = null
-    fs.writeFileSync(BOARDS_FILE, JSON.stringify(boards, null, 2))
+    writeBoardsFile()
   }, 400)
 }
 function flushBoards(): void {
   if (saveTimer) { clearTimeout(saveTimer); saveTimer = null }
-  fs.writeFileSync(BOARDS_FILE, JSON.stringify(boards, null, 2))
+  writeBoardsFile()
 }
 for (const sig of ['SIGINT', 'SIGTERM'] as const) {
   process.on(sig, () => { flushBoards(); process.exit(0) })
@@ -303,14 +325,17 @@ function startNodeJob(board: Board, node: BoardNode, index: number, count: numbe
   job.poller = setInterval(() => collectImages(board, node, job), POLL_MS)
   job.killer = setTimeout(() => {
     job.stopped = true
-    job.proc?.kill('SIGKILL')
+    killTree(job.proc, 'SIGKILL')
   }, JOB_TIMEOUT_MS)
 
   const promptText = buildNodePrompt(board, node, index, count)
   const args = ['exec', '-s', 'workspace-write', '-C', ws, '--json', '--skip-git-repo-check', promptText]
 
-  // stdin must be closed: codex exec waits for EOF on a piped stdin before starting
-  const proc = spawn(CODEX_BIN, args, { cwd: ws, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] })
+  // stdin must be closed: codex exec waits for EOF on a piped stdin before starting.
+  // detached puts codex in its own process group: the `codex` command is a JS
+  // shim that spawns the real binary as a child, so stopping a generation must
+  // kill the whole group — signaling just the shim leaves the worker running.
+  const proc = spawn(CODEX_BIN, args, { cwd: ws, env: process.env, stdio: ['ignore', 'pipe', 'pipe'], detached: true })
   job.proc = proc
 
   let stdoutBuf = ''
@@ -376,19 +401,34 @@ function finalizeJob(board: Board, node: BoardNode, job: Job): void {
       node.finishedAt = Date.now()
     }
     saveBoards()
-    sseSend(board.id, { type: 'node', node })
-    sseSend(board.id, { type: 'done', nodeId: node.id })
+    // The node may have been deleted while running; broadcasting it would
+    // make clients re-add it. (The object itself may live on in the trash.)
+    if (board.nodes.some(n => n.id === node.id)) {
+      sseSend(board.id, { type: 'node', node })
+      sseSend(board.id, { type: 'done', nodeId: node.id })
+    }
     job.log.end()
   }, 800)
+}
+
+// Signal the whole process group (see the detached spawn above); fall back to
+// the direct child if the group is already gone.
+function killTree(proc: ChildProcess | null, signal: NodeJS.Signals): void {
+  if (!proc?.pid) return
+  try {
+    process.kill(-proc.pid, signal)
+  } catch {
+    try { proc.kill(signal) } catch { /* already dead */ }
+  }
 }
 
 function stopJob(nodeId: string, signal: NodeJS.Signals = 'SIGTERM'): void {
   const job = jobs.get(nodeId)
   if (!job) return
   job.stopped = true
-  job.proc?.kill(signal)
+  killTree(job.proc, signal)
   if (signal === 'SIGTERM') {
-    setTimeout(() => job.proc?.kill('SIGKILL'), 3000)
+    setTimeout(() => killTree(job.proc, 'SIGKILL'), 3000)
   }
 }
 
@@ -451,6 +491,10 @@ function sendFile(res: http.ServerResponse, baseDir: string, relPath: string, fa
   })
 }
 
+function nodeTokens(usage: Record<string, number> | undefined): number {
+  return usage ? (usage.input_tokens || 0) + (usage.output_tokens || 0) : 0
+}
+
 function boardSummary(board: Board): BoardSummary {
   let lastImage: string | null = null
   let updatedAt = board.createdAt
@@ -466,6 +510,7 @@ function boardSummary(board: Board): BoardSummary {
     imageCount: board.nodes.reduce((n, node) => n + node.images.length, 0),
     lastImage,
     generating: generatingIds(board.id).length > 0,
+    totalTokens: board.nodes.reduce((s, node) => s + nodeTokens(node.usage), 0),
   }
 }
 
@@ -495,15 +540,42 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     return json(res, 200, { ...board, generating: generatingIds(board.id) })
   }
 
+  // PATCH /api/boards/:id — rename
+  if (req.method === 'PATCH' && !sub) {
+    const body = await readBody(req)
+    if (typeof body.title === 'string' && body.title.trim()) {
+      board.title = body.title.trim().slice(0, 120)
+      saveBoards()
+    }
+    return json(res, 200, boardSummary(board))
+  }
+
   if (req.method === 'DELETE' && !sub) {
     for (const id of generatingIds(board.id)) stopJob(id, 'SIGKILL')
     boards = boards.filter(b => b.id !== board.id)
+    for (const [undoId, entry] of trash) {
+      if (entry.boardId === board.id) { clearTimeout(entry.timer); trash.delete(undoId) }
+    }
     saveBoards()
     for (const dir of [path.join(IMAGES_DIR, board.id), path.join(WORKSPACES_DIR, board.id)]) {
       fs.rm(dir, { recursive: true, force: true }, () => {})
     }
     fs.rm(path.join(LOGS_DIR, `${board.id}.jsonl`), { force: true }, () => {})
     return json(res, 200, { ok: true })
+  }
+
+  // POST /api/boards/:id/undo/:undoId — restore a trashed subtree
+  if (req.method === 'POST' && sub === 'undo' && parts[4]) {
+    const entry = trash.get(parts[4])
+    if (!entry || entry.boardId !== board.id) return json(res, 404, { error: 'Nothing to undo' })
+    clearTimeout(entry.timer)
+    trash.delete(parts[4])
+    const existing = new Set(board.nodes.map(n => n.id))
+    const restored = entry.nodes.filter(n => !existing.has(n.id))
+    board.nodes.push(...restored)
+    saveBoards()
+    for (const n of restored) sseSend(board.id, { type: 'node', node: n })
+    return json(res, 200, { restored: restored.map(n => n.id) })
   }
 
   // POST /api/boards/:id/nodes — create N sibling nodes and start generating
@@ -574,7 +646,9 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
   if (req.method === 'POST' && action === 'regenerate') {
     const body = await readBody(req)
     if (jobs.has(node.id)) stopJob(node.id, 'SIGKILL')
-    if (generatingIds(board.id).length >= MAX_ACTIVE_PER_BOARD) {
+    // The killed job stays in the map until its async finalize runs, so it
+    // must not count against the limit — regenerating frees its own slot.
+    if (generatingIds(board.id).filter(id => id !== node.id).length >= MAX_ACTIVE_PER_BOARD) {
       return json(res, 429, { error: `Too many generations running on this board (max ${MAX_ACTIVE_PER_BOARD})` })
     }
     if (typeof body.prompt === 'string' && body.prompt.trim()) node.prompt = body.prompt.trim()
@@ -606,7 +680,8 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     return json(res, 200, { node })
   }
 
-  // DELETE /api/boards/:id/nodes/:nodeId — delete the node and its whole subtree
+  // DELETE /api/boards/:id/nodes/:nodeId — move the node and its whole subtree
+  // to the trash; POST /undo/:undoId restores it within TRASH_TTL_MS
   if (req.method === 'DELETE' && !action) {
     const doomed = new Set<string>([node.id])
     let grew = true
@@ -617,10 +692,17 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       }
     }
     for (const id of doomed) if (jobs.has(id)) stopJob(id, 'SIGKILL')
+    const removed = board.nodes.filter(n => doomed.has(n.id))
     board.nodes = board.nodes.filter(n => !doomed.has(n.id))
+    const undoId = crypto.randomUUID()
+    trash.set(undoId, {
+      boardId: board.id,
+      nodes: removed,
+      timer: setTimeout(() => trash.delete(undoId), TRASH_TTL_MS),
+    })
     saveBoards()
     sseSend(board.id, { type: 'nodesDeleted', ids: [...doomed] })
-    return json(res, 200, { deleted: [...doomed] })
+    return json(res, 200, { deleted: [...doomed], undoId })
   }
 
   json(res, 404, { error: 'Not found' })

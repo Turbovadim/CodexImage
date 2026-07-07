@@ -1,13 +1,26 @@
 <script lang="ts">
   import { untrack } from 'svelte'
   import { app } from '../state.svelte.ts'
-  import { thumbUrl, thumbFallback } from '../media.ts'
+  import { thumbUrl, thumbFallback, fmtTokens } from '../media.ts'
   import Icon from './Icon.svelte'
 
   let open = $state(false)
   let query = $state('')
   let rootEl: HTMLDivElement | undefined = $state()
   let searchEl: HTMLInputElement | undefined = $state()
+  let renamingId = $state<string | null>(null)
+  let renameDraft = $state('')
+
+  function startRename(id: string, title: string) {
+    renamingId = id
+    renameDraft = title
+  }
+
+  function commitRename() {
+    const id = renamingId
+    renamingId = null
+    if (id && renameDraft.trim()) void app.renameBoard(id, renameDraft)
+  }
 
   const active = $derived(app.boards.find(b => b.id === app.board?.id))
   const anyGenerating = $derived(app.boards.some(b => b.generating))
@@ -105,14 +118,39 @@
               <div class="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-md border border-line bg-bg text-[13px] text-faint">❖</div>
             {/if}
             <div class="min-w-0 flex-1">
-              <div class="truncate text-[13px]">{b.title}</div>
+              {#if renamingId === b.id}
+                <!-- svelte-ignore a11y_autofocus — the input appears on explicit rename intent -->
+                <input
+                  bind:value={renameDraft}
+                  autofocus
+                  onclick={e => e.stopPropagation()}
+                  onblur={commitRename}
+                  onkeydown={e => {
+                    e.stopPropagation()
+                    if (e.key === 'Enter') commitRename()
+                    if (e.key === 'Escape') renamingId = null
+                  }}
+                  class="w-full rounded-md border border-accent bg-bg px-1.5 py-0.5 text-[13px] text-ink outline-none"
+                />
+              {:else}
+                <div class="truncate text-[13px]" ondblclick={e => { e.stopPropagation(); startRename(b.id, b.title) }}>
+                  {b.title}
+                </div>
+              {/if}
               <div class="text-[11px] text-faint">
-                {b.imageCount} image{b.imageCount === 1 ? '' : 's'} · {timeAgo(b.updatedAt)}
+                {b.imageCount} image{b.imageCount === 1 ? '' : 's'}{b.totalTokens ? ` · ${fmtTokens(b.totalTokens)} tok` : ''} · {timeAgo(b.updatedAt)}
               </div>
             </div>
             {#if b.generating}
               <div class="size-[13px] shrink-0 animate-spin rounded-full border-2 border-line border-t-accent"></div>
             {/if}
+            <button
+              onclick={e => { e.stopPropagation(); startRename(b.id, b.title) }}
+              title="Rename board"
+              class="shrink-0 rounded-md p-1 text-faint opacity-0 group-hover:opacity-100 hover:bg-hover hover:text-ink"
+            >
+              <Icon name="pencil" size={13} />
+            </button>
             <button
               onclick={e => { e.stopPropagation(); void app.deleteBoard(b.id) }}
               title="Delete board"

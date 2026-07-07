@@ -11,6 +11,7 @@
   let attachments = $state<PendingAttachment[]>([])
   let fileInput: HTMLInputElement | undefined = $state()
   let textarea: HTMLTextAreaElement | undefined = $state()
+  let dragging = $state(false)
 
   function readAsBase64(file: File): Promise<string> {
     return new Promise(resolve => {
@@ -69,7 +70,30 @@
       else if (document.activeElement === textarea) textarea?.blur()
     }
   }}
+  ondragover={e => {
+    if (e.dataTransfer?.types.includes('Files')) {
+      e.preventDefault()
+      dragging = true
+    }
+  }}
+  ondragleave={e => {
+    if (!e.relatedTarget) dragging = false
+  }}
+  ondrop={e => {
+    e.preventDefault()
+    dragging = false
+    const files = [...(e.dataTransfer?.files ?? [])].filter(f => f.type.startsWith('image/'))
+    if (files.length) void addFiles(files)
+  }}
 />
+
+{#if dragging}
+  <div class="pointer-events-none fixed inset-0 z-40 flex items-center justify-center bg-bg/60">
+    <div class="rounded-2xl border-2 border-dashed border-accent bg-raised/90 px-8 py-6 text-[14px] text-ink shadow-[0_18px_60px_rgba(0,0,0,.55)]">
+      Drop images to attach as references
+    </div>
+  </div>
+{/if}
 
 {#snippet chip(label: string, onclick: () => void, active = false, title?: string)}
   <button

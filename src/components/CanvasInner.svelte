@@ -76,6 +76,14 @@
     untrack(() => sync(board))
   })
 
+  // Gallery/lightbox "show on canvas": glide the camera to the requested node
+  $effect(() => {
+    const id = app.focusNodeId
+    if (!id) return
+    untrack(() => (app.focusNodeId = null))
+    void fitView({ nodes: [{ id }], padding: 0.35, duration: 420, maxZoom: 1 })
+  })
+
   function sync(board: typeof app.board) {
     if (!board) {
       nodes = []

@@ -8,7 +8,7 @@
   import { Handle, Position, useViewport } from '@xyflow/svelte'
   import { app } from '../state.svelte.ts'
   import { isTyping } from '../hotkeys.ts'
-  import { thumbUrl, thumbFallback } from '../media.ts'
+  import { thumbUrl, thumbFallback, fmtTokens } from '../media.ts'
   import { CARD_W, type GenNodeData } from './layout.ts'
   import Elapsed from './Elapsed.svelte'
   import Icon, { type IconName } from './Icon.svelte'
@@ -22,6 +22,7 @@
   const date = $derived(
     new Date(bn.createdAt).toLocaleDateString(undefined, { day: '2-digit', month: '2-digit', year: '2-digit' }),
   )
+  const tokens = $derived((bn.usage?.input_tokens || 0) + (bn.usage?.output_tokens || 0))
 
   let copied = $state(false)
   let height = $state(0)
@@ -271,7 +272,7 @@
       <div class="flex items-center gap-2 px-4 py-2.5 text-[10.5px] text-faint">
         <span class="min-w-0 flex-1 truncate" title={bn.text}>{bn.text || 'Done'}</span>
         <span class="shrink-0">
-          codex{bn.finishedAt ? ` · ${Math.round((bn.finishedAt - bn.createdAt) / 1000)}s` : ''}
+          codex{bn.finishedAt ? ` · ${Math.round((bn.finishedAt - bn.createdAt) / 1000)}s` : ''}{tokens ? ` · ${fmtTokens(tokens)} tok` : ''}
         </span>
       </div>
     {/if}

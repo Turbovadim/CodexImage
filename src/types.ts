@@ -41,6 +41,8 @@ export interface BoardSummary {
   imageCount: number
   lastImage: string | null
   generating: boolean
+  /** input+output tokens summed over all nodes */
+  totalTokens: number
 }
 
 export interface AttachmentUpload {
