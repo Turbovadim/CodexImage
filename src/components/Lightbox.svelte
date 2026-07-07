@@ -21,6 +21,7 @@
 
   let copied = $state(false)
   let continueText = $state('')
+  let ctxMenu = $state<{ x: number; y: number } | null>(null)
 
   // ---------------------------------------------------------------------------
   // Zoom & pan: scroll to zoom toward the cursor, drag to pan when zoomed,
@@ -42,6 +43,7 @@
     scale = 1
     tx = 0
     ty = 0
+    ctxMenu = null
   })
 
   // (px, py) = cursor offset from the stage center; keep that image point fixed
@@ -68,7 +70,25 @@
     zoomAt(px, py, scale > 1 ? 1 : 2.5)
   }
 
+  function onContextMenu(e: MouseEvent) {
+    e.preventDefault()
+    // keep the menu inside the viewport when invoked near an edge
+    const W = 200
+    const H = 190
+    ctxMenu = {
+      x: Math.min(e.clientX, window.innerWidth - W - 8),
+      y: Math.min(e.clientY, window.innerHeight - H - 8),
+    }
+  }
+
+  let suppressClick = false
+
   function onPointerDown(e: PointerEvent) {
+    if (ctxMenu) {
+      ctxMenu = null
+      suppressClick = true // dismissing the menu must not also close the lightbox
+    }
+    if (e.button !== 0) return
     panning = true
     moved = false
     lastX = e.clientX
@@ -93,6 +113,10 @@
 
   // A plain click (no pan, not zoomed) closes, matching the old behavior
   function onStageClick() {
+    if (suppressClick) {
+      suppressClick = false
+      return
+    }
     if (scale === 1 && !moved) onClose()
     moved = false
   }
@@ -109,6 +133,13 @@
     }).catch(() => {})
   }
 
+  function menuCopy() {
+    ctxMenu = null
+    copyImage(src)
+      .then(() => app.showToast('Image copied', undefined, 2000))
+      .catch(() => app.showToast('Copy failed', undefined, 2000))
+  }
+
   function submitContinue() {
     const text = continueText.trim()
     if (!text) return
@@ -122,6 +153,7 @@
   onkeydown={e => {
     if (e.key === 'Escape') {
       if (isTyping(e)) (e.target as HTMLElement).blur()
+      else if (ctxMenu) ctxMenu = null
       else onClose()
     } else if (isTyping(e)) {
       return
@@ -165,6 +197,7 @@
   onclick={onStageClick}
   onwheel={onWheel}
   ondblclick={onDblClick}
+  oncontextmenu={onContextMenu}
   onpointerdown={onPointerDown}
   onpointermove={onPointerMove}
   onpointerup={onPointerUp}
@@ -198,6 +231,38 @@
   {#if scale > 1}
     <div class="absolute bottom-5 left-5 rounded-lg border border-line bg-raised/80 px-2.5 py-1 text-[11.5px] text-dim backdrop-blur-md">
       {Math.round(scale * 100)}%
+    </div>
+  {/if}
+
+  {#if ctxMenu}
+    {#snippet menuItem(label: string, icon: IconName, opts: { onclick?: () => void; href?: string; download?: boolean; newTab?: boolean })}
+      {@const cls = 'flex w-full items-center gap-2.5 px-3 py-2 text-left text-[12.5px] text-ink hover:bg-hover'}
+      {#if opts.href}
+        <a href={opts.href} download={opts.download} target={opts.newTab ? '_blank' : undefined} rel="noopener" class={cls} onclick={() => (ctxMenu = null)}>
+          <Icon name={icon} size={13} class="text-dim" /> {label}
+        </a>
+      {:else}
+        <button onclick={opts.onclick} class={cls}>
+          <Icon name={icon} size={13} class="text-dim" /> {label}
+        </button>
+      {/if}
+    {/snippet}
+    <div
+      onclick={e => e.stopPropagation()}
+      onpointerdown={e => e.stopPropagation()}
+      ondblclick={e => e.stopPropagation()}
+      oncontextmenu={e => { e.preventDefault(); e.stopPropagation() }}
+      style="left: {ctxMenu.x}px; top: {ctxMenu.y}px"
+      class="absolute z-10 w-[200px] overflow-hidden rounded-xl border border-line bg-raised/95 py-1 shadow-[0_18px_60px_rgba(0,0,0,.55)] backdrop-blur-md"
+    >
+      {@render menuItem('Copy image', 'copy', { onclick: menuCopy })}
+      {@render menuItem('Download', 'download', { href: src, download: true })}
+      {@render menuItem('Open original', 'external', { href: src, newTab: true })}
+      <div class="my-1 border-t border-line"></div>
+      {@render menuItem('Show on canvas', 'locate', { onclick: () => app.locateNode(node.id) })}
+      {#if onBranch}
+        {@render menuItem('Branch from this image', 'branch', { onclick: branch })}
+      {/if}
     </div>
   {/if}
 
