@@ -98,6 +98,9 @@
     } else if (e.key.toLowerCase() === 'r') {
       e.preventDefault()
       app.regenerate(bn)
+    } else if (e.key.toLowerCase() === 'b') {
+      e.preventDefault()
+      app.branch(bn)
     }
   }}
 />
@@ -131,7 +134,7 @@
     {#if running}
       {@render toolButton('Stop generation', 'stop', () => app.stop(bn), { danger: true, text: 'Stop' })}
     {:else}
-      {@render toolButton('Branch from this node', 'branch', () => app.branch(bn), { text: 'Branch' })}
+      {@render toolButton('Branch from this node (B)', 'branch', () => app.branch(bn), { text: 'Branch' })}
       {@render toolButton('Edit prompt & regenerate (E)', 'pencil', () => (app.editing = bn))}
       {@render toolButton('Regenerate (new session, same prompt) (R)', 'refresh', () => app.regenerate(bn))}
     {/if}
