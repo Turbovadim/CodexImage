@@ -31,7 +31,7 @@ class AppState {
   gallery = $state(false)
   /** node the canvas should glide to (set by the gallery's locate button) */
   focusNodeId = $state<string | null>(null)
-  toast = $state<{ text: string; action?: { label: string; fn: () => void } } | null>(null)
+  toast = $state<{ text: string; action?: { label: string; fn: () => void }; error?: boolean } | null>(null)
 
   #es: EventSource | null = null
   #activeBoardId: string | null = null
@@ -120,8 +120,8 @@ class AppState {
     await this.openBoard(created.id)
   }
 
+  /** permanent — callers must confirm intent first (armed delete button) */
   async deleteBoard(id: string) {
-    if (!confirm('Delete this board and its images?')) return
     await api.deleteBoard(id)
     const wasActive = this.#activeBoardId === id
     if (wasActive) {
@@ -147,6 +147,14 @@ class AppState {
     if (this.#toastTimer) clearTimeout(this.#toastTimer)
     this.toast = { text, action }
     this.#toastTimer = setTimeout(() => (this.toast = null), ms)
+  }
+
+  // Native alert()/confirm() are banned: in Electron they block the renderer
+  // and are prone to leaving the window unresponsive after dismissal.
+  showError(err: unknown) {
+    if (this.#toastTimer) clearTimeout(this.#toastTimer)
+    this.toast = { text: (err as Error).message || 'Something went wrong', error: true }
+    this.#toastTimer = setTimeout(() => (this.toast = null), 8000)
   }
 
   dismissToast() {
@@ -201,14 +209,14 @@ class AppState {
   regenerate(node: BoardNode) {
     const boardId = this.#activeBoardId
     if (!boardId) return
-    api.regenerateNode(boardId, node.id).catch(err => alert((err as Error).message))
+    api.regenerateNode(boardId, node.id).catch(err => this.showError(err))
   }
 
   /** update the prompt (and optionally aspect) and regenerate in a fresh session */
   edit(node: BoardNode, prompt: string, aspect?: string) {
     const boardId = this.#activeBoardId
     if (!boardId) return
-    api.regenerateNode(boardId, node.id, { prompt, aspect }).catch(err => alert((err as Error).message))
+    api.regenerateNode(boardId, node.id, { prompt, aspect }).catch(err => this.showError(err))
   }
 
   /** branch straight from an image with a one-off prompt (lightbox quick continue) */
@@ -244,10 +252,10 @@ class AppState {
         fn: () => {
           this.dismissToast()
           // restored nodes flow back in through SSE 'node' events
-          api.undoDelete(boardId, undoId).catch(err => alert((err as Error).message))
+          api.undoDelete(boardId, undoId).catch(err => this.showError(err))
         },
       })
-    }).catch(err => alert((err as Error).message))
+    }).catch(err => this.showError(err))
   }
 
   /** close overlays and glide the canvas to a node */

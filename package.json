@@ -43,7 +43,7 @@
     "build:server": "esbuild server.ts --bundle --platform=node --format=esm --outfile=dist-electron/server.mjs",
     "app": "npm run build && npm run build:server && electron .",
     "app:dist": "npm run build && npm run build:server && electron-builder --mac dir",
-    "app:install": "npm run app:dist && rm -rf /Applications/CodexImage.app && cp -R release/mac-arm64/CodexImage.app /Applications/",
+    "app:install": "npm run app:dist && (osascript -e 'tell application \"CodexImage\" to quit' >/dev/null 2>&1; sleep 1; true) && rm -rf /Applications/CodexImage.app && cp -R release/mac-arm64/CodexImage.app /Applications/ && open /Applications/CodexImage.app",
     "start": "node server.ts",
     "typecheck": "svelte-check --tsconfig ./tsconfig.json"
   },

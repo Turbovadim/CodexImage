@@ -52,7 +52,7 @@
     try {
       await app.send(trimmed, { aspect, count }, toSend)
     } catch (err) {
-      alert((err as Error).message)
+      app.showError(err)
       app.draft = trimmed
       attachments = toSend
     }

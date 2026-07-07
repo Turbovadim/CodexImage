@@ -10,6 +10,20 @@
   let searchEl: HTMLInputElement | undefined = $state()
   let renamingId = $state<string | null>(null)
   let renameDraft = $state('')
+  // Two-step delete instead of confirm(): native dialogs freeze Electron windows
+  let armedDeleteId = $state<string | null>(null)
+  let armTimer: ReturnType<typeof setTimeout> | undefined
+
+  function requestDelete(id: string) {
+    clearTimeout(armTimer)
+    if (armedDeleteId === id) {
+      armedDeleteId = null
+      void app.deleteBoard(id)
+    } else {
+      armedDeleteId = id
+      armTimer = setTimeout(() => (armedDeleteId = null), 3000)
+    }
+  }
 
   function startRename(id: string, title: string) {
     renamingId = id
@@ -152,11 +166,18 @@
               <Icon name="pencil" size={13} />
             </button>
             <button
-              onclick={e => { e.stopPropagation(); void app.deleteBoard(b.id) }}
-              title="Delete board"
-              class="shrink-0 rounded-md p-1 text-faint opacity-0 group-hover:opacity-100 hover:bg-danger/10 hover:text-danger"
+              onclick={e => { e.stopPropagation(); requestDelete(b.id) }}
+              title={armedDeleteId === b.id ? 'Click again to permanently delete' : 'Delete board'}
+              class="shrink-0 rounded-md p-1
+                {armedDeleteId === b.id
+                  ? 'bg-danger/15 text-danger opacity-100'
+                  : 'text-faint opacity-0 group-hover:opacity-100 hover:bg-danger/10 hover:text-danger'}"
             >
-              <Icon name="trash" size={13} />
+              {#if armedDeleteId === b.id}
+                <span class="px-0.5 text-[11px] font-medium">Sure?</span>
+              {:else}
+                <Icon name="trash" size={13} />
+              {/if}
             </button>
           </div>
         {/each}

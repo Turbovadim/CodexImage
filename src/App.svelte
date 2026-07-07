@@ -109,8 +109,9 @@
   {#if app.toast}
     {@const toast = app.toast}
     <div
-      class="fixed top-5 left-1/2 z-[60] flex -translate-x-1/2 items-center gap-3 rounded-xl border border-line
-        bg-raised/95 py-2 pr-2 pl-4 text-[13px] text-ink shadow-[0_18px_60px_rgba(0,0,0,.55)] backdrop-blur-md"
+      class="fixed top-5 left-1/2 z-[60] flex -translate-x-1/2 items-center gap-3 rounded-xl border
+        bg-raised/95 py-2 pr-2 pl-4 text-[13px] shadow-[0_18px_60px_rgba(0,0,0,.55)] backdrop-blur-md
+        {toast.error ? 'border-danger/50 text-danger' : 'border-line text-ink'}"
     >
       <span>{toast.text}</span>
       {#if toast.action}

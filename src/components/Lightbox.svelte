@@ -144,7 +144,7 @@
     const text = continueText.trim()
     if (!text) return
     continueText = ''
-    void app.continueFrom(node, src, text).catch(err => alert((err as Error).message))
+    void app.continueFrom(node, src, text).catch(err => app.showError(err))
     onClose()
   }
 </script>
