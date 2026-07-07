@@ -1,4 +1,16 @@
-data/
-dist/
+# dependencies
 node_modules/
+
+# build outputs
+dist/
+dist-electron/
+release/
+
+# user data: boards, generated images, logs, codex workspaces
+data/
+
+# environment & OS noise
+.env
+.env.*
 .DS_Store
+*.log

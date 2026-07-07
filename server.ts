@@ -7,9 +7,11 @@ import crypto from 'node:crypto'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import type { Board, BoardNode, BoardSummary, ServerEvent } from './src/types.ts'
 
-const ROOT = import.meta.dirname
+// Overridable because the Electron build runs a bundled copy from dist-electron/,
+// and the packaged app keeps its data in ~/Library/Application Support.
+const ROOT = process.env.CODEXIMAGE_ROOT || import.meta.dirname
 const DIST_DIR = path.join(ROOT, 'dist')
-const DATA_DIR = path.join(ROOT, 'data')
+const DATA_DIR = process.env.CODEXIMAGE_DATA || path.join(ROOT, 'data')
 const BOARDS_FILE = path.join(DATA_DIR, 'boards.json')
 const LEGACY_CHATS_FILE = path.join(DATA_DIR, 'chats.json')
 const IMAGES_DIR = path.join(DATA_DIR, 'images')

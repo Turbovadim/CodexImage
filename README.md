@@ -37,7 +37,17 @@ each its own branchable node.
 bun install        # or npm install
 npm run build      # typecheck + build frontend to dist/
 npm start          # serve app + API on http://localhost:4750
+npm run app        # desktop app: builds everything and opens an Electron window
+npm run app:dist   # package a standalone CodexImage.app into release/mac-arm64/
 ```
+
+The Electron app runs the same API server inside its main process (bundled to
+`dist-electron/server.mjs` via esbuild). In dev mode it shares the project's
+`data/`; the packaged app keeps its data in
+`~/Library/Application Support/CodexImage/data`. If a server is already running
+on port 4750 (e.g. `npm run dev`), the app reuses it instead of starting its
+own — handy for developing the UI with HMR (note that it then also uses that
+server's data directory).
 
 Development (Vite dev server on :5173 with HMR, proxying to the API):
 

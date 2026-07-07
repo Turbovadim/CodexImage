@@ -1,13 +1,36 @@
 {
   "name": "codeximage",
   "version": "2.0.0",
-  "description": "Local image-generation studio: chat UI on top of Codex CLI (uses your ChatGPT subscription)",
+  "description": "Local image-generation studio: node-canvas UI on top of Codex CLI (uses your ChatGPT subscription)",
   "type": "module",
+  "main": "electron/main.mjs",
   "scripts": {
     "dev": "concurrently -n server,web -c blue,magenta \"node --watch server.ts\" \"vite\"",
     "build": "tsc --noEmit && vite build",
+    "build:server": "esbuild server.ts --bundle --platform=node --format=esm --outfile=dist-electron/server.mjs",
+    "app": "npm run build && npm run build:server && electron .",
+    "app:dist": "npm run build && npm run build:server && electron-builder --mac dir",
     "start": "node server.ts",
     "typecheck": "tsc --noEmit"
+  },
+  "build": {
+    "appId": "com.yolki.codeximage",
+    "productName": "CodexImage",
+    "asar": false,
+    "directories": {
+      "output": "release",
+      "buildResources": "buildResources"
+    },
+    "files": [
+      "electron/**/*",
+      "dist/**/*",
+      "dist-electron/**/*",
+      "!node_modules/**"
+    ],
+    "mac": {
+      "category": "public.app-category.graphics-design",
+      "icon": "buildResources/icon.icns"
+    }
   },
   "dependencies": {
     "@xyflow/react": "^12.11.2",
@@ -21,6 +44,8 @@
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.3",
     "concurrently": "^10.0.3",
+    "electron": "^43.0.0",
+    "electron-builder": "^26.15.3",
     "tailwindcss": "^4.3.2",
     "typescript": "^6.0.3",
     "vite": "^8.1.3"
