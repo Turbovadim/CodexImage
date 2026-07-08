@@ -59,6 +59,8 @@ export interface NewNodesPayload {
   aspect: string
   count: number
   attachments?: AttachmentUpload[]
+  /** existing board image urls to reuse as attachments (duplicate) */
+  attachmentUrls?: string[]
 }
 
 export type ServerEvent =

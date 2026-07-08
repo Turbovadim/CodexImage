@@ -1,6 +1,7 @@
 <script lang="ts">
   import { untrack } from 'svelte'
   import { app } from '../state.svelte.ts'
+  import { isKey } from '../hotkeys.ts'
   import { thumbUrl, thumbFallback, fmtTokens } from '../media.ts'
   import Icon from './Icon.svelte'
 
@@ -74,7 +75,7 @@
 
 <svelte:window
   onkeydown={e => {
-    if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'k') {
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && isKey(e, 'k')) {
       e.preventDefault()
       open = !open
     }
@@ -105,7 +106,7 @@
           bind:this={searchEl}
           bind:value={query}
           placeholder="Search boards…"
-          class="w-full rounded-lg border border-line bg-bg px-3 py-2 text-[13px] text-ink outline-none placeholder:text-faint focus:border-accent"
+          class="w-full rounded-lg border border-line bg-bg px-3 py-2 text-[13px] text-ink outline-none placeholder:text-dim focus:border-accent"
         />
       </div>
 

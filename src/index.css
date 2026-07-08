@@ -9,7 +9,7 @@
   --color-dim: #8b90a0;
   --color-faint: #5a5f6e;
   --color-accent: #7c8cff;
-  --color-accent-strong: #6272ff;
+  --color-accent-strong: #5666f7; /* darkest shade that keeps white label text ≥4.5:1 */
   --color-danger: #ff6b6b;
   --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
   --animate-shimmer: shimmer 1.6s infinite;

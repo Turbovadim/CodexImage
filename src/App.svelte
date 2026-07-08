@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import { app } from './state.svelte.ts'
-  import { isTyping } from './hotkeys.ts'
+  import { isKey, isTyping } from './hotkeys.ts'
   import BoardSwitcher from './components/BoardSwitcher.svelte'
   import Canvas from './components/Canvas.svelte'
   import Composer from './components/Composer.svelte'
@@ -30,7 +30,7 @@
 <svelte:window
   onkeydown={e => {
     if (e.metaKey || e.ctrlKey || e.altKey || isTyping(e)) return
-    if (e.key.toLowerCase() === 'g' && !app.lightbox && !app.editing && hasImages) {
+    if (isKey(e, 'g') && !app.lightbox && !app.editing && hasImages) {
       e.preventDefault()
       app.gallery = !app.gallery
     }

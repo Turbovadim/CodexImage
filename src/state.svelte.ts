@@ -212,6 +212,26 @@ class AppState {
     api.regenerateNode(boardId, node.id).catch(err => this.showError(err))
   }
 
+  /** run the same prompt again as a new sibling node (same parent, sources and attachments) */
+  async duplicate(node: BoardNode) {
+    const boardId = this.#activeBoardId
+    if (!boardId) return
+    try {
+      const { nodes } = await api.addNodes(boardId, {
+        prompt: node.prompt,
+        parentId: node.parentId,
+        sourceImages: node.sourceImages,
+        aspect: node.aspect,
+        count: 1,
+        attachmentUrls: node.attachments,
+      })
+      if (this.board && this.board.id === boardId) this.board.nodes.push(...nodes)
+      void this.refreshBoards()
+    } catch (err) {
+      this.showError(err)
+    }
+  }
+
   /** update the prompt (and optionally aspect) and regenerate in a fresh session */
   edit(node: BoardNode, prompt: string, aspect?: string) {
     const boardId = this.#activeBoardId

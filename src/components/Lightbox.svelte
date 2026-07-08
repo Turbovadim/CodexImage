@@ -1,6 +1,6 @@
 <script lang="ts">
   import { app } from '../state.svelte.ts'
-  import { isTyping } from '../hotkeys.ts'
+  import { isKey, isTyping } from '../hotkeys.ts'
   import { copyImage } from '../media.ts'
   import type { BoardNode } from '../types.ts'
   import Icon, { type IconName } from './Icon.svelte'
@@ -157,7 +157,7 @@
       else onClose()
     } else if (isTyping(e)) {
       return
-    } else if (e.key.toLowerCase() === 'b' && !e.metaKey && !e.ctrlKey && onBranch) {
+    } else if (isKey(e, 'b') && !e.metaKey && !e.ctrlKey && onBranch) {
       branch()
     } else if (ARROWS[e.key]) {
       e.preventDefault()

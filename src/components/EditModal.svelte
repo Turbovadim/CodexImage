@@ -62,11 +62,11 @@
       rows={7}
       onkeydown={e => {
         e.stopPropagation()
-        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); save() }
+        if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); save() }
         if (e.key === 'Escape') close()
       }}
       class="w-full resize-none rounded-xl border border-line bg-bg px-3.5 py-2.5 text-[13.5px] leading-relaxed
-        text-ink outline-none placeholder:text-faint focus:border-accent"
+        text-ink outline-none placeholder:text-dim focus:border-accent"
     ></textarea>
 
     <div class="mt-2.5 flex gap-1.5" title="Aspect ratio">

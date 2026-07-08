@@ -6,7 +6,7 @@
   } from '@xyflow/svelte'
   import '@xyflow/svelte/dist/style.css'
   import { app } from '../state.svelte.ts'
-  import { isTyping } from '../hotkeys.ts'
+  import { isKey, isTyping } from '../hotkeys.ts'
   import { computeLayout, type GenNode } from './layout.ts'
   import GenCard from './GenCard.svelte'
 
@@ -160,7 +160,7 @@
 <svelte:window
   onkeydown={e => {
     if (e.metaKey || e.ctrlKey || e.altKey || isTyping(e)) return
-    if (e.key.toLowerCase() === 'f') {
+    if (isKey(e, 'f')) {
       e.preventDefault()
       void fitView({ padding: 0.15, duration: 320, maxZoom: 1 })
     }

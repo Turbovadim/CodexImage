@@ -7,7 +7,7 @@
 <script lang="ts">
   import { Handle, Position, useViewport } from '@xyflow/svelte'
   import { app } from '../state.svelte.ts'
-  import { isTyping } from '../hotkeys.ts'
+  import { isKey, isTyping } from '../hotkeys.ts'
   import { thumbUrl, thumbFallback, fmtTokens } from '../media.ts'
   import { CARD_W, type GenNodeData } from './layout.ts'
   import Elapsed from './Elapsed.svelte'
@@ -90,17 +90,25 @@
 
 <svelte:window
   onkeydown={e => {
-    if (!hovered || running || app.lightbox || app.editing) return
+    if (!hovered || app.lightbox || app.editing) return
     if (e.metaKey || e.ctrlKey || e.altKey || isTyping(e)) return
-    if (e.key.toLowerCase() === 'e') {
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      e.preventDefault()
+      app.remove(bn)
+    } else if (running) {
+      return
+    } else if (isKey(e, 'e')) {
       e.preventDefault()
       app.editing = bn
-    } else if (e.key.toLowerCase() === 'r') {
+    } else if (isKey(e, 'r')) {
       e.preventDefault()
       app.regenerate(bn)
-    } else if (e.key.toLowerCase() === 'b') {
+    } else if (isKey(e, 'b')) {
       e.preventDefault()
       app.branch(bn)
+    } else if (isKey(e, 'd')) {
+      e.preventDefault()
+      void app.duplicate(bn)
     }
   }}
 />
@@ -137,6 +145,7 @@
       {@render toolButton('Branch from this node (B)', 'branch', () => app.branch(bn), { text: 'Branch' })}
       {@render toolButton('Edit prompt & regenerate (E)', 'pencil', () => (app.editing = bn))}
       {@render toolButton('Regenerate (new session, same prompt) (R)', 'refresh', () => app.regenerate(bn))}
+      {@render toolButton('Duplicate as a new sibling node (D)', 'duplicate', () => void app.duplicate(bn))}
     {/if}
     {@render toolButton('Copy prompt', copied ? 'check' : 'copy', copyPrompt)}
     {#if bn.images.length > 0}
@@ -150,7 +159,7 @@
         <Icon name="download" size={13} />
       </a>
     {/if}
-    {@render toolButton('Delete node and its branches', 'trash', () => app.remove(bn), { danger: true })}
+    {@render toolButton('Delete node and its branches (⌫)', 'trash', () => app.remove(bn), { danger: true })}
   </div>
 
   <!-- content-visibility lets the browser skip layout/paint for offscreen cards

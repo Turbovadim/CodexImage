@@ -12,6 +12,12 @@
   let fileInput: HTMLInputElement | undefined = $state()
   let textarea: HTMLTextAreaElement | undefined = $state()
   let dragging = $state(false)
+  let promptFocused = $state(false)
+
+  const canSend = $derived(app.draft.trim().length > 0)
+  // the "/" kbd badge doubles as the hotkey's only documentation — show it
+  // whenever the empty input isn't focused
+  const slashHint = $derived(!promptFocused && !app.draft)
 
   function readAsBase64(file: File): Promise<string> {
     return new Promise(resolve => {
@@ -32,6 +38,12 @@
     }
     if (added.length) attachments.push(...added)
   }
+
+  // branching (toolbar, B hotkey, lightbox) puts the composer in target mode —
+  // focus the prompt right away so the continuation can be typed immediately
+  $effect(() => {
+    if (app.target) textarea?.focus()
+  })
 
   // keep the textarea sized to its content (also when a sample fills the draft)
   $effect(() => {
@@ -62,7 +74,7 @@
 <svelte:window
   onkeydown={e => {
     if (app.editing) return
-    if (e.key === '/' && !isTyping(e) && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    if ((e.key === '/' || e.code === 'Slash') && !isTyping(e) && !e.metaKey && !e.ctrlKey && !e.altKey) {
       e.preventDefault()
       textarea?.focus()
     } else if (e.key === 'Escape' && !app.lightbox) {
@@ -184,16 +196,20 @@
       </div>
     {/if}
 
-    <div class="flex items-end gap-2.5">
+    <div class="relative flex">
       <textarea
         bind:this={textarea}
         bind:value={app.draft}
         rows={1}
+        aria-label="Prompt"
         placeholder={app.target
           ? 'Describe the change or continuation… (Enter to generate)'
           : 'Describe the image you want… (Enter to generate, Shift+Enter for a new line)'}
+        onfocus={() => (promptFocused = true)}
+        onblur={() => (promptFocused = false)}
         onkeydown={e => {
           if (e.key === 'Enter' && !e.shiftKey) {
+            if (e.isComposing) return
             e.preventDefault()
             void submit()
           }
@@ -205,15 +221,26 @@
             .filter((f): f is File => f !== null)
           if (files.length) void addFiles(files)
         }}
-        class="max-h-[160px] flex-1 resize-none rounded-xl border border-line bg-bg px-3.5 py-2.5
-          text-[14px] text-ink outline-none placeholder:text-faint focus:border-accent"
+        class="max-h-[160px] w-full resize-none bg-transparent px-0.5 py-1.5 text-[14px] text-ink
+          outline-none placeholder:text-dim {slashHint || canSend ? 'pr-8' : ''}"
       ></textarea>
-      <button
-        onclick={() => void submit()}
-        class="rounded-[10px] border border-accent-strong bg-accent-strong px-4.5 py-2.5 text-[13.5px] font-medium text-white hover:border-accent hover:bg-accent"
-      >
-        {app.target ? 'Branch' : 'Generate'}
-      </button>
+      {#if slashHint}
+        <kbd
+          class="pointer-events-none absolute top-1/2 right-1 -translate-y-1/2 rounded-md border
+            border-line px-1.5 py-px font-sans text-[11px] text-dim"
+        >/</kbd>
+      {:else if canSend}
+        <button
+          onclick={() => void submit()}
+          title="{app.target ? 'Branch' : 'Generate'} (Enter)"
+          aria-label={app.target ? 'Branch' : 'Generate'}
+          class="absolute right-0 bottom-0.5 flex size-7 items-center justify-center rounded-lg
+            text-accent transition-colors outline-none hover:bg-accent/10
+            focus-visible:ring-2 focus-visible:ring-accent/40"
+        >
+          <Icon name="arrowUp" size={15} />
+        </button>
+      {/if}
     </div>
   </div>
 </div>

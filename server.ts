@@ -612,6 +612,10 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       makeThumb(abs)
       attachmentUrls.push(`/images/${board.id}/${fname}`)
     }
+    // Reuse attachments already stored on this board (node duplication)
+    for (const u of Array.isArray(body.attachmentUrls) ? body.attachmentUrls.slice(0, 8).map(String) : []) {
+      if (imageUrlToAbs(board.id, u) !== null) attachmentUrls.push(u)
+    }
 
     const nodes: BoardNode[] = []
     for (let i = 0; i < count; i++) {
