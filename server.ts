@@ -24,7 +24,7 @@ const CODEX_BIN = process.env.CODEX_BIN || 'codex'
 const POLL_MS = 1200
 const MAX_BODY = 64 * 1024 * 1024
 const JOB_TIMEOUT_MS = 15 * 60 * 1000
-const MAX_ACTIVE_PER_BOARD = 8
+const MAX_ACTIVE_PER_BOARD = 20
 
 const PREAMBLE = [
   'You are an expert image-generation assistant.',
