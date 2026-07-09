@@ -1,6 +1,6 @@
 # CodexImage
 
-![CodexImage canvas](docs/screenshot.png)
+![CodexImage canvas](docs/screenshot.webp)
 
 Local image-generation studio: an infinite node canvas on top of the Codex CLI, so
 images generate through **your ChatGPT subscription** — no API costs. Every prompt is
