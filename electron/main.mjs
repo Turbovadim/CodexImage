@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, nativeTheme, shell } from 'electron'
+import { app, BrowserWindow, dialog, nativeTheme, shell, utilityProcess } from 'electron'
 import { execSync } from 'node:child_process'
 import http from 'node:http'
 import os from 'node:os'
@@ -77,21 +77,61 @@ function apiRequest(pathname, method = 'GET', timeout = 2000) {
   })
 }
 
-async function ensureServer() {
-  // Reuse an already-running server (e.g. `npm run dev` / `npm start`)
-  if (await ping()) return
-  process.env.CODEXIMAGE_ROOT = ROOT
-  await import(path.join(ROOT, 'dist-electron', 'server.mjs'))
-  for (let i = 0; i < 50; i++) {
-    if (await ping()) return
-    await new Promise(r => setTimeout(r, 100))
-  }
-  throw new Error('API server failed to start')
-}
-
 let quitAuthorized = false
 let quitCheckInProgress = false
 let serverReady = false
+let serverProcess = null
+let serverShutdownInProgress = false
+
+async function ensureServer() {
+  // Reuse an already-running server (e.g. `npm run dev` / `npm start`)
+  if (await ping()) {
+    serverReady = true
+    return
+  }
+  const child = utilityProcess.fork(path.join(ROOT, 'dist-electron', 'server.mjs'), [], {
+    cwd: ROOT,
+    env: { ...process.env, CODEXIMAGE_ROOT: ROOT },
+    serviceName: 'CodexImage Server',
+    stdio: 'inherit',
+  })
+  serverProcess = child
+  child.on('exit', code => {
+    if (serverProcess === child) serverProcess = null
+    const unexpected = serverReady && !quitAuthorized && !serverShutdownInProgress
+    serverReady = false
+    if (unexpected) console.error(`CodexImage server exited unexpectedly (${code})`)
+  })
+  for (let i = 0; i < 50; i++) {
+    if (await ping()) {
+      serverReady = true
+      return
+    }
+    await new Promise(r => setTimeout(r, 100))
+  }
+  child.kill()
+  throw new Error('API server failed to start')
+}
+
+function shutdownOwnedServer() {
+  const child = serverProcess
+  if (!child) return Promise.resolve()
+  serverShutdownInProgress = true
+  return new Promise(resolve => {
+    let settled = false
+    const finish = () => {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      if (serverProcess === child) serverProcess = null
+      serverShutdownInProgress = false
+      resolve()
+    }
+    const timeout = setTimeout(finish, 3000)
+    child.once('exit', finish)
+    if (!child.kill()) finish()
+  })
+}
 
 function showMessageBox(win, options) {
   return win && !win.isDestroyed()
@@ -124,6 +164,7 @@ async function requestQuit(win) {
       if (response !== 1) return
       await apiRequest('/api/generations/stop-all', 'POST', 8000)
     }
+    await shutdownOwnedServer()
     quitAuthorized = true
     app.quit()
   } catch (err) {
@@ -176,7 +217,6 @@ nativeTheme.themeSource = 'dark'
 app.whenReady().then(async () => {
   try {
     await ensureServer()
-    serverReady = true
   } catch (err) {
     console.error(err)
     quitAuthorized = true

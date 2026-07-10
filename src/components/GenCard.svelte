@@ -5,10 +5,13 @@
 </script>
 
 <script lang="ts">
+  import { onMount } from 'svelte'
   import { Handle, Position, useViewport } from '@xyflow/svelte'
   import { app } from '../state.svelte.ts'
   import { isKey, isTyping } from '../hotkeys.ts'
+  import { requestImageDecode } from '../imageDecode.ts'
   import { thumbUrl, thumbFallback, fmtTokens } from '../media.ts'
+  import { observeViewportVisibility } from '../viewportVisibility.ts'
   import { CARD_W, type GenNodeData } from './layout.ts'
   import Elapsed from './Elapsed.svelte'
   import Icon, { type IconName } from './Icon.svelte'
@@ -23,10 +26,25 @@
     new Date(bn.createdAt).toLocaleDateString(undefined, { day: '2-digit', month: '2-digit', year: '2-digit' }),
   )
   const tokens = $derived((bn.usage?.input_tokens || 0) + (bn.usage?.output_tokens || 0))
+  const stopMessages = {
+    user: 'Stopped by you.',
+    'app-quit': 'Stopped when CodexImage quit.',
+    deleted: 'Stopped when this node was deleted.',
+  } as const
+  const stoppedMessage = $derived(
+    bn.stopReason ? stopMessages[bn.stopReason] : 'Stopped — reason wasn’t recorded.',
+  )
 
   let copied = $state(false)
   let height = $state(0)
   let hovered = $state(false)
+  let cardEl = $state<HTMLDivElement>()
+  let nearViewport = $state(false)
+
+  onMount(() => {
+    if (!cardEl) return
+    return observeViewportVisibility(cardEl, visible => (nearViewport = visible))
+  })
 
   // "Show more" appears only when the prompt actually overflows the clamp
   let promptEl = $state<HTMLDivElement>()
@@ -40,28 +58,41 @@
   })
 
   // Thumbs are 720px; once zoomed past the point where a thumb can't fill the
-  // card's device pixels, upgrade to the original. Sticky — never downgrade.
+  // card's device pixels, visible cards upgrade to the original.
   const viewport = useViewport()
   const dpr = window.devicePixelRatio || 1
   const THUMB_W = 720
   const hiZoom = $derived(THUMB_W / ((bn.images.length > 1 ? CARD_W / 2 : CARD_W) * dpr))
-  let hiRes = $state(false)
-  $effect(() => {
-    if (viewport.current.zoom >= hiZoom) hiRes = true
-  })
+  const hiRes = $derived(viewport.current.zoom >= hiZoom)
 
-  // Preload + decode originals off-screen; each img swaps to the original
-  // only once it can paint instantly, so the upgrade never flickers.
-  const requested = new Set<string>()
+  // Decode only cards near the viewport. Cards downgrade to their thumbnail
+  // when they leave, bounding decoded-image memory during long canvas pans.
+  const decodedNearViewport = new Set<string>()
   let ready = $state<Record<string, true>>({})
   $effect(() => {
-    if (!hiRes) return
-    for (const s of bn.images) {
-      if (requested.has(s)) continue
-      requested.add(s)
-      const img = new Image()
-      img.src = s
-      img.decode().then(() => { ready[s] = true }).catch(() => {})
+    if (nearViewport && hiRes) return
+    decodedNearViewport.clear()
+    ready = {}
+  })
+  $effect(() => {
+    if (!hiRes || !nearViewport) return
+
+    let disposed = false
+    const requests = bn.images
+      .filter(src => !decodedNearViewport.has(src))
+      .map(src => {
+        const request = requestImageDecode(src)
+        request.promise.then(() => {
+          if (disposed || !nearViewport) return
+          decodedNearViewport.add(src)
+          ready[src] = true
+        }).catch(() => {})
+        return request
+      })
+
+    return () => {
+      disposed = true
+      for (const request of requests) request.cancel()
     }
   })
 
@@ -128,6 +159,7 @@
 
 <!-- svelte-ignore a11y_no_static_element_interactions — pointer handlers only track hover for the E hotkey -->
 <div
+  bind:this={cardEl}
   class="group relative"
   style="width: {CARD_W}px"
   bind:clientHeight={height}
@@ -222,9 +254,9 @@
           <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
           <!-- lazy is safe here because the box height is reserved via aspect-ratio -->
           <img
-            src={ready[src] ? src : thumbUrl(src)}
+            src={ready[src] && nearViewport ? src : thumbUrl(src)}
             style={reservedRatio(src)}
-            onerror={ready[src] ? undefined : thumbFallback(src)}
+            onerror={ready[src] && nearViewport ? undefined : thumbFallback(src)}
             onload={e => {
               const el = e.currentTarget as HTMLImageElement
               if (el.naturalWidth && el.naturalHeight) seenRatio.set(src, el.naturalWidth / el.naturalHeight)
@@ -254,7 +286,7 @@
         {/if}
         <div class="flex items-center gap-2 px-4 py-2.5 text-[11.5px] text-dim {bn.images.length === 0 ? 'absolute inset-x-0 bottom-0' : ''}">
           <div class="size-3.5 shrink-0 animate-spin rounded-full border-2 border-line border-t-accent"></div>
-          <span class="shrink-0">Generating · <Elapsed since={bn.createdAt} /></span>
+          <span class="shrink-0">Generating · <Elapsed since={bn.runStartedAt ?? bn.createdAt} /></span>
           {#if activity}<span class="min-w-0 truncate text-faint">{activity}</span>{/if}
         </div>
       </div>
@@ -277,7 +309,7 @@
 
     {#if bn.status === 'stopped'}
       <div class="flex items-center justify-between px-4 py-3.5 text-[12px] text-faint">
-        <span>Stopped.</span>
+        <span>{stoppedMessage}</span>
         <button
           onclick={e => { e.stopPropagation(); app.regenerate(bn) }}
           class="nodrag flex items-center gap-1.5 rounded-lg border border-line px-2.5 py-1 text-[12px] text-dim hover:border-faint hover:text-ink"
@@ -298,7 +330,7 @@
           <span class="flex-1"></span>
         {/if}
         <span class="shrink-0">
-          codex{bn.finishedAt ? ` · ${Math.round((bn.finishedAt - bn.createdAt) / 1000)}s` : ''}{tokens ? ` · ${fmtTokens(tokens)} tok` : ''}
+          codex{bn.finishedAt ? ` · ${Math.round((bn.finishedAt - (bn.runStartedAt ?? bn.createdAt)) / 1000)}s` : ''}{tokens ? ` · ${fmtTokens(tokens)} tok` : ''}
         </span>
       </div>
     {/if}

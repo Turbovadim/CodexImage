@@ -4,8 +4,13 @@ import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import crypto from 'node:crypto'
-import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
-import type { Board, BoardNode, BoardSummary, ServerEvent } from './src/types.ts'
+import { spawn, type ChildProcess } from 'node:child_process'
+import {
+  MAX_ATTACHMENTS,
+  MAX_ATTACHMENT_BYTES,
+  MAX_ATTACHMENT_TOTAL_BYTES,
+} from './src/types.ts'
+import type { Board, BoardNode, BoardSummary, ServerEvent, StopReason } from './src/types.ts'
 
 // Overridable because the Electron build runs a bundled copy from dist-electron/,
 // and the packaged app keeps its data in ~/Library/Application Support.
@@ -23,7 +28,11 @@ const PORT = Number(process.env.PORT || 4750)
 const CODEX_BIN = process.env.CODEX_BIN || 'codex'
 const POLL_MS = 1200
 const MAX_BODY = 64 * 1024 * 1024
-const JOB_TIMEOUT_MS = 15 * 60 * 1000
+// Stop only jobs that have gone completely quiet. A fixed wall-clock deadline
+// cuts off legitimate multi-image requests even while they are still making
+// progress.
+const JOB_IDLE_TIMEOUT_MINUTES = 20
+const JOB_IDLE_TIMEOUT_MS = JOB_IDLE_TIMEOUT_MINUTES * 60 * 1000
 const MAX_ACTIVE_PER_BOARD = 20
 
 const PREAMBLE = [
@@ -55,9 +64,11 @@ interface Job {
   proc: ChildProcess | null
   watchers: Map<string, Watcher>
   failures: string[]
-  stopped: boolean
+  termination: StopReason | 'timeout' | 'replaced' | null
   poller: NodeJS.Timeout | null
-  killer: NodeJS.Timeout | null
+  idleTimer: NodeJS.Timeout | null
+  forceStopTimer: NodeJS.Timeout | null
+  collection: Promise<boolean> | null
   log: fs.WriteStream
   completed: Promise<void>
   resolveCompleted: () => void
@@ -117,13 +128,23 @@ try {
     writeBoardsFile()
   } catch { /* first run */ }
 }
-// A crash mid-generation leaves nodes stuck in 'running'
+// A crash mid-generation leaves nodes stuck in 'running'. Record the reason
+// instead of silently turning these into anonymous failures on next launch.
+let recoveredInterruptedNodes = false
 for (const board of boards) {
-  for (const node of board.nodes) if (node.status === 'running') node.status = 'error'
+  for (const node of board.nodes) {
+    if (node.status !== 'running') continue
+    node.status = 'error'
+    node.error = 'Generation was interrupted because CodexImage closed unexpectedly.'
+    node.finishedAt = Date.now()
+    recoveredInterruptedNodes = true
+  }
 }
+if (recoveredInterruptedNodes) writeBoardsFile()
 
 const jobs = new Map<string, Job>() // keyed by nodeId
 const sseClients = new Map<string, Set<http.ServerResponse>>() // keyed by boardId
+const thumbnailProcesses = new Set<ChildProcess>()
 
 // Deleted subtrees are held here for a grace period so the client can offer
 // Undo. Image files are untouched by node deletion (only board deletion
@@ -165,15 +186,76 @@ for (const sig of ['SIGINT', 'SIGTERM'] as const) {
 // through the API; this is the final synchronous safety net.
 process.on('exit', () => {
   for (const job of jobs.values()) killTree(job.proc, 'SIGKILL')
+  for (const proc of thumbnailProcesses) proc.kill('SIGKILL')
 })
 
-// Card-size thumbnail next to the original (t_<name>); clients fall back to
-// the original if it's missing. sips ships with macOS; failures are harmless.
-function makeThumb(absPath: string): void {
-  try {
-    const out = path.join(path.dirname(absPath), `t_${path.basename(absPath)}`)
-    spawnSync('sips', ['-Z', '720', absPath, '--out', out], { stdio: 'ignore', timeout: 10000 })
-  } catch { /* thumbnails are best-effort */ }
+// Card-size thumbnails next to originals (t_<name>). The queue keeps bursts
+// from launching an unbounded number of sips processes while leaving the Node
+// event loop free to serve Electron, SSE, and stop requests.
+const MAX_CONCURRENT_THUMBNAILS = 2
+const THUMBNAIL_TIMEOUT_MS = 10_000
+interface ThumbnailTask { absPath: string; resolve: () => void }
+const thumbnailQueue: ThumbnailTask[] = []
+let activeThumbnails = 0
+
+function thumbnailPath(absPath: string): string {
+  return path.join(path.dirname(absPath), `t_${path.basename(absPath)}`)
+}
+
+async function removeImagesAndThumbnails(absPaths: string[]): Promise<void> {
+  await Promise.allSettled(absPaths.flatMap(absPath => [
+    fs.promises.rm(absPath, { force: true }),
+    fs.promises.rm(thumbnailPath(absPath), { force: true }),
+  ]))
+}
+
+function runThumbnail(absPath: string): Promise<void> {
+  return new Promise(resolve => {
+    const out = thumbnailPath(absPath)
+    let proc: ChildProcess
+    try {
+      proc = spawn('sips', ['-Z', '720', absPath, '--out', out], { stdio: 'ignore' })
+    } catch {
+      resolve()
+      return
+    }
+    thumbnailProcesses.add(proc)
+    let settled = false
+    const finish = (succeeded: boolean) => {
+      if (settled) return
+      settled = true
+      thumbnailProcesses.delete(proc)
+      clearTimeout(timeout)
+      if (succeeded) resolve()
+      else void fs.promises.rm(out, { force: true }).then(resolve, resolve)
+    }
+    const timeout = setTimeout(() => {
+      proc.kill('SIGKILL')
+      finish(false)
+    }, THUMBNAIL_TIMEOUT_MS)
+    proc.once('error', () => finish(false))
+    proc.once('close', code => finish(code === 0))
+  })
+}
+
+function drainThumbnailQueue(): void {
+  while (activeThumbnails < MAX_CONCURRENT_THUMBNAILS && thumbnailQueue.length > 0) {
+    const task = thumbnailQueue.shift()!
+    activeThumbnails++
+    void runThumbnail(task.absPath).finally(() => {
+      activeThumbnails--
+      task.resolve()
+      drainThumbnailQueue()
+    })
+  }
+}
+
+/** Best-effort thumbnail creation with bounded concurrency. */
+function makeThumb(absPath: string): Promise<void> {
+  return new Promise(resolve => {
+    thumbnailQueue.push({ absPath, resolve })
+    drainThumbnailQueue()
+  })
 }
 
 function getBoard(id: string): Board | undefined {
@@ -263,27 +345,41 @@ function addUsage(a: Record<string, number> | undefined, b: Record<string, numbe
   return out
 }
 
-function collectImages(board: Board, node: BoardNode, job: Job): void {
+async function collectImages(board: Board, node: BoardNode, job: Job): Promise<boolean> {
   let changed = false
   for (const w of job.watchers.values()) {
     const dir = path.join(CODEX_GEN_DIR, w.threadId)
     let files: string[]
-    try { files = fs.readdirSync(dir) } catch { continue }
+    try { files = await fs.promises.readdir(dir) } catch { continue }
     for (const f of files) {
       if (w.seen.has(f)) continue
       const src = path.join(dir, f)
       let st: fs.Stats
-      try { st = fs.statSync(src) } catch { continue }
+      try { st = await fs.promises.stat(src) } catch { continue }
       if (!st.isFile() || st.size === 0) continue
       // Wait until the size is stable across two polls so we never copy a half-written file
       if (w.sizes.get(f) !== st.size) { w.sizes.set(f, st.size); continue }
       w.seen.add(f)
       const destDir = path.join(IMAGES_DIR, board.id)
-      fs.mkdirSync(destDir, { recursive: true })
-      const name = `${Date.now().toString(36)}-${f.replace(/[^\w.-]/g, '_')}`
+      await fs.promises.mkdir(destDir, { recursive: true })
+      const name = `${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}-${f.replace(/[^\w.-]/g, '_')}`
       const dest = path.join(destDir, name)
-      fs.copyFileSync(src, dest)
-      makeThumb(dest)
+      try {
+        await fs.promises.copyFile(src, dest)
+        await makeThumb(dest)
+      } catch {
+        // A transient source-file race should be retried on the next poll.
+        w.seen.delete(f)
+        continue
+      }
+      const stillOwned = jobs.get(node.id) === job
+        && job.termination !== 'deleted'
+        && job.termination !== 'replaced'
+        && board.nodes.includes(node)
+      if (!stillOwned) {
+        await removeImagesAndThumbnails([dest])
+        continue
+      }
       node.images.push(`/images/${board.id}/${name}`)
       changed = true
     }
@@ -292,6 +388,17 @@ function collectImages(board: Board, node: BoardNode, job: Job): void {
     saveBoards()
     sseSend(board.id, { type: 'node', node })
   }
+  return changed
+}
+
+/** Serialize collection sweeps for a job so interval and final sweeps cannot race. */
+function collectJobImages(board: Board, node: BoardNode, job: Job): Promise<boolean> {
+  if (job.collection) return job.collection
+  const collection = collectImages(board, node, job).finally(() => {
+    if (job.collection === collection) job.collection = null
+  })
+  job.collection = collection
+  return collection
 }
 
 function handleCodexEvent(board: Board, node: BoardNode, job: Job, ev: any): void {
@@ -328,20 +435,23 @@ function startNodeJob(board: Board, node: BoardNode, index: number, count: numbe
     proc: null,
     watchers: new Map(),
     failures: [],
-    stopped: false,
+    termination: null,
     poller: null,
-    killer: null,
+    idleTimer: null,
+    forceStopTimer: null,
+    collection: null,
     log: fs.createWriteStream(path.join(LOGS_DIR, `${board.id}.jsonl`), { flags: 'a' }),
     completed,
     resolveCompleted,
   }
   jobs.set(node.id, job)
 
-  job.poller = setInterval(() => collectImages(board, node, job), POLL_MS)
-  job.killer = setTimeout(() => {
-    job.stopped = true
-    killTree(job.proc, 'SIGKILL')
-  }, JOB_TIMEOUT_MS)
+  job.poller = setInterval(() => {
+    void collectJobImages(board, node, job)
+      .then(changed => { if (changed) resetIdleTimer(job) })
+      .catch(error => job.failures.push(`Image collection failed: ${(error as Error).message}`))
+  }, POLL_MS)
+  resetIdleTimer(job)
 
   const promptText = buildNodePrompt(board, node, index, count)
   const args = ['exec', '-s', 'workspace-write', '-C', ws, '--json', '--skip-git-repo-check', promptText]
@@ -355,6 +465,7 @@ function startNodeJob(board: Board, node: BoardNode, index: number, count: numbe
 
   let stdoutBuf = ''
   proc.stdout!.on('data', (chunk: Buffer) => {
+    resetIdleTimer(job)
     stdoutBuf += chunk
     let nl: number
     while ((nl = stdoutBuf.indexOf('\n')) >= 0) {
@@ -367,16 +478,19 @@ function startNodeJob(board: Board, node: BoardNode, index: number, count: numbe
   })
 
   let stderrTail = ''
-  proc.stderr!.on('data', (chunk: Buffer) => { stderrTail = (stderrTail + chunk).slice(-4000) })
+  proc.stderr!.on('data', (chunk: Buffer) => {
+    resetIdleTimer(job)
+    stderrTail = (stderrTail + chunk).slice(-4000)
+  })
 
   let settled = false
   const settle = (code: number | null) => {
     if (settled) return
     settled = true
-    if (code !== 0 && !job.stopped) {
+    if (code !== 0 && !job.termination) {
       job.failures.push((stderrTail || `codex exited with code ${code}`).trim().slice(-1000))
     }
-    finalizeJob(board, node, job)
+    void finalizeJob(board, node, job)
   }
   proc.on('close', settle)
   proc.on('error', err => {
@@ -385,9 +499,10 @@ function startNodeJob(board: Board, node: BoardNode, index: number, count: numbe
   })
 }
 
-function finalizeJob(board: Board, node: BoardNode, job: Job): void {
+async function finalizeJob(board: Board, node: BoardNode, job: Job): Promise<void> {
   if (job.poller) clearInterval(job.poller)
-  if (job.killer) clearTimeout(job.killer)
+  if (job.idleTimer) clearTimeout(job.idleTimer)
+  if (job.forceStopTimer) clearTimeout(job.forceStopTimer)
   // A newer job may have replaced this one (regenerate while running); if so,
   // this job must not touch the node — the new run owns it now.
   if (jobs.get(node.id) !== job) {
@@ -395,19 +510,28 @@ function finalizeJob(board: Board, node: BoardNode, job: Job): void {
     job.resolveCompleted()
     return
   }
-  collectImages(board, node, job)
+  try { await collectJobImages(board, node, job) }
+  catch (error) { job.failures.push(`Image collection failed: ${(error as Error).message}`) }
   // one delayed sweep to catch a file that was still being written on exit
-  setTimeout(() => {
+  setTimeout(() => void (async () => {
     if (jobs.get(node.id) !== job) {
       job.log.end()
       job.resolveCompleted()
       return
     }
-    collectImages(board, node, job)
+    try { await collectJobImages(board, node, job) }
+    catch (error) { job.failures.push(`Image collection failed: ${(error as Error).message}`) }
     jobs.delete(node.id)
     if (node.status === 'running') {
-      if (job.stopped) {
+      if (job.termination === 'user' || job.termination === 'app-quit' || job.termination === 'deleted') {
         node.status = 'stopped'
+        node.stopReason = job.termination
+      } else if (job.termination === 'timeout') {
+        const saved = node.images.length
+        node.status = 'error'
+        node.error = `No generation activity for ${JOB_IDLE_TIMEOUT_MINUTES} minutes. ${saved
+          ? `${saved} ${saved === 1 ? 'image was' : 'images were'} saved before the timeout.`
+          : 'No images were saved.'}`
       } else if (job.failures.length && node.images.length === 0) {
         node.status = 'error'
         node.error = job.failures[0]
@@ -426,7 +550,17 @@ function finalizeJob(board: Board, node: BoardNode, job: Job): void {
     }
     job.log.end()
     job.resolveCompleted()
-  }, 800)
+  })(), 800)
+}
+
+function resetIdleTimer(job: Job): void {
+  if (job.termination || jobs.get(job.nodeId) !== job) return
+  if (job.idleTimer) clearTimeout(job.idleTimer)
+  job.idleTimer = setTimeout(() => {
+    if (job.termination || jobs.get(job.nodeId) !== job) return
+    job.termination = 'timeout'
+    killTree(job.proc, 'SIGKILL')
+  }, JOB_IDLE_TIMEOUT_MS)
 }
 
 // Signal the whole process group (see the detached spawn above); fall back to
@@ -440,13 +574,19 @@ function killTree(proc: ChildProcess | null, signal: NodeJS.Signals): void {
   }
 }
 
-function stopJob(nodeId: string, signal: NodeJS.Signals = 'SIGTERM'): void {
+function stopJob(
+  nodeId: string,
+  reason: StopReason | 'replaced' = 'user',
+  signal: NodeJS.Signals = 'SIGTERM',
+): void {
   const job = jobs.get(nodeId)
   if (!job) return
-  job.stopped = true
+  job.termination = reason
+  if (job.idleTimer) clearTimeout(job.idleTimer)
+  if (job.forceStopTimer) clearTimeout(job.forceStopTimer)
   killTree(job.proc, signal)
   if (signal === 'SIGTERM') {
-    setTimeout(() => killTree(job.proc, 'SIGKILL'), 3000)
+    job.forceStopTimer = setTimeout(() => killTree(job.proc, 'SIGKILL'), 3000)
   }
 }
 
@@ -458,7 +598,7 @@ async function stopAllJobs(): Promise<number> {
 
   stoppingAllJobs = true
   try {
-    for (const job of active) stopJob(job.nodeId, 'SIGKILL')
+    for (const job of active) stopJob(job.nodeId, 'app-quit', 'SIGKILL')
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error('Timed out stopping generations')), 6000)
       Promise.all(active.map(job => job.completed)).then(
@@ -476,11 +616,14 @@ async function stopAllJobs(): Promise<number> {
 function stopAllJobsImmediately(): void {
   const stoppedAt = Date.now()
   for (const job of jobs.values()) {
-    job.stopped = true
+    job.termination = 'app-quit'
+    if (job.idleTimer) clearTimeout(job.idleTimer)
+    if (job.forceStopTimer) clearTimeout(job.forceStopTimer)
     killTree(job.proc, 'SIGKILL')
     const node = getBoard(job.boardId)?.nodes.find(candidate => candidate.id === job.nodeId)
     if (node?.status === 'running') {
       node.status = 'stopped'
+      node.stopReason = 'app-quit'
       node.finishedAt = stoppedAt
     }
   }
@@ -615,7 +758,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
   }
 
   if (req.method === 'DELETE' && !sub) {
-    for (const id of generatingIds(board.id)) stopJob(id, 'SIGKILL')
+    for (const id of generatingIds(board.id)) stopJob(id, 'deleted', 'SIGKILL')
     boards = boards.filter(b => b.id !== board.id)
     for (const [undoId, entry] of trash) {
       if (entry.boardId === board.id) { clearTimeout(entry.timer); trash.delete(undoId) }
@@ -665,24 +808,67 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       sourceImages = (requested ?? parent.images).filter(u => imageUrlToAbs(board.id, u) !== null)
     }
 
-    // Persist attachments so codex can open them by absolute path
-    const attachmentUrls: string[] = []
-    for (const att of Array.isArray(body.attachments) ? body.attachments.slice(0, 8) : []) {
-      const safe = String(att.name || 'image.png').replace(/[^\w.-]/g, '_')
-      const fname = `${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 6)}-${safe}`
-      const destDir = path.join(IMAGES_DIR, board.id)
-      fs.mkdirSync(destDir, { recursive: true })
-      const abs = path.join(destDir, fname)
-      fs.writeFileSync(abs, Buffer.from(String(att.data || ''), 'base64'))
-      makeThumb(abs)
-      attachmentUrls.push(`/images/${board.id}/${fname}`)
+    // Validate the complete batch before writing anything: the renderer uses
+    // the same limits, while this server-side check protects other clients.
+    const incomingAttachments = Array.isArray(body.attachments) ? body.attachments : []
+    const requestedAttachmentUrls = Array.isArray(body.attachmentUrls)
+      ? body.attachmentUrls.map(String)
+      : []
+    if (incomingAttachments.length + requestedAttachmentUrls.length > MAX_ATTACHMENTS) {
+      return json(res, 400, { error: `Too many attachments (max ${MAX_ATTACHMENTS})` })
+    }
+    const preparedAttachments: Array<{ name: string; data: Buffer }> = []
+    let attachmentBytes = 0
+    for (const att of incomingAttachments) {
+      const data = Buffer.from(String(att.data || ''), 'base64')
+      if (data.byteLength > MAX_ATTACHMENT_BYTES) {
+        return json(res, 400, { error: `Attachment exceeds ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB` })
+      }
+      attachmentBytes += data.byteLength
+      if (attachmentBytes > MAX_ATTACHMENT_TOTAL_BYTES) {
+        return json(res, 400, { error: `Attachments exceed ${MAX_ATTACHMENT_TOTAL_BYTES / 1024 / 1024} MB total` })
+      }
+      preparedAttachments.push({
+        name: String(att.name || 'image.png').replace(/[^\w.-]/g, '_'),
+        data,
+      })
+    }
+
+    const destDir = path.join(IMAGES_DIR, board.id)
+    if (preparedAttachments.length) await fs.promises.mkdir(destDir, { recursive: true })
+    const createdAttachmentPaths: string[] = []
+    let attachmentUrls: string[]
+    try {
+      attachmentUrls = await Promise.all(preparedAttachments.map(async attachment => {
+        const fname = `${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 6)}-${attachment.name}`
+        const abs = path.join(destDir, fname)
+        createdAttachmentPaths.push(abs)
+        await fs.promises.writeFile(abs, attachment.data)
+        await makeThumb(abs)
+        return `/images/${board.id}/${fname}`
+      }))
+    } catch (error) {
+      await removeImagesAndThumbnails(createdAttachmentPaths)
+      throw error
+    }
+
+    // Attachment writes yield to the event loop; the board may have been
+    // deleted or other requests may have filled its generation slots meanwhile.
+    if (getBoard(board.id) !== board) {
+      await removeImagesAndThumbnails(createdAttachmentPaths)
+      return json(res, 409, { error: 'Board was deleted while attachments were uploading' })
+    }
+    if (generatingIds(board.id).length + count > MAX_ACTIVE_PER_BOARD) {
+      await removeImagesAndThumbnails(createdAttachmentPaths)
+      return json(res, 429, { error: `Too many generations running on this board (max ${MAX_ACTIVE_PER_BOARD})` })
     }
     // Reuse attachments already stored on this board (node duplication)
-    for (const u of Array.isArray(body.attachmentUrls) ? body.attachmentUrls.slice(0, 8).map(String) : []) {
+    for (const u of requestedAttachmentUrls) {
       if (imageUrlToAbs(board.id, u) !== null) attachmentUrls.push(u)
     }
 
     const nodes: BoardNode[] = []
+    const runStartedAt = Date.now()
     for (let i = 0; i < count; i++) {
       const node: BoardNode = {
         id: crypto.randomUUID(),
@@ -694,7 +880,8 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
         images: [],
         text: '',
         status: 'running',
-        createdAt: Date.now() + i, // stable sibling ordering
+        createdAt: runStartedAt + i, // stable sibling ordering
+        runStartedAt,
       }
       board.nodes.push(node)
       nodes.push(node)
@@ -715,7 +902,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
   if (req.method === 'POST' && action === 'regenerate') {
     if (stoppingAllJobs) return json(res, 409, { error: 'All generations are stopping' })
     const body = await readBody(req)
-    if (jobs.has(node.id)) stopJob(node.id, 'SIGKILL')
+    if (jobs.has(node.id)) stopJob(node.id, 'replaced', 'SIGKILL')
     // The killed job stays in the map until its async finalize runs, so it
     // must not count against the limit — regenerating frees its own slot.
     if (generatingIds(board.id).filter(id => id !== node.id).length >= MAX_ACTIVE_PER_BOARD) {
@@ -726,7 +913,9 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     node.images = []
     node.text = ''
     node.error = undefined
+    node.stopReason = undefined
     node.status = 'running'
+    node.runStartedAt = Date.now()
     node.finishedAt = undefined
     saveBoards()
     sseSend(board.id, { type: 'node', node })
@@ -761,7 +950,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
         if (n.parentId && doomed.has(n.parentId) && !doomed.has(n.id)) { doomed.add(n.id); grew = true }
       }
     }
-    for (const id of doomed) if (jobs.has(id)) stopJob(id, 'SIGKILL')
+    for (const id of doomed) if (jobs.has(id)) stopJob(id, 'deleted', 'SIGKILL')
     const removed = board.nodes.filter(n => doomed.has(n.id))
     board.nodes = board.nodes.filter(n => !doomed.has(n.id))
     const undoId = crypto.randomUUID()
@@ -815,31 +1004,26 @@ const server = http.createServer((req, res) => {
   sendFile(res, DIST_DIR, rel, 'index.html')
 })
 
-// One-time backfill for images created before thumbnails existed, paced so a
-// large library doesn't block the event loop at startup.
-function backfillThumbs(): void {
+// One-time backfill for images created before thumbnails existed. It feeds
+// the same bounded async queue one file at a time, so live generations are
+// never trapped behind an entire historical library.
+async function backfillThumbs(): Promise<void> {
   const queue: string[] = []
   try {
-    for (const boardDir of fs.readdirSync(IMAGES_DIR)) {
+    for (const boardDir of await fs.promises.readdir(IMAGES_DIR)) {
       const dir = path.join(IMAGES_DIR, boardDir)
       let files: string[]
-      try { files = fs.readdirSync(dir) } catch { continue }
+      try { files = await fs.promises.readdir(dir) } catch { continue }
       const have = new Set(files)
       for (const f of files) {
         if (!f.startsWith('t_') && !have.has(`t_${f}`)) queue.push(path.join(dir, f))
       }
     }
   } catch { return }
-  const step = () => {
-    const next = queue.shift()
-    if (!next) return
-    makeThumb(next)
-    setTimeout(step, 50)
-  }
-  step()
+  for (const absPath of queue) await makeThumb(absPath)
 }
 
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`CodexImage API + app on http://localhost:${PORT}`)
-  backfillThumbs()
+  void backfillThumbs()
 })

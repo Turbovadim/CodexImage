@@ -5,6 +5,7 @@ export interface PendingAttachment {
   name: string
   data: string
   previewUrl: string
+  size: number
 }
 
 export interface ComposerTarget {
@@ -16,7 +17,7 @@ export interface ComposerTarget {
 }
 
 /** BoardNode keys that may disappear between server snapshots of a node. */
-const OPTIONAL_NODE_KEYS = ['error', 'x', 'y', 'finishedAt', 'usage'] as const
+const OPTIONAL_NODE_KEYS = ['error', 'stopReason', 'x', 'y', 'runStartedAt', 'finishedAt', 'usage'] as const
 
 class AppState {
   boards = $state<BoardSummary[]>([])
@@ -258,7 +259,7 @@ class AppState {
   stop(node: BoardNode) {
     const boardId = this.#activeBoardId
     if (!boardId) return
-    void api.stopNode(boardId, node.id)
+    void api.stopNode(boardId, node.id).catch(err => this.showError(err))
   }
 
   // No confirm: the server keeps the subtree in a trash for a few minutes,

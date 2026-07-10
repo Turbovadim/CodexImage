@@ -1,4 +1,9 @@
+export const MAX_ATTACHMENTS = 8
+export const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
+export const MAX_ATTACHMENT_TOTAL_BYTES = 32 * 1024 * 1024
+
 export type NodeStatus = 'running' | 'done' | 'error' | 'stopped'
+export type StopReason = 'user' | 'app-quit' | 'deleted'
 
 export interface BoardNode {
   id: string
@@ -16,10 +21,14 @@ export interface BoardNode {
   text: string
   status: NodeStatus
   error?: string
+  /** why a run entered the stopped state; timeouts are errors, not stops */
+  stopReason?: StopReason
   /** manual canvas position; auto-layout applies when absent */
   x?: number
   y?: number
   createdAt: number
+  /** start of the current run; differs from createdAt after regeneration */
+  runStartedAt?: number
   finishedAt?: number
   usage?: Record<string, number>
 }

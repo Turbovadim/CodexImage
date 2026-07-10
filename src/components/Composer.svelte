@@ -1,6 +1,12 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte'
   import { app, type PendingAttachment } from '../state.svelte.ts'
   import { isTyping } from '../hotkeys.ts'
+  import {
+    MAX_ATTACHMENTS,
+    MAX_ATTACHMENT_BYTES,
+    MAX_ATTACHMENT_TOTAL_BYTES,
+  } from '../types.ts'
   import Icon from './Icon.svelte'
 
   const ASPECTS = ['auto', '1:1', '16:9', '9:16', '3:2']
@@ -13,6 +19,8 @@
   let textarea: HTMLTextAreaElement | undefined = $state()
   let dragging = $state(false)
   let promptFocused = $state(false)
+  let fileImport = Promise.resolve()
+  const ownedPreviewUrls = new Set<string>()
 
   const canSend = $derived(app.draft.trim().length > 0)
   // the "/" kbd badge doubles as the hotkey's only documentation — show it
@@ -20,24 +28,83 @@
   const slashHint = $derived(!promptFocused && !app.draft)
 
   function readAsBase64(file: File): Promise<string> {
-    return new Promise(resolve => {
+    return new Promise((resolve, reject) => {
       const r = new FileReader()
       r.onload = () => resolve((r.result as string).split(',')[1])
+      r.onerror = () => reject(r.error ?? new Error(`Could not read ${file.name}`))
+      r.onabort = () => reject(new Error(`Reading ${file.name} was cancelled`))
       r.readAsDataURL(file)
     })
   }
 
-  async function addFiles(files: Iterable<File>) {
-    const added: PendingAttachment[] = []
+  function formatMiB(bytes: number): string {
+    return `${Math.round(bytes / 1024 / 1024)} MB`
+  }
+
+  function disposeAttachment(attachment: PendingAttachment) {
+    if (!ownedPreviewUrls.delete(attachment.previewUrl)) return
+    URL.revokeObjectURL(attachment.previewUrl)
+  }
+
+  function removeAttachment(index: number) {
+    const attachment = attachments[index]
+    if (!attachment) return
+    disposeAttachment(attachment)
+    attachments = attachments.filter((_, candidate) => candidate !== index)
+  }
+
+  async function addFiles(files: File[]) {
+    let totalBytes = attachments.reduce((sum, attachment) => sum + attachment.size, 0)
+    let rejection: string | null = null
+
     for (const file of files) {
-      added.push({
+      if (!file.type.startsWith('image/')) continue
+      if (attachments.length >= MAX_ATTACHMENTS) {
+        rejection = `You can attach up to ${MAX_ATTACHMENTS} images at once.`
+        break
+      }
+      if (file.size > MAX_ATTACHMENT_BYTES) {
+        rejection ??= `${file.name} is larger than ${formatMiB(MAX_ATTACHMENT_BYTES)}.`
+        continue
+      }
+      if (totalBytes + file.size > MAX_ATTACHMENT_TOTAL_BYTES) {
+        rejection ??= `Attachments can total up to ${formatMiB(MAX_ATTACHMENT_TOTAL_BYTES)}.`
+        continue
+      }
+
+      const attachment: PendingAttachment = {
         name: file.name || 'pasted.png',
         data: await readAsBase64(file),
         previewUrl: URL.createObjectURL(file),
-      })
+        size: file.size,
+      }
+      ownedPreviewUrls.add(attachment.previewUrl)
+      attachments.push(attachment)
+      totalBytes += file.size
     }
-    if (added.length) attachments.push(...added)
+
+    if (rejection) app.showError(new Error(rejection))
   }
+
+  function queueFiles(files: Iterable<File>) {
+    const batch = [...files]
+    fileImport = fileImport
+      .then(() => addFiles(batch))
+      .catch(error => app.showError(error))
+  }
+
+  async function waitForFileImports() {
+    let pending: Promise<void>
+    do {
+      pending = fileImport
+      await pending
+    } while (pending !== fileImport)
+  }
+
+  onDestroy(() => {
+    for (const url of ownedPreviewUrls) URL.revokeObjectURL(url)
+    ownedPreviewUrls.clear()
+  })
 
   // branching (toolbar, B hotkey, lightbox) puts the composer in target mode —
   // focus the prompt right away so the continuation can be typed immediately
@@ -56,6 +123,9 @@
   })
 
   async function submit() {
+    // A drop/paste may still be reading from disk when Enter is pressed.
+    // Preserve intent by waiting for that serialized import before snapshotting.
+    await waitForFileImports()
     const trimmed = app.draft.trim()
     if (!trimmed) return
     app.draft = ''
@@ -63,6 +133,7 @@
     attachments = []
     try {
       await app.send(trimmed, { aspect, count }, toSend)
+      for (const attachment of toSend) disposeAttachment(attachment)
       count = 1
     } catch (err) {
       app.showError(err)
@@ -96,7 +167,7 @@
     e.preventDefault()
     dragging = false
     const files = [...(e.dataTransfer?.files ?? [])].filter(f => f.type.startsWith('image/'))
-    if (files.length) void addFiles(files)
+    if (files.length) queueFiles(files)
   }}
 />
 
@@ -179,7 +250,7 @@
         hidden
         onchange={e => {
           const input = e.currentTarget
-          if (input.files) void addFiles(input.files)
+          if (input.files) queueFiles(input.files)
           input.value = ''
         }}
       />
@@ -191,7 +262,7 @@
           <div class="relative">
             <img src={a.previewUrl} alt={a.name} class="h-12 w-12 rounded-lg border border-line object-cover" />
             <button
-              onclick={() => (attachments = attachments.filter((_, j) => j !== i))}
+              onclick={() => removeAttachment(i)}
               title="Remove"
               class="absolute -top-1.5 -right-1.5 flex size-[18px] items-center justify-center rounded-full bg-danger text-white"
             >
@@ -225,7 +296,7 @@
             .filter(i => i.type.startsWith('image/'))
             .map(i => i.getAsFile())
             .filter((f): f is File => f !== null)
-          if (files.length) void addFiles(files)
+          if (files.length) queueFiles(files)
         }}
         class="max-h-[160px] w-full resize-none bg-transparent px-0.5 py-1.5 text-[14px] text-ink
           outline-none placeholder:text-dim {slashHint || canSend ? 'pr-8' : ''}"
