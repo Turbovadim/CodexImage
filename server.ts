@@ -59,6 +59,8 @@ interface Job {
   poller: NodeJS.Timeout | null
   killer: NodeJS.Timeout | null
   log: fs.WriteStream
+  completed: Promise<void>
+  resolveCompleted: () => void
 }
 
 for (const dir of [DATA_DIR, IMAGES_DIR, WORKSPACES_DIR, LOGS_DIR]) fs.mkdirSync(dir, { recursive: true })
@@ -153,8 +155,17 @@ function flushBoards(): void {
   writeBoardsFile()
 }
 for (const sig of ['SIGINT', 'SIGTERM'] as const) {
-  process.on(sig, () => { flushBoards(); process.exit(0) })
+  process.on(sig, () => {
+    stopAllJobsImmediately()
+    process.exit(0)
+  })
 }
+// Generation processes run in detached groups, so they would otherwise
+// survive an abrupt server shutdown. The normal app-close path drains them
+// through the API; this is the final synchronous safety net.
+process.on('exit', () => {
+  for (const job of jobs.values()) killTree(job.proc, 'SIGKILL')
+})
 
 // Card-size thumbnail next to the original (t_<name>); clients fall back to
 // the original if it's missing. sips ships with macOS; failures are harmless.
@@ -309,6 +320,8 @@ function startNodeJob(board: Board, node: BoardNode, index: number, count: numbe
   const ws = path.join(WORKSPACES_DIR, board.id)
   fs.mkdirSync(ws, { recursive: true })
 
+  let resolveCompleted!: () => void
+  const completed = new Promise<void>(resolve => { resolveCompleted = resolve })
   const job: Job = {
     boardId: board.id,
     nodeId: node.id,
@@ -319,6 +332,8 @@ function startNodeJob(board: Board, node: BoardNode, index: number, count: numbe
     poller: null,
     killer: null,
     log: fs.createWriteStream(path.join(LOGS_DIR, `${board.id}.jsonl`), { flags: 'a' }),
+    completed,
+    resolveCompleted,
   }
   jobs.set(node.id, job)
 
@@ -377,6 +392,7 @@ function finalizeJob(board: Board, node: BoardNode, job: Job): void {
   // this job must not touch the node — the new run owns it now.
   if (jobs.get(node.id) !== job) {
     job.log.end()
+    job.resolveCompleted()
     return
   }
   collectImages(board, node, job)
@@ -384,6 +400,7 @@ function finalizeJob(board: Board, node: BoardNode, job: Job): void {
   setTimeout(() => {
     if (jobs.get(node.id) !== job) {
       job.log.end()
+      job.resolveCompleted()
       return
     }
     collectImages(board, node, job)
@@ -408,6 +425,7 @@ function finalizeJob(board: Board, node: BoardNode, job: Job): void {
       sseSend(board.id, { type: 'done', nodeId: node.id })
     }
     job.log.end()
+    job.resolveCompleted()
   }, 800)
 }
 
@@ -430,6 +448,43 @@ function stopJob(nodeId: string, signal: NodeJS.Signals = 'SIGTERM'): void {
   if (signal === 'SIGTERM') {
     setTimeout(() => killTree(job.proc, 'SIGKILL'), 3000)
   }
+}
+
+let stoppingAllJobs = false
+
+async function stopAllJobs(): Promise<number> {
+  const active = [...jobs.values()]
+  if (!active.length) return 0
+
+  stoppingAllJobs = true
+  try {
+    for (const job of active) stopJob(job.nodeId, 'SIGKILL')
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Timed out stopping generations')), 6000)
+      Promise.all(active.map(job => job.completed)).then(
+        () => { clearTimeout(timeout); resolve() },
+        error => { clearTimeout(timeout); reject(error) },
+      )
+    })
+    flushBoards()
+    return active.length
+  } finally {
+    stoppingAllJobs = false
+  }
+}
+
+function stopAllJobsImmediately(): void {
+  const stoppedAt = Date.now()
+  for (const job of jobs.values()) {
+    job.stopped = true
+    killTree(job.proc, 'SIGKILL')
+    const node = getBoard(job.boardId)?.nodes.find(candidate => candidate.id === job.nodeId)
+    if (node?.status === 'running') {
+      node.status = 'stopped'
+      node.finishedAt = stoppedAt
+    }
+  }
+  flushBoards()
 }
 
 // ---------------------------------------------------------------------------
@@ -521,6 +576,15 @@ function boardSummary(board: Board): BoardSummary {
 async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, url: URL): Promise<void> {
   const parts = url.pathname.split('/').filter(Boolean) // ['api', 'boards', boardId?, 'nodes'?, nodeId?, action?]
 
+  if (req.method === 'GET' && url.pathname === '/api/generations') {
+    return json(res, 200, { active: jobs.size })
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/generations/stop-all') {
+    const stopped = await stopAllJobs()
+    return json(res, 200, { stopped })
+  }
+
   if (req.method === 'GET' && url.pathname === '/api/boards') {
     return json(res, 200, boards.map(boardSummary).sort((a, b) => b.updatedAt - a.updatedAt))
   }
@@ -580,6 +644,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
 
   // POST /api/boards/:id/nodes — create N sibling nodes and start generating
   if (req.method === 'POST' && sub === 'nodes' && !parts[4]) {
+    if (stoppingAllJobs) return json(res, 409, { error: 'All generations are stopping' })
     const body = await readBody(req)
     const prompt = String(body.prompt || '').trim()
     if (!prompt) return json(res, 400, { error: 'Empty prompt' })
@@ -648,6 +713,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
   // Optional body { prompt, aspect } edits the node before rerunning (inline node edit).
   // Children are unaffected: they snapshotted their source image paths and the files stay on disk.
   if (req.method === 'POST' && action === 'regenerate') {
+    if (stoppingAllJobs) return json(res, 409, { error: 'All generations are stopping' })
     const body = await readBody(req)
     if (jobs.has(node.id)) stopJob(node.id, 'SIGKILL')
     // The killed job stays in the map until its async finalize runs, so it

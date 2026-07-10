@@ -1,4 +1,4 @@
-import { app, BrowserWindow, nativeTheme, shell } from 'electron'
+import { app, BrowserWindow, dialog, nativeTheme, shell } from 'electron'
 import { execSync } from 'node:child_process'
 import http from 'node:http'
 import os from 'node:os'
@@ -51,6 +51,32 @@ function ping() {
   })
 }
 
+function apiRequest(pathname, method = 'GET', timeout = 2000) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(`${APP_URL}${pathname}`, { method }, res => {
+      const chunks = []
+      res.on('data', chunk => chunks.push(chunk))
+      res.on('end', () => {
+        let body
+        try {
+          body = JSON.parse(Buffer.concat(chunks).toString() || '{}')
+        } catch {
+          reject(new Error(`API returned invalid JSON (${res.statusCode})`))
+          return
+        }
+        if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
+          reject(new Error(body.error || `API request failed (${res.statusCode})`))
+          return
+        }
+        resolve(body)
+      })
+    })
+    req.on('error', reject)
+    req.setTimeout(timeout, () => req.destroy(new Error('API request timed out')))
+    req.end()
+  })
+}
+
 async function ensureServer() {
   // Reuse an already-running server (e.g. `npm run dev` / `npm start`)
   if (await ping()) return
@@ -61,6 +87,60 @@ async function ensureServer() {
     await new Promise(r => setTimeout(r, 100))
   }
   throw new Error('API server failed to start')
+}
+
+let quitAuthorized = false
+let quitCheckInProgress = false
+let serverReady = false
+
+function showMessageBox(win, options) {
+  return win && !win.isDestroyed()
+    ? dialog.showMessageBox(win, options)
+    : dialog.showMessageBox(options)
+}
+
+async function requestQuit(win) {
+  if (quitAuthorized || quitCheckInProgress) return
+  if (!serverReady) {
+    quitAuthorized = true
+    app.quit()
+    return
+  }
+  quitCheckInProgress = true
+  try {
+    const { active } = await apiRequest('/api/generations')
+    if (active > 0) {
+      const noun = active === 1 ? 'generation is' : 'generations are'
+      const { response } = await showMessageBox(win, {
+        type: 'warning',
+        title: 'Generations are still running',
+        message: `${active} ${noun} still running`,
+        detail: 'Quitting now will terminate the running work. Any images already received will be kept.',
+        buttons: ['Keep Running', 'Terminate and Quit'],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true,
+      })
+      if (response !== 1) return
+      await apiRequest('/api/generations/stop-all', 'POST', 8000)
+    }
+    quitAuthorized = true
+    app.quit()
+  } catch (err) {
+    console.error('Unable to prepare the app for shutdown:', err)
+    const reason = err instanceof Error ? err.message : String(err)
+    await showMessageBox(win, {
+      type: 'error',
+      title: 'Couldn\u2019t quit safely',
+      message: 'CodexImage couldn\u2019t stop its running generations.',
+      detail: `${reason}\n\nThe app will remain open so generation processes are not left running in the background.`,
+      buttons: ['OK'],
+      defaultId: 0,
+      noLink: true,
+    })
+  } finally {
+    quitCheckInProgress = false
+  }
 }
 
 async function createWindow() {
@@ -75,6 +155,11 @@ async function createWindow() {
     webPreferences: { contextIsolation: true, sandbox: true },
   })
   win.once('ready-to-show', () => win.show())
+  win.on('close', event => {
+    if (quitAuthorized) return
+    event.preventDefault()
+    void requestQuit(win)
+  })
   // External links (e.g. "Open original") go to the default browser
   win.webContents.setWindowOpenHandler(({ url }) => {
     if (!url.startsWith(APP_URL)) {
@@ -91,8 +176,10 @@ nativeTheme.themeSource = 'dark'
 app.whenReady().then(async () => {
   try {
     await ensureServer()
+    serverReady = true
   } catch (err) {
     console.error(err)
+    quitAuthorized = true
     app.quit()
     return
   }
@@ -101,6 +188,13 @@ app.whenReady().then(async () => {
 
 app.on('activate', () => {
   if (BrowserWindow.getAllWindows().length === 0) void createWindow()
+})
+
+app.on('before-quit', event => {
+  if (quitAuthorized) return
+  event.preventDefault()
+  const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0]
+  void requestQuit(win)
 })
 
 app.on('window-all-closed', () => {

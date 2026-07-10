@@ -63,6 +63,7 @@
     attachments = []
     try {
       await app.send(trimmed, { aspect, count }, toSend)
+      count = 1
     } catch (err) {
       app.showError(err)
       app.draft = trimmed
@@ -109,8 +110,13 @@
 
 {#snippet chip(label: string, onclick: () => void, active = false, title?: string)}
   <button
-    {onclick}
+    type="button"
+    onclick={() => {
+      onclick()
+      textarea?.focus()
+    }}
     {title}
+    aria-pressed={active}
     class="rounded-full border px-2.5 py-1 text-[12px]
       {active
         ? 'border-accent bg-accent/10 text-accent'

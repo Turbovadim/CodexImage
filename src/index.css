@@ -28,3 +28,22 @@ body {
 ::-webkit-scrollbar { width: 9px; }
 ::-webkit-scrollbar-thumb { background: var(--color-line); border-radius: 5px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--color-faint); }
+
+.generation-sweep {
+  background: linear-gradient(
+    100deg,
+    transparent 34%,
+    color-mix(in srgb, var(--color-ink) 7%, transparent) 50%,
+    transparent 66%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.6s infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-shimmer,
+  .generation-sweep,
+  .animate-spin {
+    animation: none;
+  }
+}

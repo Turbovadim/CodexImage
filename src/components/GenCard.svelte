@@ -95,6 +95,9 @@
     if (e.key === 'Delete' || e.key === 'Backspace') {
       e.preventDefault()
       app.remove(bn)
+    } else if (isKey(e, 'd')) {
+      e.preventDefault()
+      void app.duplicate(bn)
     } else if (running) {
       return
     } else if (isKey(e, 'e')) {
@@ -106,9 +109,6 @@
     } else if (isKey(e, 'b')) {
       e.preventDefault()
       app.branch(bn)
-    } else if (isKey(e, 'd')) {
-      e.preventDefault()
-      void app.duplicate(bn)
     }
   }}
 />
@@ -141,6 +141,7 @@
   <div class="absolute -top-9 right-1 z-10 flex gap-1 opacity-0 transition-opacity group-hover:opacity-100">
     {#if running}
       {@render toolButton('Stop generation', 'stop', () => app.stop(bn), { danger: true, text: 'Stop' })}
+      {@render toolButton('Duplicate as a new sibling node (D)', 'duplicate', () => void app.duplicate(bn))}
     {:else}
       {@render toolButton('Branch from this node (B)', 'branch', () => app.branch(bn), { text: 'Branch' })}
       {@render toolButton('Edit prompt & regenerate (E)', 'pencil', () => (app.editing = bn))}
@@ -168,7 +169,9 @@
   <div
     class="overflow-hidden rounded-[20px] border bg-raised shadow-[0_10px_36px_rgba(0,0,0,.4)] transition-[border-color,box-shadow]
       [contain-intrinsic-size:auto_340px_auto_460px] [content-visibility:auto]
-      {isTarget ? 'border-accent shadow-[0_0_0_3px_rgba(124,140,255,.18),0_10px_36px_rgba(0,0,0,.4)]' : 'border-line'}"
+      {isTarget
+        ? 'border-accent shadow-[0_0_0_3px_rgba(124,140,255,.18),0_10px_36px_rgba(0,0,0,.4)]'
+        : running ? 'border-accent/40' : 'border-line'}"
   >
     <!-- prompt -->
     <div class="px-4 pt-3.5 pb-3">
@@ -214,7 +217,7 @@
 
     <!-- result -->
     {#if bn.images.length > 0}
-      <div class={bn.images.length > 1 ? 'grid grid-cols-2 gap-px bg-line/50' : ''}>
+      <div class="relative {bn.images.length > 1 ? 'grid grid-cols-2 gap-px bg-line/50' : ''}">
         {#each bn.images as src (src)}
           <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
           <!-- lazy is safe here because the box height is reserved via aspect-ratio -->
@@ -230,10 +233,14 @@
             loading="lazy"
             decoding="async"
             onclick={() => app.openImage(src, bn)}
-            class="nodrag block w-full cursor-zoom-in"
+            class="nodrag block w-full cursor-zoom-in transition-[filter,opacity] duration-200 ease-out
+              {running ? 'blur-[1.5px] opacity-80' : ''}"
             draggable={false}
           />
         {/each}
+        {#if running}
+          <div class="generation-sweep pointer-events-none absolute inset-0"></div>
+        {/if}
       </div>
     {/if}
 
@@ -282,7 +289,14 @@
 
     {#if !running && bn.status === 'done'}
       <div class="flex items-center gap-2 px-4 py-2.5 text-[10.5px] text-faint">
-        <span class="min-w-0 flex-1 truncate" title={bn.text}>{bn.text || 'Done'}</span>
+        <span class="flex shrink-0 items-center gap-1 text-dim">
+          <Icon name="check" size={11} /> Finished
+        </span>
+        {#if bn.text}
+          <span class="min-w-0 flex-1 truncate" title={bn.text}>{bn.text}</span>
+        {:else}
+          <span class="flex-1"></span>
+        {/if}
         <span class="shrink-0">
           codex{bn.finishedAt ? ` · ${Math.round((bn.finishedAt - bn.createdAt) / 1000)}s` : ''}{tokens ? ` · ${fmtTokens(tokens)} tok` : ''}
         </span>
