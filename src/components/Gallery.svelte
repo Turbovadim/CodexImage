@@ -269,7 +269,7 @@
                       {#each node.images as src, index (`${node.id}:${src}`)}
                         <button
                           onclick={() => app.openImage(src, node)}
-                          title={`Open output ${index + 1}: ${node.prompt}`}
+                          title={`Open ${node.imageLabels[index] || `output ${index + 1}`}: ${node.prompt}`}
                           aria-label={`Open output ${index + 1} from ${node.prompt}`}
                           class="group/image relative min-w-0 cursor-zoom-in overflow-hidden rounded-lg bg-raised
                             outline outline-1 -outline-offset-1 outline-line hover:outline-faint

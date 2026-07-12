@@ -30,14 +30,35 @@ body {
 ::-webkit-scrollbar-thumb:hover { background: var(--color-faint); }
 
 .generation-sweep {
+  overflow: hidden;
+  background: color-mix(in srgb, var(--color-bg) 48%, transparent);
+}
+
+.generation-sweep::after {
+  position: absolute;
+  inset: -15% auto -15% -55%;
+  width: 55%;
+  content: "";
   background: linear-gradient(
     100deg,
-    transparent 34%,
-    color-mix(in srgb, var(--color-ink) 7%, transparent) 50%,
-    transparent 66%
+    transparent,
+    color-mix(in srgb, var(--color-accent) 24%, transparent) 42%,
+    color-mix(in srgb, var(--color-ink) 18%, transparent) 52%,
+    transparent
   );
-  background-size: 200% 100%;
-  animation: shimmer 1.6s infinite;
+  transform: skewX(-8deg);
+  animation: generation-sweep 1.35s cubic-bezier(0.25, 1, 0.5, 1) infinite;
+}
+
+.generation-preview {
+  filter: blur(8px) brightness(.52) saturate(.65);
+  opacity: .78;
+  transform: scale(1.04);
+  will-change: filter, opacity, transform;
+}
+
+@keyframes generation-sweep {
+  to { transform: translateX(390%) skewX(-8deg); }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -45,5 +66,9 @@ body {
   .generation-sweep,
   .animate-spin {
     animation: none;
+  }
+
+  .generation-sweep::after {
+    display: none;
   }
 }

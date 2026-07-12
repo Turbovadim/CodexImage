@@ -22,6 +22,10 @@
   let copied = $state(false)
   let continueText = $state('')
   let ctxMenu = $state<{ x: number; y: number } | null>(null)
+  const outputIndex = $derived(node.images.indexOf(src))
+  const outputLabel = $derived(
+    outputIndex >= 0 ? node.imageLabels[outputIndex] || `Output ${outputIndex + 1}` : '',
+  )
 
   // ---------------------------------------------------------------------------
   // Zoom & pan: scroll to zoom toward the cursor, drag to pan when zoomed,
@@ -211,6 +215,13 @@
     style="transform: translate({tx}px, {ty}px) scale({scale})"
     class="h-full w-full object-contain select-none {panning ? '' : 'transition-transform duration-75'}"
   />
+
+  {#if outputIndex >= 0 && node.images.length > 1}
+    <div class="absolute top-4 left-4 rounded-lg border border-line bg-raised/85 px-2.5 py-1.5 text-[11.5px] text-dim backdrop-blur-md">
+      <span class="text-ink/90">{outputLabel}</span>
+      <span class="ml-2 tabular-nums">{outputIndex + 1} / {node.images.length}</span>
+    </div>
+  {/if}
 
   <div
     onclick={e => e.stopPropagation()}

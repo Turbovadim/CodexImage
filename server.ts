@@ -6,6 +6,13 @@ import os from 'node:os'
 import crypto from 'node:crypto'
 import { spawn, type ChildProcess } from 'node:child_process'
 import {
+  OUTPUT_MANIFEST_SCHEMA,
+  isPathInside,
+  manifestFilePath,
+  parseOutputManifest,
+  type OutputManifest,
+} from './src/outputManifest.ts'
+import {
   MAX_ATTACHMENTS,
   MAX_ATTACHMENT_BYTES,
   MAX_ATTACHMENT_TOTAL_BYTES,
@@ -22,7 +29,9 @@ const LEGACY_CHATS_FILE = path.join(DATA_DIR, 'chats.json')
 const IMAGES_DIR = path.join(DATA_DIR, 'images')
 const WORKSPACES_DIR = path.join(DATA_DIR, 'workspaces')
 const LOGS_DIR = path.join(DATA_DIR, 'logs')
-const CODEX_GEN_DIR = path.join(os.homedir(), '.codex', 'generated_images')
+const OUTPUT_SCHEMA_FILE = path.join(DATA_DIR, 'output-manifest.schema.json')
+const CODEX_GEN_DIR = process.env.CODEXIMAGE_GENERATED_IMAGES
+  || path.join(os.homedir(), '.codex', 'generated_images')
 
 const PORT = Number(process.env.PORT || 4750)
 const CODEX_BIN = process.env.CODEX_BIN || 'codex'
@@ -39,9 +48,12 @@ const PREAMBLE = [
   'You are an expert image-generation assistant.',
   '',
   'Hard rules:',
-  '- ALWAYS create the requested image with your built-in image generation tool. Never draw images with code (SVG/HTML/canvas), never substitute placeholders, and never fetch images from the web.',
-  '- The user automatically sees every image the tool produces, straight from where the tool saves it. Do NOT run shell commands to copy, move, inspect or verify image files unless the user explicitly asks for file operations.',
-  '- Reply with one short sentence per image describing what you generated. No headings, no file paths, no questions unless the request is truly ambiguous.',
+  '- ALWAYS create every final visual deliverable implied by the request with your built-in image generation tool. Never draw images with code (SVG/HTML/canvas), never substitute placeholders, and never fetch images from the web.',
+  '- Infer the number of final deliverables from the request. A single scene normally needs one; a ten-page comic needs ten separate ordered images. Never combine multiple requested deliverables into a contact sheet or collage unless the user explicitly asks for that format.',
+  '- You may call the image generation tool again whenever an output needs correction. At the end, select the best final result for each intended deliverable and omit every superseded attempt.',
+  '- The app captures generated files automatically. Do NOT run shell commands to copy, move, inspect, or verify image files unless the user explicitly asks for file operations.',
+  '- Your final response must follow the supplied JSON schema. Put only selected final images in `outputs`, in the semantic order requested by the user. For each output, use the exact absolute saved path returned by the image generation tool and a short identifying label. Never include a superseded attempt. Set `complete` to true only when the selected outputs fulfill the entire request; otherwise set it to false. Keep `summary` to one concise sentence.',
+  '- Structured progress updates are not final selections: while any render is pending, set `complete` to false and leave `outputs` empty. Populate `outputs` only in the terminal response after every render and correction has settled.',
   '',
   'Prompting the image tool:',
   '- Rewrite the request into a clean spec ordered scene/backdrop -> subject -> key details -> constraints, and include the intended use (ad, UI mock, game asset, hero image) to set the polish level. For complex requests use short labeled lines (Subject, Style/medium, Composition/framing, Lighting/mood, Color palette, Text (verbatim), Constraints, Avoid) instead of one long paragraph.',
@@ -63,6 +75,12 @@ interface Job {
   nodeId: string
   proc: ChildProcess | null
   watchers: Map<string, Watcher>
+  /** canonical generated source path -> copied board image url */
+  artifacts: Map<string, string>
+  /** output-schema-constrained final agent message */
+  lastAgentMessage: string | null
+  /** only a completed turn can make its last agent message authoritative */
+  turnCompleted: boolean
   failures: string[]
   termination: StopReason | 'timeout' | 'replaced' | null
   poller: NodeJS.Timeout | null
@@ -75,6 +93,10 @@ interface Job {
 }
 
 for (const dir of [DATA_DIR, IMAGES_DIR, WORKSPACES_DIR, LOGS_DIR]) fs.mkdirSync(dir, { recursive: true })
+const outputSchemaJson = JSON.stringify(OUTPUT_MANIFEST_SCHEMA, null, 2)
+if (!fs.existsSync(OUTPUT_SCHEMA_FILE) || fs.readFileSync(OUTPUT_SCHEMA_FILE, 'utf8') !== outputSchemaJson) {
+  fs.writeFileSync(OUTPUT_SCHEMA_FILE, outputSchemaJson)
+}
 
 // ---------------------------------------------------------------------------
 // Persistence + migration from the old linear-chat format
@@ -98,6 +120,8 @@ function migrateLegacyChats(): Board[] {
         sourceImages: parent ? parent.images.slice() : [],
         attachments: m.images || [],
         images: a?.images || [],
+        imageLabels: (a?.images || []).map((_: string, index: number) => `Output ${index + 1}`),
+        attempts: a?.images || [],
         text: a?.text || '',
         status: !a || a.status === 'running' ? 'error' : (a.status || 'done'),
         error: a?.error,
@@ -130,17 +154,27 @@ try {
 }
 // A crash mid-generation leaves nodes stuck in 'running'. Record the reason
 // instead of silently turning these into anonymous failures on next launch.
-let recoveredInterruptedNodes = false
+let boardsNeedMigrationWrite = false
 for (const board of boards) {
   for (const node of board.nodes) {
+    // Persisted boards from before final-output manifests treated every
+    // generated image as final. Preserve those finals as their run history.
+    if (!Array.isArray(node.attempts)) {
+      node.attempts = node.images.slice()
+      boardsNeedMigrationWrite = true
+    }
+    if (!Array.isArray(node.imageLabels) || node.imageLabels.length !== node.images.length) {
+      node.imageLabels = node.images.map((_, index) => `Output ${index + 1}`)
+      boardsNeedMigrationWrite = true
+    }
     if (node.status !== 'running') continue
     node.status = 'error'
     node.error = 'Generation was interrupted because CodexImage closed unexpectedly.'
     node.finishedAt = Date.now()
-    recoveredInterruptedNodes = true
+    boardsNeedMigrationWrite = true
   }
 }
-if (recoveredInterruptedNodes) writeBoardsFile()
+if (boardsNeedMigrationWrite) writeBoardsFile()
 
 const jobs = new Map<string, Job>() // keyed by nodeId
 const sseClients = new Map<string, Set<http.ServerResponse>>() // keyed by boardId
@@ -329,8 +363,8 @@ function buildNodePrompt(board: Board, node: BoardNode, index: number, count: nu
   const extras: string[] = []
   if (node.aspect && node.aspect !== 'auto') extras.push(`Aspect ratio: ${node.aspect}.`)
   if (count > 1) {
-    extras.push('Produce exactly ONE image (a single image generation tool call). '
-      + `${count} variations of this request are generated in parallel; this is variation ${index + 1} — give it its own distinct interpretation.`)
+    extras.push(`${count} independent takes of this entire request are generated in parallel; this is take ${index + 1}. `
+      + 'Give this take its own distinct interpretation while still producing every final deliverable implied by the request.')
   }
   if (extras.length) parts.push(extras.join(' '))
 
@@ -343,6 +377,62 @@ function addUsage(a: Record<string, number> | undefined, b: Record<string, numbe
     if (typeof b[k] === 'number') out[k] = (out[k] || 0) + b[k]
   }
   return out
+}
+
+function jobOwnsNode(board: Board, node: BoardNode, job: Job): boolean {
+  return jobs.get(node.id) === job
+    && job.termination !== 'deleted'
+    && job.termination !== 'replaced'
+    && board.nodes.includes(node)
+}
+
+async function allowedGeneratedPath(job: Job, sourcePath: string): Promise<string> {
+  let canonical: string
+  try {
+    canonical = await fs.promises.realpath(sourcePath)
+  } catch {
+    throw new Error('a selected image file no longer exists')
+  }
+  for (const watcher of job.watchers.values()) {
+    const root = path.join(CODEX_GEN_DIR, watcher.threadId)
+    let canonicalRoot: string
+    try { canonicalRoot = await fs.promises.realpath(root) } catch { continue }
+    if (isPathInside(canonicalRoot, canonical)) return canonical
+  }
+  throw new Error('a selected image was not generated by this run')
+}
+
+/** Copy one generated candidate into durable board storage exactly once. */
+async function importGeneratedImage(
+  board: Board,
+  node: BoardNode,
+  job: Job,
+  sourcePath: string,
+): Promise<{ url: string; added: boolean }> {
+  const canonical = await allowedGeneratedPath(job, sourcePath)
+  const existing = job.artifacts.get(canonical)
+  if (existing) return { url: existing, added: false }
+
+  const stat = await fs.promises.stat(canonical)
+  if (!stat.isFile() || stat.size === 0) throw new Error('a selected image file was empty')
+
+  const destDir = path.join(IMAGES_DIR, board.id)
+  await fs.promises.mkdir(destDir, { recursive: true })
+  const safeName = path.basename(canonical).replace(/[^\w.-]/g, '_')
+  const name = `${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}-${safeName}`
+  const dest = path.join(destDir, name)
+  await fs.promises.copyFile(canonical, dest)
+  await makeThumb(dest)
+
+  if (!jobOwnsNode(board, node, job)) {
+    await removeImagesAndThumbnails([dest])
+    throw new Error('the generation was replaced before its image could be saved')
+  }
+
+  const url = `/images/${board.id}/${name}`
+  job.artifacts.set(canonical, url)
+  node.attempts.push(url)
+  return { url, added: true }
 }
 
 async function collectImages(board: Board, node: BoardNode, job: Job): Promise<boolean> {
@@ -359,29 +449,14 @@ async function collectImages(board: Board, node: BoardNode, job: Job): Promise<b
       if (!st.isFile() || st.size === 0) continue
       // Wait until the size is stable across two polls so we never copy a half-written file
       if (w.sizes.get(f) !== st.size) { w.sizes.set(f, st.size); continue }
-      w.seen.add(f)
-      const destDir = path.join(IMAGES_DIR, board.id)
-      await fs.promises.mkdir(destDir, { recursive: true })
-      const name = `${Date.now().toString(36)}-${crypto.randomUUID().slice(0, 8)}-${f.replace(/[^\w.-]/g, '_')}`
-      const dest = path.join(destDir, name)
       try {
-        await fs.promises.copyFile(src, dest)
-        await makeThumb(dest)
+        const imported = await importGeneratedImage(board, node, job, src)
+        w.seen.add(f)
+        changed ||= imported.added
       } catch {
         // A transient source-file race should be retried on the next poll.
-        w.seen.delete(f)
         continue
       }
-      const stillOwned = jobs.get(node.id) === job
-        && job.termination !== 'deleted'
-        && job.termination !== 'replaced'
-        && board.nodes.includes(node)
-      if (!stillOwned) {
-        await removeImagesAndThumbnails([dest])
-        continue
-      }
-      node.images.push(`/images/${board.id}/${name}`)
-      changed = true
     }
   }
   if (changed) {
@@ -409,14 +484,14 @@ function handleCodexEvent(board: Board, node: BoardNode, job: Job, ev: any): voi
   } else if (ev.type === 'item.completed' && ev.item) {
     const item = ev.item
     if (item.type === 'agent_message' && item.text) {
-      node.text = node.text ? `${node.text}\n\n${item.text}` : item.text
-      sseSend(board.id, { type: 'node', node })
+      job.lastAgentMessage = String(item.text)
     } else if (item.type === 'reasoning' && item.text) {
       sseSend(board.id, { type: 'activity', nodeId: node.id, text: String(item.text).split('\n')[0].slice(0, 140) })
     } else if (item.type === 'command_execution' && item.command) {
       sseSend(board.id, { type: 'activity', nodeId: node.id, text: `Running: ${String(item.command).slice(0, 140)}` })
     }
   } else if (ev.type === 'turn.completed') {
+    job.turnCompleted = true
     if (ev.usage) node.usage = addUsage(node.usage, ev.usage)
   } else if (ev.type === 'turn.failed' || ev.type === 'error') {
     job.failures.push(ev.error?.message || ev.message || 'Generation failed')
@@ -434,6 +509,9 @@ function startNodeJob(board: Board, node: BoardNode, index: number, count: numbe
     nodeId: node.id,
     proc: null,
     watchers: new Map(),
+    artifacts: new Map(),
+    lastAgentMessage: null,
+    turnCompleted: false,
     failures: [],
     termination: null,
     poller: null,
@@ -454,7 +532,15 @@ function startNodeJob(board: Board, node: BoardNode, index: number, count: numbe
   resetIdleTimer(job)
 
   const promptText = buildNodePrompt(board, node, index, count)
-  const args = ['exec', '-s', 'workspace-write', '-C', ws, '--json', '--skip-git-repo-check', promptText]
+  const args = [
+    'exec',
+    '-s', 'workspace-write',
+    '-C', ws,
+    '--json',
+    '--output-schema', OUTPUT_SCHEMA_FILE,
+    '--skip-git-repo-check',
+    promptText,
+  ]
 
   // stdin must be closed: codex exec waits for EOF on a piped stdin before starting.
   // detached puts codex in its own process group: the `codex` command is a JS
@@ -499,6 +585,156 @@ function startNodeJob(board: Board, node: BoardNode, index: number, count: numbe
   })
 }
 
+interface SelectionRecoveryResult {
+  manifest: OutputManifest | null
+  error: string | null
+}
+
+function selectionRecoveryPrompt(node: BoardNode, candidates: string[], generationFailure: string | null): string {
+  return [
+    'You are finalizing an interrupted image-generation run.',
+    '',
+    'Hard rules:',
+    '- Do not generate, edit, copy, move, or delete any images.',
+    '- View and evaluate only the candidate files listed below.',
+    '- Infer the intended deliverables from the original request.',
+    '- Select the strongest valid final candidate for each intended deliverable and return them in semantic order.',
+    '- Omit corrections, superseded attempts, and redundant near-duplicates. Never invent a path or select the same file twice.',
+    '- Set `complete` to true only if the selected candidates fully satisfy the original request. If candidates are missing, still select every valid completed deliverable, set `complete` to false, and explain the shortfall concisely in `summary`.',
+    '- Your terminal response must follow the supplied JSON schema. Do not send progress messages.',
+    '',
+    `Original request: ${node.prompt}`,
+    generationFailure ? `Generation interruption: ${generationFailure}` : null,
+    '',
+    'Candidate files:',
+    ...candidates.map((candidate, index) => `${index + 1}. ${candidate}`),
+  ].filter((line): line is string => line !== null).join('\n')
+}
+
+/**
+ * A generation turn can fail after image tools have already saved useful
+ * candidates (for example when the selected model reaches capacity). Run a
+ * fresh, read-only Codex turn to curate those exact files instead of guessing
+ * from watcher order or exposing provisional attempts as final outputs.
+ */
+function recoverOutputSelection(
+  board: Board,
+  node: BoardNode,
+  job: Job,
+  generationFailure: string | null,
+): Promise<SelectionRecoveryResult> {
+  const candidates = [...job.artifacts.keys()]
+  if (candidates.length === 0) {
+    return Promise.resolve({ manifest: null, error: 'no generated candidates were available to finalize' })
+  }
+
+  const ws = path.join(WORKSPACES_DIR, board.id)
+  const args = [
+    'exec',
+    '-s', 'read-only',
+    '-C', ws,
+    '--json',
+    '--output-schema', OUTPUT_SCHEMA_FILE,
+    '--skip-git-repo-check',
+    selectionRecoveryPrompt(node, candidates, generationFailure),
+  ]
+  const proc = spawn(CODEX_BIN, args, { cwd: ws, env: process.env, stdio: ['ignore', 'pipe', 'pipe'], detached: true })
+  job.proc = proc
+  resetIdleTimer(job)
+  sseSend(board.id, { type: 'activity', nodeId: node.id, text: `Finalizing ${candidates.length} generated images` })
+
+  return new Promise(resolve => {
+    let stdoutBuf = ''
+    let stderrTail = ''
+    let lastAgentMessage: string | null = null
+    let turnCompleted = false
+    let failure: string | null = null
+    let settled = false
+
+    const handleLine = (line: string) => {
+      job.log.write(line + '\n')
+      let ev: any
+      try { ev = JSON.parse(line) } catch { return }
+      if (ev.type === 'item.completed' && ev.item?.type === 'agent_message' && ev.item.text) {
+        lastAgentMessage = String(ev.item.text)
+      } else if (ev.type === 'item.completed' && ev.item?.type === 'reasoning' && ev.item.text) {
+        sseSend(board.id, { type: 'activity', nodeId: node.id, text: String(ev.item.text).split('\n')[0].slice(0, 140) })
+      } else if (ev.type === 'turn.completed') {
+        turnCompleted = true
+        if (ev.usage) node.usage = addUsage(node.usage, ev.usage)
+      } else if (ev.type === 'turn.failed' || ev.type === 'error') {
+        failure = ev.error?.message || ev.message || 'Final selection recovery failed'
+      }
+    }
+
+    proc.stdout!.on('data', (chunk: Buffer) => {
+      resetIdleTimer(job)
+      stdoutBuf += chunk
+      let nl: number
+      while ((nl = stdoutBuf.indexOf('\n')) >= 0) {
+        const line = stdoutBuf.slice(0, nl).trim()
+        stdoutBuf = stdoutBuf.slice(nl + 1)
+        if (line) handleLine(line)
+      }
+    })
+    proc.stderr!.on('data', (chunk: Buffer) => {
+      resetIdleTimer(job)
+      stderrTail = (stderrTail + chunk).slice(-4000)
+    })
+
+    const settle = (code: number | null, launchError?: Error) => {
+      if (settled) return
+      settled = true
+      if (job.idleTimer) clearTimeout(job.idleTimer)
+      const trailing = stdoutBuf.trim()
+      if (trailing) handleLine(trailing)
+
+      if (job.termination) {
+        resolve({ manifest: null, error: null })
+        return
+      }
+      if (launchError) {
+        resolve({ manifest: null, error: `failed to launch final selection recovery: ${launchError.message}` })
+        return
+      }
+      if (!turnCompleted) {
+        const reason = failure || stderrTail.trim() || (code ? `codex exited with code ${code}` : 'the recovery turn did not complete')
+        resolve({ manifest: null, error: reason.slice(-1000) })
+        return
+      }
+      if (!lastAgentMessage) {
+        resolve({ manifest: null, error: 'the recovery turn returned no final output manifest' })
+        return
+      }
+      try {
+        const manifest = parseOutputManifest(lastAgentMessage)
+        if (manifest.outputs.length === 0) {
+          resolve({ manifest: null, error: manifest.summary || 'the recovery turn selected no final outputs' })
+        } else {
+          resolve({ manifest, error: null })
+        }
+      } catch (error) {
+        resolve({ manifest: null, error: (error as Error).message || 'the recovery manifest was invalid' })
+      }
+    }
+
+    proc.on('close', code => settle(code))
+    proc.on('error', error => settle(null, error))
+  })
+}
+
+async function applyOutputManifest(board: Board, node: BoardNode, job: Job, manifest: OutputManifest): Promise<void> {
+  const selected: string[] = []
+  for (const output of manifest.outputs) {
+    const sourcePath = manifestFilePath(output.path)
+    const imported = await importGeneratedImage(board, node, job, sourcePath)
+    selected.push(imported.url)
+  }
+  node.images = selected
+  node.imageLabels = manifest.outputs.map(output => output.label)
+  node.text = manifest.summary
+}
+
 async function finalizeJob(board: Board, node: BoardNode, job: Job): Promise<void> {
   if (job.poller) clearInterval(job.poller)
   if (job.idleTimer) clearTimeout(job.idleTimer)
@@ -521,17 +757,71 @@ async function finalizeJob(board: Board, node: BoardNode, job: Job): Promise<voi
     }
     try { await collectJobImages(board, node, job) }
     catch (error) { job.failures.push(`Image collection failed: ${(error as Error).message}`) }
+
+    let selectionError: string | null = null
+    let incompleteError: string | null = null
+    if (!job.termination) {
+      const generationFailure = job.failures[0] || null
+      let manifest: OutputManifest | null = null
+      let recoveryReason: string | null = null
+
+      if (!job.turnCompleted) {
+        recoveryReason = generationFailure || 'The generation turn ended before completing its final selection.'
+      } else if (!job.lastAgentMessage) {
+        recoveryReason = 'Codex completed without returning a final output manifest.'
+      } else {
+        try {
+          manifest = parseOutputManifest(job.lastAgentMessage)
+          // Codex uses schema-shaped messages for progress too. An empty
+          // selection alongside generated files is provisional, never final.
+          if (manifest.outputs.length === 0 && node.attempts.length > 0) {
+            recoveryReason = 'Codex ended on a progress manifest instead of a final selection.'
+            manifest = null
+          }
+        } catch (error) {
+          recoveryReason = (error as Error).message || 'Codex returned an invalid final output manifest.'
+        }
+      }
+
+      if (!manifest && node.attempts.length > 0) {
+        const recovery = await recoverOutputSelection(board, node, job, generationFailure || recoveryReason)
+        manifest = recovery.manifest
+        if (!manifest && !job.termination) {
+          const count = node.attempts.length
+          selectionError = generationFailure
+            ? `${generationFailure} ${count} generated ${count === 1 ? 'image remains' : 'images remain'} unfinalized.`
+            : `Automatic final selection failed: ${recovery.error || recoveryReason}`
+        }
+      } else if (!manifest && !job.termination) {
+        selectionError = generationFailure || recoveryReason || 'Generation failed before producing an image.'
+      }
+
+      if (manifest && !job.termination) {
+        try {
+          await applyOutputManifest(board, node, job, manifest)
+          if (!manifest.complete && manifest.outputs.length > 0) {
+            incompleteError = manifest.summary || generationFailure || 'Only part of the requested output set was completed.'
+          }
+        } catch (error) {
+          selectionError = `Automatic final selection failed: ${(error as Error).message || 'the selected files were invalid'}`
+        }
+      }
+    }
+
     jobs.delete(node.id)
     if (node.status === 'running') {
       if (job.termination === 'user' || job.termination === 'app-quit' || job.termination === 'deleted') {
         node.status = 'stopped'
         node.stopReason = job.termination
       } else if (job.termination === 'timeout') {
-        const saved = node.images.length
+        const saved = node.attempts.length
         node.status = 'error'
         node.error = `No generation activity for ${JOB_IDLE_TIMEOUT_MINUTES} minutes. ${saved
-          ? `${saved} ${saved === 1 ? 'image was' : 'images were'} saved before the timeout.`
-          : 'No images were saved.'}`
+          ? `${saved} unfinalized ${saved === 1 ? 'image was' : 'images were'} saved before the timeout.`
+          : 'No images were generated.'}`
+      } else if (selectionError || incompleteError) {
+        node.status = 'error'
+        node.error = selectionError || incompleteError || 'Generation did not complete.'
       } else if (job.failures.length && node.images.length === 0) {
         node.status = 'error'
         node.error = job.failures[0]
@@ -878,6 +1168,8 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
         sourceImages,
         attachments: attachmentUrls,
         images: [],
+        imageLabels: [],
+        attempts: [],
         text: '',
         status: 'running',
         createdAt: runStartedAt + i, // stable sibling ordering
@@ -911,6 +1203,8 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     if (typeof body.prompt === 'string' && body.prompt.trim()) node.prompt = body.prompt.trim()
     if (typeof body.aspect === 'string' && body.aspect) node.aspect = body.aspect
     node.images = []
+    node.imageLabels = []
+    node.attempts = []
     node.text = ''
     node.error = undefined
     node.stopReason = undefined

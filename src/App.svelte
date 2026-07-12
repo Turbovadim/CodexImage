@@ -61,8 +61,8 @@
         <div class="text-[42px] text-accent">❖</div>
         <h1 class="text-[26px] font-semibold text-ink">What should we create?</h1>
         <p class="max-w-lg">
-          Prompt once — or ×4 for four takes side by side. Every generation becomes a node
-          you can branch, continue, and regenerate on an infinite canvas.
+          Ask for one image or a complete ordered series — Codex decides the set. Use ×4 for
+          parallel takes, then branch, continue, and regenerate on an infinite canvas.
         </p>
         <div class="flex max-w-[560px] flex-wrap justify-center gap-2">
           {#each SAMPLES as s (s)}

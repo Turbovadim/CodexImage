@@ -15,9 +15,13 @@ export interface BoardNode {
   sourceImages: string[]
   /** user-uploaded reference images for this node (server /images/... urls) */
   attachments: string[]
-  /** generated outputs */
+  /** Codex-selected final outputs, in semantic order */
   images: string[]
-  /** codex's one-line description(s) */
+  /** semantic labels aligned by index with images */
+  imageLabels: string[]
+  /** all generated candidates from the current run; never presented as final outputs */
+  attempts: string[]
+  /** Codex's concise description of the selected final output set */
   text: string
   status: NodeStatus
   error?: string

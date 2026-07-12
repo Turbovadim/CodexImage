@@ -20,6 +20,13 @@
 
   const bn = $derived(data.bn)
   const running = $derived(bn.status === 'running')
+  const attempts = $derived(bn.attempts ?? [])
+  const provisionalImage = $derived(bn.images.length === 0 ? attempts[attempts.length - 1] : undefined)
+  const displayImages = $derived(bn.images.length > 0 ? bn.images : provisionalImage ? [provisionalImage] : [])
+  const compactOutputs = $derived(
+    bn.images.length > 6 ? bn.images.slice(1, 5) : bn.images.slice(1, 6),
+  )
+  const hiddenOutputCount = $derived(Math.max(0, bn.images.length - compactOutputs.length - 1))
   const activity = $derived(app.activity[bn.id] ?? '')
   const isTarget = $derived(app.target?.nodeId === bn.id)
   const date = $derived(
@@ -62,7 +69,8 @@
   const viewport = useViewport()
   const dpr = window.devicePixelRatio || 1
   const THUMB_W = 720
-  const hiZoom = $derived(THUMB_W / ((bn.images.length > 1 ? CARD_W / 2 : CARD_W) * dpr))
+  const tiledOutputs = $derived(displayImages.length > 1 && displayImages.length <= 4)
+  const hiZoom = $derived(THUMB_W / ((tiledOutputs ? CARD_W / 2 : CARD_W) * dpr))
   const hiRes = $derived(viewport.current.zoom >= hiZoom)
 
   // Decode only cards near the viewport. Cards downgrade to their thumbnail
@@ -78,7 +86,7 @@
     if (!hiRes || !nearViewport) return
 
     let disposed = false
-    const requests = bn.images
+    const requests = displayImages
       .filter(src => !decodedNearViewport.has(src))
       .map(src => {
         const request = requestImageDecode(src)
@@ -181,9 +189,9 @@
       {@render toolButton('Duplicate as a new sibling node (D)', 'duplicate', () => void app.duplicate(bn))}
     {/if}
     {@render toolButton('Copy prompt', copied ? 'check' : 'copy', copyPrompt)}
-    {#if bn.images.length > 0}
+    {#if bn.images.length === 1}
       <a
-        href={bn.images[bn.images.length - 1]}
+        href={bn.images[0]}
         download
         onclick={e => e.stopPropagation()}
         title="Download image"
@@ -247,64 +255,149 @@
 
     <div class="border-t border-dashed border-line/80"></div>
 
-    <!-- result -->
-    {#if bn.images.length > 0}
-      <div class="relative {bn.images.length > 1 ? 'grid grid-cols-2 gap-px bg-line/50' : ''}">
-        {#each bn.images as src (src)}
-          <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
-          <!-- lazy is safe here because the box height is reserved via aspect-ratio -->
-          <img
-            src={ready[src] && nearViewport ? src : thumbUrl(src)}
-            style={reservedRatio(src)}
-            onerror={ready[src] && nearViewport ? undefined : thumbFallback(src)}
-            onload={e => {
-              const el = e.currentTarget as HTMLImageElement
-              if (el.naturalWidth && el.naturalHeight) seenRatio.set(src, el.naturalWidth / el.naturalHeight)
-            }}
-            alt=""
-            loading="lazy"
-            decoding="async"
-            onclick={() => app.openImage(src, bn)}
-            class="nodrag block w-full cursor-zoom-in transition-[filter,opacity] duration-200 ease-out
-              {running ? 'blur-[1.5px] opacity-80' : ''}"
-            draggable={false}
-          />
-        {/each}
-        {#if running}
-          <div class="generation-sweep pointer-events-none absolute inset-0"></div>
-        {/if}
-      </div>
+    <!-- While Codex is working, only its latest candidate is visible. Once the
+         final manifest arrives, this switches atomically to the ordered set. -->
+    {#if displayImages.length > 0}
+      {#if bn.images.length <= 4}
+        <div class="relative {tiledOutputs ? 'grid grid-cols-2 gap-px bg-line/50' : ''}">
+          {#each displayImages as src (src)}
+            <div class="overflow-hidden">
+              <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
+              <img
+                src={ready[src] && nearViewport ? src : thumbUrl(src)}
+                style={reservedRatio(src)}
+                onerror={ready[src] && nearViewport ? undefined : thumbFallback(src)}
+                onload={e => {
+                  const el = e.currentTarget as HTMLImageElement
+                  if (el.naturalWidth && el.naturalHeight) seenRatio.set(src, el.naturalWidth / el.naturalHeight)
+                }}
+                alt=""
+                loading="lazy"
+                decoding="async"
+                onclick={provisionalImage ? undefined : () => app.openImage(src, bn)}
+                class="nodrag block w-full transition-[filter,opacity,transform] duration-200 ease-out
+                  {provisionalImage ? '' : 'cursor-zoom-in'}
+                  {running ? 'generation-preview' : ''}"
+                draggable={false}
+              />
+            </div>
+          {/each}
+          {#if running}<div class="generation-sweep pointer-events-none absolute inset-0"></div>{/if}
+          {#if !running && provisionalImage}
+            <span class="pointer-events-none absolute right-2 bottom-2 rounded-md bg-bg/80 px-2 py-1 text-[10px] text-dim">
+              Unfinalized
+            </span>
+          {/if}
+        </div>
+      {:else}
+        <!-- Large ordered sets stay compact on the canvas: first output as
+             the hero, then a numbered filmstrip. The lightbox exposes all. -->
+        <div class="bg-line/50">
+          <div class="relative bg-raised">
+            <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
+            <img
+              src={ready[bn.images[0]] && nearViewport ? bn.images[0] : thumbUrl(bn.images[0])}
+              style={reservedRatio(bn.images[0])}
+              onerror={ready[bn.images[0]] && nearViewport ? undefined : thumbFallback(bn.images[0])}
+              onload={e => {
+                const el = e.currentTarget as HTMLImageElement
+                if (el.naturalWidth && el.naturalHeight) seenRatio.set(bn.images[0], el.naturalWidth / el.naturalHeight)
+              }}
+              alt=""
+              loading="lazy"
+              decoding="async"
+              onclick={() => app.openImage(bn.images[0], bn)}
+              class="nodrag block w-full cursor-zoom-in"
+              draggable={false}
+            />
+            <span class="pointer-events-none absolute right-2 bottom-2 rounded-md bg-bg/80 px-2 py-1 text-[10px] tabular-nums text-ink/80">
+              1 / {bn.images.length}
+            </span>
+          </div>
+          <div class="mt-px flex gap-px bg-line/50">
+            {#each compactOutputs as src, index (src)}
+              <button
+                onclick={() => app.openImage(src, bn)}
+                title={bn.imageLabels[index + 1] || `Output ${index + 2}`}
+                class="nodrag relative min-w-0 flex-1 cursor-zoom-in overflow-hidden bg-raised
+                  focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent"
+              >
+                <img
+                  src={thumbUrl(src)}
+                  onerror={thumbFallback(src)}
+                  alt=""
+                  loading="lazy"
+                  decoding="async"
+                  class="aspect-square w-full object-cover"
+                  draggable={false}
+                />
+                <span class="pointer-events-none absolute right-1 bottom-1 rounded bg-bg/75 px-1 py-0.5 text-[9px] tabular-nums text-ink/75">
+                  {index + 2}
+                </span>
+              </button>
+            {/each}
+            {#if hiddenOutputCount > 0}
+              {@const hiddenIndex = compactOutputs.length + 1}
+              <button
+                onclick={() => app.openImage(bn.images[hiddenIndex], bn)}
+                title={`Open ${hiddenOutputCount} more outputs`}
+                class="nodrag flex min-w-0 flex-1 items-center justify-center bg-raised text-[12px] font-medium text-dim
+                  hover:bg-hover hover:text-ink focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent"
+              >
+                +{hiddenOutputCount}
+              </button>
+            {/if}
+          </div>
+        </div>
+      {/if}
     {/if}
 
     {#if running}
       <div class="relative">
-        {#if bn.images.length === 0}
+        {#if displayImages.length === 0}
           <div
             class="aspect-square w-full animate-shimmer
               bg-[linear-gradient(100deg,var(--color-raised)_40%,var(--color-hover)_50%,var(--color-raised)_60%)] bg-[length:200%_100%]"
           ></div>
         {/if}
-        <div class="flex items-center gap-2 px-4 py-2.5 text-[11.5px] text-dim {bn.images.length === 0 ? 'absolute inset-x-0 bottom-0' : ''}">
+        <div class="flex items-center gap-2 px-4 py-2.5 text-[11.5px] text-dim {displayImages.length === 0 ? 'absolute inset-x-0 bottom-0' : ''}">
           <div class="size-3.5 shrink-0 animate-spin rounded-full border-2 border-line border-t-accent"></div>
-          <span class="shrink-0">Generating · <Elapsed since={bn.runStartedAt ?? bn.createdAt} /></span>
+          <span class="shrink-0">
+            {attempts.length > 0 ? `${attempts.length} generated · ` : 'Generating · '}<Elapsed since={bn.runStartedAt ?? bn.createdAt} />
+          </span>
           {#if activity}<span class="min-w-0 truncate text-faint">{activity}</span>{/if}
         </div>
       </div>
     {/if}
 
     {#if bn.status === 'error'}
-      <div class="flex flex-col items-center gap-2.5 px-5 py-8 text-center">
-        <Icon name="alert" size={22} class="text-danger" />
-        <div class="line-clamp-4 max-w-full text-[12px] break-words text-danger/90" title={bn.error}>
-          {bn.error || 'Generation failed'}
+      {#if bn.images.length > 0}
+        <div class="flex items-start gap-2.5 px-4 py-3 text-[11.5px]">
+          <Icon name="alert" size={14} class="mt-0.5 shrink-0 text-danger" />
+          <div class="line-clamp-3 min-w-0 flex-1 break-words text-danger/90" title={bn.error}>
+            {bn.error || 'The output set is incomplete.'}
+          </div>
+          <button
+            onclick={e => { e.stopPropagation(); app.regenerate(bn) }}
+            class="nodrag flex shrink-0 items-center gap-1 rounded-lg border border-line px-2 py-1 text-[11px] text-dim hover:border-faint hover:text-ink"
+          >
+            <Icon name="refresh" size={11} /> Retry
+          </button>
         </div>
-        <button
-          onclick={e => { e.stopPropagation(); app.regenerate(bn) }}
-          class="nodrag flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12px] text-dim hover:border-faint hover:text-ink"
-        >
-          <Icon name="refresh" size={12} /> Retry
-        </button>
-      </div>
+      {:else}
+        <div class="flex flex-col items-center gap-2.5 px-5 py-8 text-center">
+          <Icon name="alert" size={22} class="text-danger" />
+          <div class="line-clamp-4 max-w-full text-[12px] break-words text-danger/90" title={bn.error}>
+            {bn.error || 'Generation failed'}
+          </div>
+          <button
+            onclick={e => { e.stopPropagation(); app.regenerate(bn) }}
+            class="nodrag flex items-center gap-1.5 rounded-lg border border-line px-3 py-1.5 text-[12px] text-dim hover:border-faint hover:text-ink"
+          >
+            <Icon name="refresh" size={12} /> Retry
+          </button>
+        </div>
+      {/if}
     {/if}
 
     {#if bn.status === 'stopped'}
@@ -322,7 +415,7 @@
     {#if !running && bn.status === 'done'}
       <div class="flex items-center gap-2 px-4 py-2.5 text-[10.5px] text-faint">
         <span class="flex shrink-0 items-center gap-1 text-dim">
-          <Icon name="check" size={11} /> Finished
+          <Icon name="check" size={11} /> Finished{bn.images.length > 1 ? ` · ${bn.images.length} images` : ''}
         </span>
         {#if bn.text}
           <span class="min-w-0 flex-1 truncate" title={bn.text}>{bn.text}</span>
