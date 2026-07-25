@@ -1,9 +1,21 @@
 mod app;
 mod canvas;
+mod canvas_view;
 mod card;
+mod card_layout;
+mod card_scene;
+mod card_svg;
+mod composer;
 mod format;
 mod input;
+mod input_actions;
+mod input_element;
+mod input_layout;
+mod input_text;
 mod keymap;
+mod lightbox;
+mod node_actions;
+mod overlays;
 mod theme;
 
 pub use app::run;

@@ -1,16 +1,19 @@
+mod codex;
+mod prompt;
+
 use crate::manifest::{OutputManifest, absolute_file_path, is_path_inside};
 use crate::model::{
     Board, BoardNode, MAX_ACTIVE_PER_BOARD, NewNodesRequest, NodeStatus, StopReason,
 };
 use crate::storage::{Repository, now_ms};
 use anyhow::{Context, Result, bail};
+use codex::{CodexInvocation, configure_process_group, kill_process_group, read_tail};
 use parking_lot::Mutex;
+use prompt::{build_node_prompt, selection_recovery_prompt, tail_chars};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::env;
-use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -22,26 +25,6 @@ use std::time::{Duration, Instant};
 const POLL_INTERVAL: Duration = Duration::from_millis(1_200);
 const FINAL_SWEEP_DELAY: Duration = Duration::from_millis(800);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
-const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(4);
-const LOGIN_SHELL_PATH_MARKER: &[u8] = b"__CODEXIMAGE_PATH__=";
-
-const PREAMBLE: &str = r#"You are an expert image-generation assistant.
-
-Hard rules:
-- ALWAYS create every final visual deliverable implied by the request with your built-in image generation tool. Never draw images with code (SVG/HTML/canvas), never substitute placeholders, and never fetch images from the web.
-- Infer the number of final deliverables from the request. A single scene normally needs one; a ten-page comic needs ten separate ordered images. Never combine multiple requested deliverables into a contact sheet or collage unless the user explicitly asks for that format.
-- You may call the image generation tool again whenever an output needs correction. At the end, select the best final result for each intended deliverable and omit every superseded attempt.
-- The app captures generated files automatically. Do NOT run shell commands to copy, move, inspect, or verify image files unless the user explicitly asks for file operations.
-- Your final response must follow the supplied JSON schema. Put only selected final images in `outputs`, in the semantic order requested by the user. For each output, use the exact absolute saved path returned by the image generation tool and a short identifying label. Never include a superseded attempt. Set `complete` to true only when the selected outputs fulfill the entire request; otherwise set it to false. Keep `summary` to one concise sentence.
-- Structured progress updates are not final selections: while any render is pending, set `complete` to false and leave `outputs` empty. Populate `outputs` only in the terminal response after every render and correction has settled.
-
-Prompting the image tool:
-- Rewrite the request into a clean spec ordered scene/backdrop -> subject -> key details -> constraints, and include the intended use to set the polish level. For complex requests use short labeled lines.
-- Match augmentation to specificity. Never invent characters, props, brands, slogans, palettes, or story beats the user did not imply.
-- For photorealism, use photography language and ask for real-world texture and imperfect everyday detail.
-- If text must appear in the image, quote it verbatim, specify typography and placement, spell uncommon words letter-by-letter, and require exact rendering with no extra characters.
-- When image files are provided, treat each by its stated role. For compositing, match lighting, perspective, and scale.
-- For edits, state invariants explicitly. Preserve identity aggressively when people are involved and preserve everything the request does not ask to change."#;
 
 #[derive(Clone)]
 pub struct GenerationEngine {
@@ -52,11 +35,6 @@ struct EngineInner {
     repository: Repository,
     jobs: Mutex<HashMap<String, Arc<JobControl>>>,
     codex: OnceLock<CodexInvocation>,
-}
-
-struct CodexInvocation {
-    executable: PathBuf,
-    path: OsString,
 }
 
 struct JobControl {
@@ -781,404 +759,16 @@ impl GenerationEngine {
     }
 }
 
-fn build_node_prompt(
-    repository: &Repository,
-    board: &Board,
-    node: &BoardNode,
-    index: usize,
-    count: usize,
-) -> String {
-    let mut sections = vec![PREAMBLE.to_owned()];
-    let by_id: HashMap<_, _> = board
-        .nodes
-        .iter()
-        .map(|node| (node.id.as_str(), node))
-        .collect();
-    let mut ancestors = Vec::new();
-    let mut current = node
-        .parent_id
-        .as_deref()
-        .and_then(|id| by_id.get(id).copied());
-    while let Some(ancestor) = current {
-        let prompt = if ancestor.prompt.chars().count() > 400 {
-            format!("{}…", ancestor.prompt.chars().take(397).collect::<String>())
-        } else {
-            ancestor.prompt.clone()
-        };
-        ancestors.push(prompt);
-        if ancestors.len() == 12 {
-            break;
-        }
-        current = ancestor
-            .parent_id
-            .as_deref()
-            .and_then(|id| by_id.get(id).copied());
-    }
-    ancestors.reverse();
-    if !ancestors.is_empty() {
-        sections.push(format!(
-            "This request continues earlier work on an image. The prompts so far, oldest first:\n{}",
-            ancestors
-                .iter()
-                .enumerate()
-                .map(|(index, prompt)| format!("{}. {prompt}", index + 1))
-                .collect::<Vec<_>>()
-                .join("\n")
-        ));
-    }
-    let source_paths: Vec<_> = node
-        .source_images
-        .iter()
-        .filter_map(|url| repository.image_path(&board.id, url))
-        .filter(|path| path.exists())
-        .collect();
-    if !source_paths.is_empty() {
-        sections.push(format!(
-            "The current image to continue from is saved at:\n{}\nView it first. The request below applies to this image: keep everything it does not ask to change.",
-            bullet_paths(&source_paths)
-        ));
-    }
-    let attachments: Vec<_> = node
-        .attachments
-        .iter()
-        .filter_map(|url| repository.image_path(&board.id, url))
-        .filter(|path| path.exists())
-        .collect();
-    if !attachments.is_empty() {
-        sections.push(format!(
-            "The user attached reference image file(s). View them before generating:\n{}",
-            bullet_paths(&attachments)
-        ));
-    }
-    sections.push(format!("Request: {}", node.prompt));
-    let mut extras = Vec::new();
-    if node.aspect != "auto" {
-        extras.push(format!("Aspect ratio: {}.", node.aspect));
-    }
-    if count > 1 {
-        extras.push(format!(
-            "{count} independent takes of this entire request are generated in parallel; this is take {}. Give this take its own distinct interpretation while still producing every final deliverable implied by the request.",
-            index + 1
-        ));
-    }
-    if !extras.is_empty() {
-        sections.push(extras.join(" "));
-    }
-    sections.join("\n\n")
-}
-
-fn selection_recovery_prompt<'a>(
-    node: &BoardNode,
-    candidates: impl Iterator<Item = &'a PathBuf>,
-    failure: Option<&str>,
-) -> String {
-    let mut lines = vec![
-        "You are finalizing an interrupted image-generation run.".to_owned(),
-        "Hard rules: Do not generate, edit, copy, move, or delete images. View only the candidates below. Select the strongest final candidate for each intended deliverable in semantic order. Omit superseded attempts and duplicates. Return the supplied JSON schema and set complete accurately.".to_owned(),
-        format!("Original request: {}", node.prompt),
-    ];
-    if let Some(failure) = failure {
-        lines.push(format!("Generation interruption: {failure}"));
-    }
-    lines.push("Candidate files:".into());
-    lines.extend(
-        candidates
-            .enumerate()
-            .map(|(index, path)| format!("{}. {}", index + 1, path.display())),
-    );
-    lines.join("\n\n")
-}
-
-fn bullet_paths(paths: &[PathBuf]) -> String {
-    paths
-        .iter()
-        .map(|path| format!("- {}", path.display()))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn tail_chars(value: &str, limit: usize) -> String {
-    let count = value.chars().count();
-    value.chars().skip(count.saturating_sub(limit)).collect()
-}
-
-/// Drains `reader` and keeps at most the last `limit` bytes.
-fn read_tail_bytes(mut reader: impl Read, limit: usize) -> Vec<u8> {
-    let mut tail = Vec::with_capacity(limit);
-    let mut chunk = [0_u8; 8 * 1024];
-    loop {
-        match reader.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
-            Ok(read) => {
-                tail.extend_from_slice(&chunk[..read]);
-                if tail.len() > limit {
-                    tail.drain(..tail.len() - limit);
-                }
-            }
-        }
-    }
-    tail
-}
-
-fn read_tail(reader: impl Read, limit: usize) -> String {
-    String::from_utf8_lossy(&read_tail_bytes(reader, limit)).into_owned()
-}
-
-impl CodexInvocation {
-    fn resolve() -> Self {
-        let path = build_command_path(
-            login_shell_path(),
-            env::var_os("PATH"),
-            dirs::home_dir().as_deref(),
-        );
-        let executable = env::var_os("CODEX_BIN")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                find_executable_on_path(OsStr::new("codex"), &path)
-                    .unwrap_or_else(|| PathBuf::from("codex"))
-            });
-        Self { executable, path }
-    }
-
-    fn command(&self) -> Command {
-        let mut command = Command::new(&self.executable);
-        command.env("PATH", &self.path);
-        command
-    }
-}
-
-fn build_command_path(
-    login_shell: Option<OsString>,
-    inherited: Option<OsString>,
-    home: Option<&Path>,
-) -> OsString {
-    let mut entries = Vec::new();
-    if let Some(path) = login_shell {
-        entries.extend(env::split_paths(&path));
-    }
-    if let Some(path) = inherited.as_ref() {
-        entries.extend(env::split_paths(path));
-    }
-    if let Some(home) = home {
-        entries.extend([
-            home.join(".bun/bin"),
-            home.join(".local/bin"),
-            home.join(".cargo/bin"),
-            home.join(".volta/bin"),
-            home.join(".npm-global/bin"),
-            home.join("Library/pnpm"),
-        ]);
-        let nvm_versions = home.join(".nvm/versions/node");
-        if let Ok(versions) = fs::read_dir(nvm_versions) {
-            let mut version_bins: Vec<_> = versions
-                .filter_map(Result::ok)
-                .map(|entry| entry.path().join("bin"))
-                .filter(|path| path.is_dir())
-                .collect();
-            version_bins.sort_by(|left, right| right.cmp(left));
-            entries.extend(version_bins);
-        }
-    }
-    entries.extend([
-        PathBuf::from("/opt/homebrew/bin"),
-        PathBuf::from("/usr/local/bin"),
-        PathBuf::from("/usr/bin"),
-        PathBuf::from("/bin"),
-        PathBuf::from("/usr/sbin"),
-        PathBuf::from("/sbin"),
-    ]);
-
-    let mut seen = HashSet::new();
-    entries.retain(|entry| !entry.as_os_str().is_empty() && seen.insert(entry.clone()));
-    env::join_paths(entries).unwrap_or_else(|_| {
-        inherited.unwrap_or_else(|| OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"))
-    })
-}
-
-fn find_executable_on_path(name: &OsStr, path: &OsStr) -> Option<PathBuf> {
-    env::split_paths(path)
-        .map(|directory| directory.join(name))
-        .find(|candidate| is_executable(candidate))
-}
-
-#[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    path.metadata()
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(not(unix))]
-fn is_executable(path: &Path) -> bool {
-    path.is_file()
-}
-
-fn login_shell_path() -> Option<OsString> {
-    let shell = env::var_os("SHELL")
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| OsString::from("/bin/zsh"));
-    let mut command = Command::new(shell);
-    command
-        .args(["-ilc", "printf '\n__CODEXIMAGE_PATH__=%s\n' \"$PATH\""])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    configure_process_group(&mut command);
-    let mut child = command.spawn().ok()?;
-    let stdout = child.stdout.take()?;
-    let output = thread::spawn(move || read_tail_bytes(stdout, 64 * 1024));
-    let deadline = Instant::now() + LOGIN_SHELL_TIMEOUT;
-    let succeeded = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status.success(),
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
-            Ok(None) => {
-                terminate_process(&mut child);
-                break false;
-            }
-            Err(_) => {
-                terminate_process(&mut child);
-                break false;
-            }
-        }
-    };
-    let bytes = output.join().ok()?;
-    succeeded.then(|| parse_login_shell_path(&bytes)).flatten()
-}
-
-fn terminate_process(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    kill_process_group(child.id() as i32, libc::SIGKILL);
-    #[cfg(not(unix))]
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-#[cfg(unix)]
-fn parse_login_shell_path(output: &[u8]) -> Option<OsString> {
-    use std::os::unix::ffi::OsStringExt;
-    let start = output
-        .windows(LOGIN_SHELL_PATH_MARKER.len())
-        .rposition(|window| window == LOGIN_SHELL_PATH_MARKER)?
-        + LOGIN_SHELL_PATH_MARKER.len();
-    let end = output[start..]
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .map_or(output.len(), |offset| start + offset);
-    (end > start).then(|| OsString::from_vec(output[start..end].to_vec()))
-}
-
-#[cfg(not(unix))]
-fn parse_login_shell_path(output: &[u8]) -> Option<OsString> {
-    let output = String::from_utf8_lossy(output);
-    output
-        .lines()
-        .rev()
-        .find_map(|line| line.strip_prefix("__CODEXIMAGE_PATH__="))
-        .filter(|path| !path.is_empty())
-        .map(OsString::from)
-}
-
-#[cfg(unix)]
-fn configure_process_group(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    command.process_group(0);
-}
-
-#[cfg(not(unix))]
-fn configure_process_group(_: &mut Command) {}
-
-#[cfg(unix)]
-fn kill_process_group(pid: i32, signal: i32) {
-    if pid > 0 {
-        unsafe {
-            libc::kill(-pid, signal);
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn kill_process_group(_: i32, _: i32) {}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        GenerationEngine, JobControl, Termination, build_command_path, find_executable_on_path,
-        parse_login_shell_path, read_tail,
-    };
+    use super::{GenerationEngine, JobControl, Termination};
     use crate::model::{NewNodesRequest, NodeStatus, StopReason};
     use crate::storage::{DataPaths, Repository};
     use async_channel::unbounded;
     use parking_lot::Mutex;
-    use std::ffi::{OsStr, OsString};
-    use std::io::Cursor;
-    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::AtomicI32;
     use tempfile::TempDir;
-
-    #[test]
-    fn stderr_tail_drains_input_and_retains_the_requested_suffix() {
-        let input: Vec<_> = (0_u32..20_000)
-            .map(|value| b'a' + (value % 26) as u8)
-            .collect();
-        let result = read_tail(Cursor::new(&input), 4_096);
-        assert_eq!(result.as_bytes(), &input[input.len() - 4_096..]);
-    }
-
-    #[test]
-    fn command_path_prefers_the_login_shell_and_deduplicates_entries() {
-        let directory = TempDir::new().unwrap();
-        let login = OsString::from("/login/bin:/shared/bin");
-        let inherited = OsString::from("/shared/bin:/inherited/bin");
-
-        let path = build_command_path(Some(login), Some(inherited), Some(directory.path()));
-        let entries: Vec<_> = std::env::split_paths(&path).collect();
-
-        assert_eq!(entries[0], PathBuf::from("/login/bin"));
-        assert_eq!(entries[1], PathBuf::from("/shared/bin"));
-        assert_eq!(entries[2], PathBuf::from("/inherited/bin"));
-        assert_eq!(
-            entries
-                .iter()
-                .filter(|entry| *entry == &PathBuf::from("/shared/bin"))
-                .count(),
-            1
-        );
-        assert!(entries.contains(&directory.path().join(".bun/bin")));
-        assert!(entries.contains(&PathBuf::from("/opt/homebrew/bin")));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn executable_resolution_finds_an_executable_file() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let directory = TempDir::new().unwrap();
-        let executable = directory.path().join("codex");
-        std::fs::write(&executable, "#!/bin/sh\n").unwrap();
-        let mut permissions = executable.metadata().unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&executable, permissions).unwrap();
-        let path = std::env::join_paths([directory.path()]).unwrap();
-
-        assert_eq!(
-            find_executable_on_path(OsStr::new("codex"), &path),
-            Some(executable)
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn login_shell_path_parser_ignores_shell_startup_output() {
-        let output = b"startup noise\n__CODEXIMAGE_PATH__=/user/bin:/usr/bin\n";
-
-        assert_eq!(
-            parse_login_shell_path(output),
-            Some(OsString::from("/user/bin:/usr/bin"))
-        );
-    }
 
     #[test]
     fn cancellation_before_spawn_finishes_the_node_without_launching_codex() {

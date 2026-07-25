@@ -1,0 +1,758 @@
+//! Everything layered over the canvas: the board switcher, the gallery, the
+//! prompt and rename modals, the quit confirmation, and toasts.
+
+use super::app::AppView;
+use super::app::Overlay;
+use super::composer::control_button;
+use super::format::{format_date, format_tokens, node_depths, status_label, time_ago};
+use super::input::TextInputMode;
+use super::keymap::{Generate, OpenBoards, ToggleGallery};
+use super::theme;
+use gpui::{
+    AnyElement, Context, Focusable, FontWeight, ObjectFit, Role, SharedString, StyledImage, Window,
+    div, img, prelude::*, px,
+};
+use std::time::Duration;
+
+pub(super) struct Toast {
+    pub(super) text: String,
+    pub(super) error: bool,
+    pub(super) undo: Option<(String, String)>,
+    pub(super) serial: u64,
+}
+
+impl AppView {
+    pub(super) fn show_error(&mut self, error: impl std::fmt::Display, cx: &mut Context<Self>) {
+        self.show_toast(error.to_string(), true, None, cx);
+    }
+
+    pub(super) fn show_toast(
+        &mut self,
+        text: String,
+        error: bool,
+        undo: Option<(String, String)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.toast_serial += 1;
+        let serial = self.toast_serial;
+        self.toast = Some(Toast {
+            text,
+            error,
+            undo,
+            serial,
+        });
+        cx.spawn(async move |weak, cx| {
+            cx.background_executor().timer(Duration::from_secs(8)).await;
+            let _ = weak.update(cx, |view, cx| {
+                if view
+                    .toast
+                    .as_ref()
+                    .is_some_and(|toast| toast.serial == serial)
+                {
+                    view.toast = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub(super) fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.overlay = Overlay::None;
+        self.modal_input.update(cx, |input, cx| input.clear(cx));
+        window.focus(&self.focus, cx);
+    }
+
+    pub(super) fn open_boards(
+        &mut self,
+        _: &OpenBoards,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.overlay = if matches!(self.overlay, Overlay::Boards) {
+            Overlay::None
+        } else {
+            Overlay::Boards
+        };
+        self.armed_board_delete = None;
+        self.search_input.update(cx, |input, cx| input.clear(cx));
+        if matches!(self.overlay, Overlay::Boards) {
+            window.focus(&self.search_input.focus_handle(cx), cx);
+        } else {
+            window.focus(&self.focus, cx);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn toggle_gallery(
+        &mut self,
+        _: &ToggleGallery,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(
+            self.overlay,
+            Overlay::Lightbox(_)
+                | Overlay::EditNode(_)
+                | Overlay::RenameBoard(_)
+                | Overlay::QuitConfirm
+        ) {
+            return;
+        }
+        self.overlay = if matches!(self.overlay, Overlay::Gallery) {
+            Overlay::None
+        } else {
+            Overlay::Gallery
+        };
+        cx.notify();
+    }
+
+    pub(super) fn save_edited_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Overlay::EditNode(node_id) = &self.overlay else {
+            return;
+        };
+        let node_id = node_id.clone();
+        let prompt = self.modal_input.read(cx).content().trim().to_owned();
+        if prompt.is_empty() {
+            return;
+        }
+        match self.board_id().map(str::to_owned).and_then(|board_id| {
+            self.engine
+                .regenerate(&board_id, &node_id, Some(prompt), None)
+        }) {
+            Ok(()) => {
+                self.overlay = Overlay::None;
+                window.focus(&self.focus, cx);
+            }
+            Err(error) => self.show_error(error, cx),
+        }
+        cx.notify();
+    }
+
+    pub(super) fn rename_open_board(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Overlay::RenameBoard(board_id) = &self.overlay else {
+            return;
+        };
+        let board_id = board_id.clone();
+        let title = self.modal_input.read(cx).content().trim().to_owned();
+        match self.engine.repository().rename_board(&board_id, &title) {
+            Ok(()) => {
+                self.overlay = Overlay::Boards;
+                window.focus(&self.search_input.focus_handle(cx), cx);
+            }
+            Err(error) => self.show_error(error, cx),
+        }
+        cx.notify();
+    }
+
+    pub(super) fn render_boards(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let query = self.search_input.read(cx).content().to_lowercase();
+        let summaries = self
+            .engine
+            .repository()
+            .summaries(&self.engine.active_node_ids());
+        let width = 360.;
+        let mut list = div()
+            .id("board-list")
+            .max_h(px(
+                (f32::from(window.viewport_size().height) * 0.58).max(300.)
+            ))
+            .overflow_y_scroll()
+            .px_2()
+            .pb_2();
+        for summary in summaries
+            .into_iter()
+            .filter(|summary| summary.title.to_lowercase().contains(&query))
+        {
+            let id = summary.id.clone();
+            let rename_id = summary.id.clone();
+            let delete_id = summary.id.clone();
+            let active = self.board_id.as_deref() == Some(summary.id.as_str());
+            let armed = self.armed_board_delete.as_deref() == Some(summary.id.as_str());
+            let mut thumbnail = div()
+                .size(px(34.))
+                .rounded_md()
+                .border_1()
+                .border_color(theme::line())
+                .bg(theme::background())
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(theme::faint())
+                .child("❖")
+                .into_any_element();
+            if let Some(url) = &summary.last_image {
+                thumbnail = img(self.display_image_path(url, false))
+                    .size(px(34.))
+                    .rounded_md()
+                    .object_fit(ObjectFit::Cover)
+                    .into_any_element();
+            }
+            list = list.child(
+                div()
+                    .id(SharedString::from(format!("board-{}", summary.id)))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded_lg()
+                    .px_2()
+                    .py_2()
+                    .bg(if active {
+                        theme::hover()
+                    } else {
+                        theme::raised()
+                    })
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_board(id.clone(), window, cx)
+                    }))
+                    .child(thumbnail)
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(if active { theme::ink() } else { theme::dim() })
+                                    .child(summary.title.clone()),
+                            )
+                            .child(div().text_xs().text_color(theme::faint()).child(format!(
+                                "{} images · {} tok · {}",
+                                summary.image_count,
+                                format_tokens(summary.total_tokens),
+                                time_ago(summary.updated_at)
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("rename-{}", rename_id)))
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .text_xs()
+                            .text_color(theme::faint())
+                            .hover(|style| style.bg(theme::hover()).text_color(theme::ink()))
+                            .child("Rename")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                let title = this
+                                    .engine
+                                    .repository()
+                                    .board(&rename_id)
+                                    .map(|board| board.title)
+                                    .unwrap_or_default();
+                                this.modal_input.update(cx, |input, cx| {
+                                    input.set_mode(TextInputMode::SingleLine, cx);
+                                    input.set_placeholder("Board name", cx);
+                                    input.set_content(title, cx);
+                                });
+                                this.overlay = Overlay::RenameBoard(rename_id.clone());
+                                window.focus(&this.modal_input.focus_handle(cx), cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("delete-board-{}", delete_id)))
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .text_xs()
+                            .text_color(theme::danger())
+                            .child(if armed { "Sure?" } else { "Delete" })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                if this.armed_board_delete.as_deref() == Some(&delete_id) {
+                                    match this.engine.delete_board(&delete_id) {
+                                        Ok(()) => {
+                                            let next = this
+                                                .engine
+                                                .repository()
+                                                .summaries(&this.engine.active_node_ids())
+                                                .first()
+                                                .map(|summary| summary.id.clone());
+                                            this.board_id = next.clone();
+                                            this.board = next
+                                                .as_deref()
+                                                .and_then(|id| this.engine.repository().board(id));
+                                            this.armed_board_delete = None;
+                                        }
+                                        Err(error) => this.show_error(error, cx),
+                                    }
+                                } else {
+                                    this.armed_board_delete = Some(delete_id.clone());
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
+        div()
+            .id("boards-popover")
+            .absolute()
+            .top(px(58.))
+            .left(px(18.))
+            .w(px(width))
+            .rounded_xl()
+            .border_1()
+            .border_color(theme::line())
+            .bg(theme::raised().opacity(0.98))
+            .overflow_hidden()
+            .occlude()
+            .child(
+                div().p_3().child(
+                    div()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(theme::line())
+                        .bg(theme::background())
+                        .px_3()
+                        .py_2()
+                        .child(self.search_input.clone()),
+                ),
+            )
+            .child(list)
+            .child(
+                div()
+                    .id("new-board")
+                    .border_t_1()
+                    .border_color(theme::line())
+                    .px_4()
+                    .py_3()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme::accent())
+                    .cursor_pointer()
+                    .child("＋ New board")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        match this.engine.repository().create_board() {
+                            Ok(board) => this.open_board(board.id, window, cx),
+                            Err(error) => this.show_error(error, cx),
+                        }
+                    })),
+            )
+            .into_any_element()
+    }
+
+    pub(super) fn render_gallery(&self, cx: &mut Context<Self>) -> AnyElement {
+        let board = self.board.clone();
+        let image_count: usize = board
+            .as_ref()
+            .map(|board| board.nodes.iter().map(|node| node.images.len()).sum())
+            .unwrap_or(0);
+        let node_count = board.as_ref().map(|board| board.nodes.len()).unwrap_or(0);
+        let mut content = div()
+            .id("gallery-scroll")
+            .flex_1()
+            .overflow_y_scroll()
+            .px_6()
+            .pb_8();
+        if let Some(board) = board {
+            let depths = node_depths(&board);
+            let mut nodes = board.nodes.clone();
+            nodes.sort_by_key(|node| (std::cmp::Reverse(node.created_at), node.id.clone()));
+            for node in nodes {
+                let depth = depths.get(&node.id).copied().unwrap_or(0);
+                let locate_id = node.id.clone();
+                let mut strip = div().flex_1().flex().flex_wrap().gap_2();
+                if node.images.is_empty() {
+                    strip = strip.child(
+                        div()
+                            .h(px(96.))
+                            .flex_1()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(theme::line())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_xs()
+                            .text_color(theme::faint())
+                            .child(status_label(&node)),
+                    );
+                } else {
+                    for (index, url) in node.images.iter().enumerate() {
+                        let node_id = node.id.clone();
+                        let image_url = url.clone();
+                        strip = strip.child(
+                            div()
+                                .relative()
+                                .child(
+                                    img(self.display_image_path(url, false))
+                                        .id(SharedString::from(format!(
+                                            "gallery-image-{}-{index}",
+                                            node.id
+                                        )))
+                                        .role(Role::Button)
+                                        .aria_label(format!(
+                                            "Open image {} of {}",
+                                            index + 1,
+                                            node.images.len()
+                                        ))
+                                        .size(px(148.))
+                                        .rounded_lg()
+                                        .object_fit(ObjectFit::Cover)
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.open_lightbox(
+                                                node_id.clone(),
+                                                image_url.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        })),
+                                )
+                                .when(node.images.len() > 1, |cell| {
+                                    cell.child(
+                                        div()
+                                            .absolute()
+                                            .right_1()
+                                            .bottom_1()
+                                            .rounded_md()
+                                            .bg(theme::background().opacity(0.78))
+                                            .px_1()
+                                            .text_xs()
+                                            .text_color(theme::ink())
+                                            .child(format!("{}/{}", index + 1, node.images.len())),
+                                    )
+                                }),
+                        );
+                    }
+                }
+                content = content.child(
+                    div()
+                        .border_b_1()
+                        .border_color(theme::line().opacity(0.7))
+                        .py_4()
+                        .flex()
+                        .gap_5()
+                        .child(
+                            div()
+                                .w(px(330.))
+                                .pl(px(depth as f32 * 18.))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(theme::ink())
+                                        .child(node.prompt.clone()),
+                                )
+                                .child(div().mt_1().text_xs().text_color(theme::faint()).child(
+                                    format!(
+                                        "{} · {} · {} branch depth",
+                                        status_label(&node),
+                                        format_date(node.created_at),
+                                        depth
+                                    ),
+                                ))
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("locate-{}", locate_id)))
+                                        .mt_2()
+                                        .text_xs()
+                                        .text_color(theme::accent())
+                                        .cursor_pointer()
+                                        .child("◎ Show on canvas")
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.locate_node(&locate_id, window, cx);
+                                        })),
+                                ),
+                        )
+                        .child(strip),
+                );
+            }
+        }
+        div()
+            .id("gallery")
+            .role(Role::Dialog)
+            .aria_label("Image gallery")
+            .absolute()
+            .inset_0()
+            .key_context("CodexImageGallery")
+            .bg(theme::background())
+            .flex()
+            .flex_col()
+            .occlude()
+            .child(
+                div()
+                    .flex_none()
+                    .border_b_1()
+                    .border_color(theme::line())
+                    .px_6()
+                    .py_4()
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .size(px(28.))
+                            .rounded_lg()
+                            .bg(theme::accent().opacity(0.12))
+                            .text_color(theme::accent())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child("⑂"),
+                    )
+                    .child(
+                        div()
+                            .ml_3()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme::ink())
+                                    .child("Branch gallery"),
+                            )
+                            .child(
+                                div().text_xs().text_color(theme::dim()).child(format!(
+                                    "{image_count} images · {node_count} generations"
+                                )),
+                            ),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("close-gallery")
+                            .size(px(32.))
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(theme::line())
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_color(theme::dim())
+                            .cursor_pointer()
+                            .child("×")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.close_overlay(window, cx);
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(content)
+            .into_any_element()
+    }
+
+    pub(super) fn render_modal(
+        &self,
+        title: &str,
+        detail: &str,
+        action: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .id("modal-overlay")
+            .absolute()
+            .inset_0()
+            .bg(gpui::black().opacity(0.72))
+            .flex()
+            .items_center()
+            .justify_center()
+            .occlude()
+            .child(
+                div()
+                    .w(px(560.))
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(theme::line())
+                    .bg(theme::raised())
+                    .p_5()
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::ink())
+                            .child(title.to_owned()),
+                    )
+                    .child(
+                        div()
+                            .mt_1()
+                            .text_sm()
+                            .text_color(theme::dim())
+                            .child(detail.to_owned()),
+                    )
+                    .child(
+                        div()
+                            .mt_4()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(theme::line())
+                            .bg(theme::background())
+                            .px_3()
+                            .py_2()
+                            .child(self.modal_input.clone()),
+                    )
+                    .child(
+                        div()
+                            .mt_5()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(control_button(
+                                "Cancel",
+                                cx.listener(|this, _, window, cx| {
+                                    this.close_overlay(window, cx);
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(
+                                div()
+                                    .id("modal-submit")
+                                    .rounded_lg()
+                                    .bg(theme::accent_strong())
+                                    .px_4()
+                                    .py_2()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(gpui::white())
+                                    .cursor_pointer()
+                                    .child(action.to_owned())
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.generate(&Generate, window, cx)
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    pub(super) fn render_quit_confirm(&self, cx: &mut Context<Self>) -> AnyElement {
+        let count = self.engine.active_count();
+        div()
+            .id("quit-confirm-overlay")
+            .absolute()
+            .inset_0()
+            .bg(gpui::black().opacity(0.72))
+            .flex()
+            .items_center()
+            .justify_center()
+            .occlude()
+            .child(
+                div()
+                    .w(px(480.))
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(theme::line())
+                    .bg(theme::raised())
+                    .p_5()
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::ink())
+                            .child("Generations are still running"),
+                    )
+                    .child(
+                        div()
+                            .mt_2()
+                            .text_sm()
+                            .text_color(theme::dim())
+                            .child(format!(
+                                "{count} generation(s) are still running. Quitting will terminate them; images already received will be kept."
+                            )),
+                    )
+                    .child(
+                        div()
+                            .mt_5()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(control_button(
+                                "Keep running",
+                                cx.listener(|this, _, window, cx| {
+                                    this.close_overlay(window, cx);
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(
+                                div()
+                                    .id("terminate-quit")
+                                    .rounded_lg()
+                                    .bg(theme::danger().opacity(0.15))
+                                    .px_4()
+                                    .py_2()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme::danger())
+                                    .cursor_pointer()
+                                    .child("Terminate and quit")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.engine.stop_all_for_quit();
+                                        cx.quit();
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    pub(super) fn render_toast(
+        &self,
+        toast: &Toast,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut row = div()
+            .id("toast")
+            .absolute()
+            .top(px(20.))
+            .left(px((f32::from(window.viewport_size().width) - 430.) / 2.))
+            .w(px(430.))
+            .rounded_xl()
+            .border_1()
+            .border_color(if toast.error {
+                theme::danger().opacity(0.55)
+            } else {
+                theme::line()
+            })
+            .bg(theme::raised().opacity(0.98))
+            .px_4()
+            .py_3()
+            .flex()
+            .items_center()
+            .gap_3()
+            .occlude()
+            .text_sm()
+            .text_color(if toast.error {
+                theme::danger()
+            } else {
+                theme::ink()
+            })
+            .child(div().flex_1().child(toast.text.clone()));
+        if let Some((board_id, undo_id)) = &toast.undo {
+            let board_id = board_id.clone();
+            let undo_id = undo_id.clone();
+            row = row.child(
+                div()
+                    .id("undo")
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(theme::accent_strong())
+                    .px_3()
+                    .py_1()
+                    .text_color(theme::accent())
+                    .cursor_pointer()
+                    .child("Undo")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        match this.engine.repository().undo_delete(&board_id, &undo_id) {
+                            Ok(_) => this.toast = None,
+                            Err(error) => this.show_error(error, cx),
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        row.child(
+            div()
+                .id("dismiss-toast")
+                .text_color(theme::faint())
+                .cursor_pointer()
+                .child("×")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.toast = None;
+                    cx.notify();
+                })),
+        )
+        .into_any_element()
+    }
+}
