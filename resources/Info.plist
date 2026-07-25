@@ -5,15 +5,17 @@
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
     <key>CFBundleDisplayName</key>
-    <string>CodexImage GPUI</string>
+    <string>CodexImage</string>
     <key>CFBundleExecutable</key>
     <string>codex-image</string>
+    <key>CFBundleIconFile</key>
+    <string>icon.icns</string>
     <key>CFBundleIdentifier</key>
-    <string>com.yolki.codeximage.gpui</string>
+    <string>com.yolki.codeximage</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>CodexImage GPUI</string>
+    <string>CodexImage</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -30,4 +32,3 @@
     <false/>
 </dict>
 </plist>
-

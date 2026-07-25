@@ -1,6 +1,6 @@
 use super::theme;
 use gpui::{
-    App, Bounds, ClickEvent, ClipboardEntry, ClipboardItem, ContentMask, Context, CursorStyle,
+    App, Bounds, ClipboardEntry, ClipboardItem, ContentMask, Context, CursorStyle,
     Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
     Focusable, GlobalElementId, Image, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PaintQuad, Pixels, Point, Role, ScrollWheelEvent, SharedString,
@@ -827,11 +827,6 @@ impl TextInput {
         }
     }
 
-    fn click(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        cx.stop_propagation();
-        window.focus(&self.focus, cx);
-    }
-
     fn auto_scroll_for_drag(&mut self, position: Point<Pixels>) {
         let (Some(bounds), Some(layout)) = (&self.last_bounds, &self.last_layout) else {
             return;
@@ -1330,7 +1325,6 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::redo))
             .on_action(cx.listener(Self::insert_newline))
             .on_action(cx.listener(Self::show_character_palette))
-            .on_click(cx.listener(Self::click))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
             .on_mouse_move(cx.listener(Self::mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))

@@ -67,6 +67,7 @@ actions!(
 const ASPECTS: &[&str] = &["auto", "1:1", "16:9", "9:16", "4:3", "3:4"];
 const LIGHTBOX_MIN_ZOOM: f32 = 1.;
 const LIGHTBOX_MAX_ZOOM: f32 = 8.;
+const NODE_TOOLBAR_HEIGHT: f32 = 36.;
 const SAMPLES: &[&str] = &[
     "A cozy cabin in a snowy forest at dusk, warm light in the windows",
     "Isometric illustration of a tiny home office, pastel palette",
@@ -1034,7 +1035,12 @@ impl AppView {
         cx.notify();
     }
 
-    fn open_board(&mut self, id: String, cx: &mut Context<Self>) {
+    fn open_board(
+        &mut self,
+        id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.board_id = Some(id.clone());
         self.board = self.engine.repository().board(&id);
         self.overlay = Overlay::None;
@@ -1046,6 +1052,7 @@ impl AppView {
         self.zoom = 1.;
         self.refresh_image_metadata();
         self.refresh_layout();
+        window.focus(&self.focus, cx);
         cx.notify();
     }
 
@@ -1121,6 +1128,7 @@ impl AppView {
                     Ok(_) => {
                         self.modal_input.update(cx, |input, cx| input.clear(cx));
                         self.overlay = Overlay::None;
+                        window.focus(&self.focus, cx);
                     }
                     Err(error) => self.show_error(error, cx),
                 }
@@ -1138,7 +1146,10 @@ impl AppView {
                         .regenerate(&board_id, &node_id, Some(prompt), None)
                 });
                 match result {
-                    Ok(()) => self.overlay = Overlay::None,
+                    Ok(()) => {
+                        self.overlay = Overlay::None;
+                        window.focus(&self.focus, cx);
+                    }
                     Err(error) => self.show_error(error, cx),
                 }
                 cx.notify();
@@ -1148,7 +1159,10 @@ impl AppView {
                 let title = self.modal_input.read(cx).content().trim().to_owned();
                 let board_id = board_id.clone();
                 match self.engine.repository().rename_board(&board_id, &title) {
-                    Ok(()) => self.overlay = Overlay::Boards,
+                    Ok(()) => {
+                        self.overlay = Overlay::Boards;
+                        window.focus(&self.search_input.focus_handle(cx), cx);
+                    }
                     Err(error) => self.show_error(error, cx),
                 }
                 cx.notify();
@@ -1247,11 +1261,15 @@ impl AppView {
         }
     }
 
+    fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.overlay = Overlay::None;
+        self.modal_input.update(cx, |input, cx| input.clear(cx));
+        window.focus(&self.focus, cx);
+    }
+
     fn escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
         if !matches!(self.overlay, Overlay::None) {
-            self.overlay = Overlay::None;
-            self.modal_input.update(cx, |input, cx| input.clear(cx));
-            window.focus(&self.focus, cx);
+            self.close_overlay(window, cx);
         } else if self.target.is_some() {
             self.target = None;
         } else if self.prompt.focus_handle(cx).is_focused(window) {
@@ -2165,7 +2183,11 @@ impl AppView {
                 let screen_y = self.camera_y + world_position.y * self.zoom;
                 let width = CARD_WIDTH * self.zoom;
                 let height = self.card_height(&canvas_node.node) * self.zoom;
-                (x >= screen_x && x <= screen_x + width && y >= screen_y && y <= screen_y + height)
+                let toolbar_top = screen_y - NODE_TOOLBAR_HEIGHT * self.zoom;
+                (x >= screen_x
+                    && x <= screen_x + width
+                    && y >= toolbar_top
+                    && y <= screen_y + height)
                     .then_some((index, world_position))
             })
     }
@@ -2270,6 +2292,9 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !matches!(self.overlay, Overlay::None) {
+            return;
+        }
         window.focus(&self.focus, cx);
         if let Some((index, origin)) = self.canvas_node_at(event.position) {
             let canvas_node = &self.canvas_nodes[index];
@@ -2321,6 +2346,9 @@ impl AppView {
     }
 
     fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.overlay, Overlay::None) {
+            return;
+        }
         match &self.drag {
             Some(DragState::Canvas { start, origin }) if event.dragging() => {
                 self.camera_x = origin.0 + f32::from(event.position.x - start.x);
@@ -2343,7 +2371,7 @@ impl AppView {
                 );
                 cx.notify();
             }
-            _ if !event.dragging() && matches!(self.overlay, Overlay::None) => {
+            _ if !event.dragging() => {
                 let hovered = self
                     .canvas_node_at(event.position)
                     .and_then(|(index, _)| self.canvas_nodes.get(index))
@@ -2400,6 +2428,10 @@ impl AppView {
     }
 
     fn mouse_up(&mut self, _: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.overlay, Overlay::None) {
+            self.drag = None;
+            return;
+        }
         let drag = self.drag.take();
         if let Some(DragState::Node {
             id, click_target, ..
@@ -2561,7 +2593,7 @@ impl AppView {
                         theme::raised()
                     })
                     .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| this.open_board(id.clone(), cx)))
+                    .on_click(cx.listener(move |this, _, window, cx| this.open_board(id.clone(), window, cx)))
                     .child(thumbnail)
                     .child(
                         div()
@@ -2680,9 +2712,9 @@ impl AppView {
                     .text_color(theme::accent())
                     .cursor_pointer()
                     .child("＋ New board")
-                    .on_click(cx.listener(|this, _, _, cx| {
+                    .on_click(cx.listener(|this, _, window, cx| {
                         match this.engine.repository().create_board() {
-                            Ok(board) => this.open_board(board.id, cx),
+                            Ok(board) => this.open_board(board.id, window, cx),
                             Err(error) => this.show_error(error, cx),
                         }
                     })),
@@ -2878,8 +2910,8 @@ impl AppView {
                             .text_color(theme::dim())
                             .cursor_pointer()
                             .child("×")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.overlay = Overlay::None;
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.close_overlay(window, cx);
                                 cx.notify();
                             })),
                     ),
@@ -2988,8 +3020,7 @@ impl AppView {
             .child(control_button(
                 "×",
                 cx.listener(|this, _, window, cx| {
-                    this.overlay = Overlay::None;
-                    window.focus(&this.focus, cx);
+                    this.close_overlay(window, cx);
                     cx.notify();
                 }),
             ));
@@ -3000,7 +3031,7 @@ impl AppView {
             .aria_label("Image lightbox")
             .absolute()
             .inset_0()
-            .key_context("CodexImageLightbox")
+            .key_context("CodexImage CodexImageLightbox")
             .track_focus(&self.lightbox_focus)
             .overflow_hidden()
             .bg(gpui::black().opacity(0.97))
@@ -3076,8 +3107,7 @@ impl AppView {
                     .on_click(cx.listener(|this, _, window, cx| {
                         if matches!(&this.overlay, Overlay::Lightbox(lightbox) if lightbox.zoom <= 1.)
                         {
-                            this.overlay = Overlay::None;
-                            window.focus(&this.focus, cx);
+                            this.close_overlay(window, cx);
                             cx.notify();
                         }
                     }))
@@ -3261,8 +3291,8 @@ impl AppView {
                             .gap_2()
                             .child(control_button(
                                 "Cancel",
-                                cx.listener(|this, _, _, cx| {
-                                    this.overlay = Overlay::None;
+                                cx.listener(|this, _, window, cx| {
+                                    this.close_overlay(window, cx);
                                     cx.notify();
                                 }),
                             ))
@@ -3330,8 +3360,8 @@ impl AppView {
                             .gap_2()
                             .child(control_button(
                                 "Keep running",
-                                cx.listener(|this, _, _, cx| {
-                                    this.overlay = Overlay::None;
+                                cx.listener(|this, _, window, cx| {
+                                    this.close_overlay(window, cx);
                                     cx.notify();
                                 }),
                             ))
