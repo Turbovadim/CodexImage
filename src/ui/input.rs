@@ -1,7 +1,7 @@
 use super::theme;
 use gpui::{
-    App, Bounds, ClipboardEntry, ClipboardItem, ContentMask, Context, CursorStyle,
-    Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
+    App, Bounds, ClipboardEntry, ClipboardItem, ContentMask, Context, CursorStyle, Element,
+    ElementId, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
     Focusable, GlobalElementId, Image, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PaintQuad, Pixels, Point, Role, ScrollWheelEvent, SharedString,
     StatefulInteractiveElement, Style, TextRun, UTF16Selection, UnderlineStyle, Window,
@@ -384,21 +384,22 @@ impl TextInput {
     }
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
-        let offset = offset.min(self.content.len());
-        self.selected = offset..offset;
-        self.selection_reversed = false;
-        self.marked = None;
-        self.preferred_x = None;
-        self.break_history_group();
-        cx.notify();
+        self.move_to_with_preference(offset, None, cx);
     }
 
-    fn move_to_vertical(&mut self, offset: usize, preferred_x: f32, cx: &mut Context<Self>) {
+    /// Moves the cursor, remembering the column vertical movement should aim
+    /// for so repeated up/down keeps its horizontal place across short lines.
+    fn move_to_with_preference(
+        &mut self,
+        offset: usize,
+        preferred_x: Option<f32>,
+        cx: &mut Context<Self>,
+    ) {
         let offset = offset.min(self.content.len());
         self.selected = offset..offset;
         self.selection_reversed = false;
         self.marked = None;
-        self.preferred_x = Some(preferred_x);
+        self.preferred_x = preferred_x;
         self.break_history_group();
         cx.notify();
     }
@@ -486,7 +487,7 @@ impl TextInput {
 
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
         if let Some((target, preferred_x)) = self.vertical_target(-1) {
-            self.move_to_vertical(target, preferred_x, cx);
+            self.move_to_with_preference(target, Some(preferred_x), cx);
         } else {
             self.move_to(0, cx);
         }
@@ -494,7 +495,7 @@ impl TextInput {
 
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
         if let Some((target, preferred_x)) = self.vertical_target(1) {
-            self.move_to_vertical(target, preferred_x, cx);
+            self.move_to_with_preference(target, Some(preferred_x), cx);
         } else {
             self.move_to(self.content.len(), cx);
         }
@@ -573,6 +574,15 @@ impl TextInput {
         cx.notify();
     }
 
+    fn spliced(&self, range: &Range<usize>, insertion: &str) -> SharedString {
+        let mut content =
+            String::with_capacity(self.content.len() - (range.end - range.start) + insertion.len());
+        content.push_str(&self.content[..range.start]);
+        content.push_str(insertion);
+        content.push_str(&self.content[range.end..]);
+        content.into()
+    }
+
     fn apply_edit(
         &mut self,
         range: Range<usize>,
@@ -585,13 +595,7 @@ impl TextInput {
             return;
         }
         let before = self.snapshot();
-        let mut content = String::with_capacity(
-            self.content.len() - (range.end - range.start) + normalized.len(),
-        );
-        content.push_str(&self.content[..range.start]);
-        content.push_str(&normalized);
-        content.push_str(&self.content[range.end..]);
-        self.content = content.into();
+        self.content = self.spliced(&range, &normalized);
         let cursor = range.start + normalized.len();
         self.selected = cursor..cursor;
         self.selection_reversed = false;
@@ -601,32 +605,46 @@ impl TextInput {
         cx.notify();
     }
 
-    fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+    /// Deletes the selection, or the range `to_boundary` reaches from the
+    /// cursor when nothing is selected. Rings the bell when the cursor already
+    /// sits at the edge it would delete towards.
+    fn delete_to(
+        &mut self,
+        to_boundary: impl FnOnce(&Self) -> usize,
+        kind: EditKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let range = if self.selected.is_empty() {
-            let previous = previous_grapheme_boundary(&self.content, self.cursor());
-            if previous == self.cursor() {
-                window.play_system_bell();
-                return;
-            }
-            previous..self.cursor()
+            let boundary = to_boundary(self);
+            let cursor = self.cursor();
+            boundary.min(cursor)..boundary.max(cursor)
         } else {
             self.selected.clone()
         };
-        self.apply_edit(range, "", EditKind::DeleteBackward, cx);
+        if range.is_empty() {
+            window.play_system_bell();
+        } else {
+            self.apply_edit(range, "", kind, cx);
+        }
+    }
+
+    fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        self.delete_to(
+            |input| previous_grapheme_boundary(&input.content, input.cursor()),
+            EditKind::DeleteBackward,
+            window,
+            cx,
+        );
     }
 
     fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
-        let range = if self.selected.is_empty() {
-            let next = next_grapheme_boundary(&self.content, self.cursor());
-            if next == self.cursor() {
-                window.play_system_bell();
-                return;
-            }
-            self.cursor()..next
-        } else {
-            self.selected.clone()
-        };
-        self.apply_edit(range, "", EditKind::DeleteForward, cx);
+        self.delete_to(
+            |input| next_grapheme_boundary(&input.content, input.cursor()),
+            EditKind::DeleteForward,
+            window,
+            cx,
+        );
     }
 
     fn delete_word_backward(
@@ -635,17 +653,12 @@ impl TextInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = if self.selected.is_empty() {
-            let previous = previous_word_boundary(&self.content, self.cursor());
-            if previous == self.cursor() {
-                window.play_system_bell();
-                return;
-            }
-            previous..self.cursor()
-        } else {
-            self.selected.clone()
-        };
-        self.apply_edit(range, "", EditKind::DeleteBackward, cx);
+        self.delete_to(
+            |input| previous_word_boundary(&input.content, input.cursor()),
+            EditKind::DeleteBackward,
+            window,
+            cx,
+        );
     }
 
     fn delete_word_forward(
@@ -654,17 +667,12 @@ impl TextInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = if self.selected.is_empty() {
-            let next = next_word_boundary(&self.content, self.cursor());
-            if next == self.cursor() {
-                window.play_system_bell();
-                return;
-            }
-            self.cursor()..next
-        } else {
-            self.selected.clone()
-        };
-        self.apply_edit(range, "", EditKind::DeleteForward, cx);
+        self.delete_to(
+            |input| next_word_boundary(&input.content, input.cursor()),
+            EditKind::DeleteForward,
+            window,
+            cx,
+        );
     }
 
     fn delete_to_line_start(
@@ -673,16 +681,12 @@ impl TextInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = if self.selected.is_empty() {
-            self.visual_line_edge(false)..self.cursor()
-        } else {
-            self.selected.clone()
-        };
-        if range.is_empty() {
-            window.play_system_bell();
-        } else {
-            self.apply_edit(range, "", EditKind::DeleteBackward, cx);
-        }
+        self.delete_to(
+            |input| input.visual_line_edge(false),
+            EditKind::DeleteBackward,
+            window,
+            cx,
+        );
     }
 
     fn delete_to_line_end(
@@ -691,16 +695,12 @@ impl TextInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let range = if self.selected.is_empty() {
-            self.cursor()..self.visual_line_edge(true)
-        } else {
-            self.selected.clone()
-        };
-        if range.is_empty() {
-            window.play_system_bell();
-        } else {
-            self.apply_edit(range, "", EditKind::DeleteForward, cx);
-        }
+        self.delete_to(
+            |input| input.visual_line_edge(true),
+            EditKind::DeleteForward,
+            window,
+            cx,
+        );
     }
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
@@ -969,13 +969,7 @@ impl EntityInputHandler for TextInput {
             .unwrap_or(self.selected.clone());
         let normalized = normalize_inserted_text(new_text, self.mode.is_multiline());
         let before = self.snapshot();
-        let mut content = String::with_capacity(
-            self.content.len() - (range.end - range.start) + normalized.len(),
-        );
-        content.push_str(&self.content[..range.start]);
-        content.push_str(&normalized);
-        content.push_str(&self.content[range.end..]);
-        self.content = content.into();
+        self.content = self.spliced(&range, &normalized);
         self.marked =
             (!normalized.is_empty()).then_some(range.start..range.start + normalized.len());
         self.selected = selected

@@ -522,35 +522,21 @@ impl Repository {
                 .with_context(|| format!("{} is not a supported image", path.display()))?;
             prepared.push(path);
         }
-        if prepared.is_empty() {
-            return Ok(Vec::new());
-        }
-        let directory = self.paths.images.join(board_id);
-        fs::create_dir_all(&directory)?;
         let mut imported = Vec::new();
         let mut created = Vec::new();
-        let result = (|| -> Result<()> {
-            for source in prepared {
-                let safe_name =
-                    sanitize_filename(&source.file_name().unwrap_or_default().to_string_lossy());
-                let name = format!(
-                    "{}-{}-{safe_name}",
-                    now_ms(),
-                    &Uuid::new_v4().to_string()[..8]
-                );
-                let destination = directory.join(&name);
-                fs::copy(source, &destination)?;
-                created.push(destination.clone());
-                create_thumbnail(&destination)?;
-                imported.push(format!("/images/{board_id}/{name}"));
+        for source in prepared {
+            match self.copy_into_board(board_id, source) {
+                Ok((destination, url)) => {
+                    created.push(destination);
+                    imported.push(url);
+                }
+                Err(error) => {
+                    for path in created {
+                        remove_image_and_thumbnail(&path);
+                    }
+                    return Err(error);
+                }
             }
-            Ok(())
-        })();
-        if let Err(error) = result {
-            for path in created {
-                remove_image_and_thumbnail(&path);
-            }
-            return Err(error);
         }
         Ok(imported)
     }
@@ -561,14 +547,19 @@ impl Repository {
         if !metadata.is_file() || metadata.len() == 0 {
             bail!("generated image was empty");
         }
+        Ok(self.copy_into_board(board_id, source)?.1)
+    }
+
+    /// Copies `source` into the board's image directory under a fresh name and
+    /// builds its thumbnail, returning the stored path and its `/images/…` URL.
+    fn copy_into_board(&self, board_id: &str, source: &Path) -> Result<(PathBuf, String)> {
         let directory = self.paths.images.join(board_id);
         fs::create_dir_all(&directory)?;
-        let safe_name =
-            sanitize_filename(&source.file_name().unwrap_or_default().to_string_lossy());
         let name = format!(
-            "{}-{}-{safe_name}",
+            "{}-{}-{}",
             now_ms(),
-            &Uuid::new_v4().to_string()[..8]
+            &Uuid::new_v4().to_string()[..8],
+            sanitize_filename(&source.file_name().unwrap_or_default().to_string_lossy())
         );
         let destination = directory.join(&name);
         fs::copy(source, &destination)?;
@@ -576,7 +567,7 @@ impl Repository {
             remove_image_and_thumbnail(&destination);
             return Err(error);
         }
-        Ok(format!("/images/{board_id}/{name}"))
+        Ok((destination, format!("/images/{board_id}/{name}")))
     }
 
     fn persist_and_notify(&self) -> Result<()> {

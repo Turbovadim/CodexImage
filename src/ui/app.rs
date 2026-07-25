@@ -1,68 +1,47 @@
-use super::input::{
-    Backspace as InputBackspace, Copy as InputCopy, Cut as InputCut, Delete as InputDelete,
-    DeleteToLineEnd as InputDeleteToLineEnd, DeleteToLineStart as InputDeleteToLineStart,
-    DeleteWordBackward as InputDeleteWordBackward, DeleteWordForward as InputDeleteWordForward,
-    DocumentEnd as InputDocumentEnd, DocumentStart as InputDocumentStart, Down as InputDown,
-    End as InputEnd, Home as InputHome, InsertNewline, Left as InputLeft, Paste as InputPaste,
-    Redo as InputRedo, Right as InputRight, SelectAll as InputSelectAll,
-    SelectDocumentEnd as InputSelectDocumentEnd, SelectDocumentStart as InputSelectDocumentStart,
-    SelectDown as InputSelectDown, SelectEnd as InputSelectEnd, SelectHome as InputSelectHome,
-    SelectLeft as InputSelectLeft, SelectRight as InputSelectRight, SelectUp as InputSelectUp,
-    SelectWordLeft as InputSelectWordLeft, SelectWordRight as InputSelectWordRight,
-    ShowCharacterPalette as InputShowCharacterPalette, TextInput, TextInputEvent, TextInputMode,
-    Undo as InputUndo, Up as InputUp, WordLeft as InputWordLeft, WordRight as InputWordRight,
+//! The application window: board state, overlays, input handling, and the
+//! element tree that hosts the painted canvas.
+
+use super::canvas::{
+    CanvasNodeFrame, VIEWPORT_CULL_MARGIN, edge_is_visible, paint_canvas_node, paint_connectors,
+    paint_dot_grid, rect_is_visible,
+};
+use super::card::{
+    ATTACHMENT_ROW_HEIGHT, COLLAPSED_PROMPT_LINES, CanvasImageAsset, CanvasNode,
+    EXPANDED_PROMPT_LINES, MEDIA_GAP, OutputLayout, PROMPT_LINE_HEIGHT, PROMPT_WRAP_COLUMNS,
+    SHOW_MORE_HEIGHT, card_height, card_height_from_metadata, output_layout, status_area_height,
+    wrap_prompt,
+};
+use super::format::{
+    format_date, format_tokens, image_format_for_path, node_depths, read_image_ratio, status_label,
+    time_ago,
+};
+use super::input::{TextInput, TextInputEvent, TextInputMode};
+use super::keymap::{
+    AddAttachment, BranchHovered, DeleteHovered, DuplicateHovered, EditHovered, Escape, FitCanvas,
+    FocusPrompt, Generate, LightboxDown, LightboxLeft, LightboxRight, LightboxUp, OpenBoards, Quit,
+    RegenerateHovered, ToggleGallery, ZoomIn, ZoomOut, bind_keys, configure_menus,
 };
 use super::theme;
 use crate::APP_NAME;
 use crate::generation::GenerationEngine;
 use crate::layout::{CARD_WIDTH, Position, compute_layout};
-use crate::model::{Board, BoardNode, NewNodesRequest, NodeStatus, StopReason};
-use crate::storage::{RepositoryEvent, THUMBNAIL_MAX_DIMENSION, create_thumbnail, now_ms};
+use crate::model::{Board, BoardNode, NewNodesRequest, NodeStatus};
+use crate::storage::{RepositoryEvent, create_thumbnail, now_ms};
 use anyhow::{Context as _, Result};
 use gpui::{
-    AnyElement, App, AppContext, BorderStyle, Bounds, ClipboardItem, ContentMask, Context, Entity,
-    ExternalPaths, FocusHandle, Focusable, FontWeight, Image, ImageFormat, ImgResourceLoader,
-    KeyBinding, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ObjectFit, OsAction, PathBuilder, PathPromptOptions, PinchEvent, Pixels, Point, Render,
-    Resource, Role, ScrollWheelEvent, SharedString, StyledImage, SystemMenuType, TextAlign,
-    TextRun, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, canvas, div, fill, img,
-    point, prelude::*, px, quad, size,
+    AnyElement, App, AppContext, Bounds, ClipboardItem, Context, Entity, ExternalPaths,
+    FocusHandle, Focusable, FontWeight, Image, ImageFormat, ImgResourceLoader, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PathPromptOptions, PinchEvent, Pixels,
+    Point, Render, Resource, Role, ScrollWheelEvent, SharedString, TitlebarOptions, Window,
+    WindowBounds, WindowOptions, canvas, div, fill, img, point, prelude::*, px, size,
 };
 use gpui_platform::application;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
-use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
-
-actions!(
-    codex_image,
-    [
-        Generate,
-        FocusPrompt,
-        OpenBoards,
-        ToggleGallery,
-        FitCanvas,
-        ZoomIn,
-        ZoomOut,
-        Escape,
-        BranchHovered,
-        RegenerateHovered,
-        EditHovered,
-        DuplicateHovered,
-        DeleteHovered,
-        LightboxLeft,
-        LightboxRight,
-        LightboxUp,
-        LightboxDown,
-        AddAttachment,
-        Quit,
-    ]
-);
 
 const ASPECTS: &[&str] = &["auto", "1:1", "16:9", "9:16", "4:3", "3:4"];
 const LIGHTBOX_MIN_ZOOM: f32 = 1.;
@@ -235,147 +214,6 @@ struct ImageAsset {
 }
 
 #[derive(Clone)]
-struct CanvasImageAsset {
-    original: Arc<Path>,
-    thumbnail: Arc<Path>,
-}
-
-struct CanvasImage {
-    url: String,
-    asset: CanvasImageAsset,
-}
-
-struct CanvasNode {
-    node: BoardNode,
-    prompt_lines: Vec<SharedString>,
-    collapsed_prompt_lines: Vec<SharedString>,
-    output_layout: OutputLayout,
-    displayed_images: Vec<CanvasImage>,
-    attachment_images: Vec<CanvasImageAsset>,
-    date: SharedString,
-    done_footer: SharedString,
-    status_message: SharedString,
-    scene: CardScene,
-    sprite_images: Vec<Arc<Image>>,
-    last_ready_sprite_tier: AtomicU8,
-}
-
-#[derive(Clone, Copy)]
-struct CardRect {
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-}
-
-impl CardRect {
-    fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
-        Self {
-            x,
-            y,
-            width,
-            height,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum CardColor {
-    Transparent,
-    Background82,
-    Raised,
-    Hover,
-    Line,
-    Ink,
-    Ink90,
-    Dim,
-    Faint,
-    Accent,
-    Accent45,
-    Danger,
-}
-
-impl CardColor {
-    fn hsla(self) -> gpui::Hsla {
-        match self {
-            Self::Transparent => gpui::transparent_black(),
-            Self::Background82 => theme::background().opacity(0.82),
-            Self::Raised => theme::raised(),
-            Self::Hover => theme::hover(),
-            Self::Line => theme::line(),
-            Self::Ink => theme::ink(),
-            Self::Ink90 => theme::ink().opacity(0.9),
-            Self::Dim => theme::dim(),
-            Self::Faint => theme::faint(),
-            Self::Accent => theme::accent(),
-            Self::Accent45 => theme::accent().opacity(0.45),
-            Self::Danger => theme::danger(),
-        }
-    }
-
-    fn svg(self) -> (&'static str, f32) {
-        match self {
-            Self::Transparent => ("#000000", 0.),
-            Self::Background82 => ("#0d0e12", 0.82),
-            Self::Raised => ("#14161c", 1.),
-            Self::Hover => ("#1b1e26", 1.),
-            Self::Line => ("#262a35", 1.),
-            Self::Ink => ("#e8eaf0", 1.),
-            Self::Ink90 => ("#e8eaf0", 0.9),
-            Self::Dim => ("#8b90a0", 1.),
-            Self::Faint => ("#5a5f6e", 1.),
-            Self::Accent => ("#7c8cff", 1.),
-            Self::Accent45 => ("#7c8cff", 0.45),
-            Self::Danger => ("#ff6b6b", 1.),
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum CardImageFit {
-    Contain,
-    Cover,
-}
-
-enum CardPrimitive {
-    Quad {
-        bounds: CardRect,
-        radius: f32,
-        fill: CardColor,
-        border: Option<(f32, CardColor)>,
-    },
-    Text {
-        text: SharedString,
-        bounds: CardRect,
-        font_size: f32,
-        line_height: f32,
-        color: CardColor,
-        align: TextAlign,
-    },
-    Image {
-        asset: CanvasImageAsset,
-        bounds: CardRect,
-        fit: CardImageFit,
-        radius: f32,
-    },
-}
-
-#[derive(Default)]
-struct CardScene {
-    height: f32,
-    primitives: Vec<CardPrimitive>,
-}
-
-#[derive(Clone, Copy)]
-struct CanvasNodeFrame {
-    node_index: usize,
-    screen_x: f32,
-    screen_y: f32,
-    height: f32,
-    targeted: bool,
-}
-
-#[derive(Clone)]
 enum CanvasClickTarget {
     Image { node_id: String, url: String },
     TogglePrompt(String),
@@ -498,144 +336,6 @@ pub fn run() -> Result<()> {
         cx.activate(true);
     });
     Ok(())
-}
-
-fn bind_keys(cx: &mut App) {
-    const CANVAS_CONTEXT: &str = "CodexImage && !CodexImageInput";
-
-    cx.bind_keys([
-        KeyBinding::new("enter", Generate, None),
-        KeyBinding::new("shift-enter", InsertNewline, Some("CodexImageInput")),
-        KeyBinding::new("/", FocusPrompt, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("cmd-k", OpenBoards, None),
-        KeyBinding::new("g", ToggleGallery, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("f", FitCanvas, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("cmd-=", ZoomIn, None),
-        KeyBinding::new("cmd--", ZoomOut, None),
-        KeyBinding::new("escape", Escape, None),
-        KeyBinding::new("b", BranchHovered, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("r", RegenerateHovered, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("e", EditHovered, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("d", DuplicateHovered, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("backspace", DeleteHovered, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("delete", DeleteHovered, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("left", LightboxLeft, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("right", LightboxRight, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("up", LightboxUp, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("down", LightboxDown, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("cmd-o", AddAttachment, None),
-        KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("backspace", InputBackspace, Some("CodexImageInput")),
-        KeyBinding::new("shift-backspace", InputBackspace, Some("CodexImageInput")),
-        KeyBinding::new("ctrl-h", InputBackspace, Some("CodexImageInput")),
-        KeyBinding::new("delete", InputDelete, Some("CodexImageInput")),
-        KeyBinding::new("ctrl-d", InputDelete, Some("CodexImageInput")),
-        KeyBinding::new("left", InputLeft, Some("CodexImageInput")),
-        KeyBinding::new("right", InputRight, Some("CodexImageInput")),
-        KeyBinding::new("up", InputUp, Some("CodexImageInput")),
-        KeyBinding::new("down", InputDown, Some("CodexImageInput")),
-        KeyBinding::new("shift-left", InputSelectLeft, Some("CodexImageInput")),
-        KeyBinding::new("shift-right", InputSelectRight, Some("CodexImageInput")),
-        KeyBinding::new("shift-up", InputSelectUp, Some("CodexImageInput")),
-        KeyBinding::new("shift-down", InputSelectDown, Some("CodexImageInput")),
-        KeyBinding::new("alt-left", InputWordLeft, Some("CodexImageInput")),
-        KeyBinding::new("alt-right", InputWordRight, Some("CodexImageInput")),
-        KeyBinding::new(
-            "alt-shift-left",
-            InputSelectWordLeft,
-            Some("CodexImageInput"),
-        ),
-        KeyBinding::new(
-            "alt-shift-right",
-            InputSelectWordRight,
-            Some("CodexImageInput"),
-        ),
-        KeyBinding::new("cmd-left", InputHome, Some("CodexImageInput")),
-        KeyBinding::new("cmd-right", InputEnd, Some("CodexImageInput")),
-        KeyBinding::new("cmd-shift-left", InputSelectHome, Some("CodexImageInput")),
-        KeyBinding::new("cmd-shift-right", InputSelectEnd, Some("CodexImageInput")),
-        KeyBinding::new("cmd-up", InputDocumentStart, Some("CodexImageInput")),
-        KeyBinding::new("cmd-down", InputDocumentEnd, Some("CodexImageInput")),
-        KeyBinding::new(
-            "cmd-shift-up",
-            InputSelectDocumentStart,
-            Some("CodexImageInput"),
-        ),
-        KeyBinding::new(
-            "cmd-shift-down",
-            InputSelectDocumentEnd,
-            Some("CodexImageInput"),
-        ),
-        KeyBinding::new(
-            "alt-backspace",
-            InputDeleteWordBackward,
-            Some("CodexImageInput"),
-        ),
-        KeyBinding::new("ctrl-w", InputDeleteWordBackward, Some("CodexImageInput")),
-        KeyBinding::new(
-            "alt-delete",
-            InputDeleteWordForward,
-            Some("CodexImageInput"),
-        ),
-        KeyBinding::new(
-            "cmd-backspace",
-            InputDeleteToLineStart,
-            Some("CodexImageInput"),
-        ),
-        KeyBinding::new("cmd-delete", InputDeleteToLineEnd, Some("CodexImageInput")),
-        KeyBinding::new("ctrl-k", InputDeleteToLineEnd, Some("CodexImageInput")),
-        KeyBinding::new("cmd-a", InputSelectAll, Some("CodexImageInput")),
-        KeyBinding::new("cmd-v", InputPaste, Some("CodexImageInput")),
-        KeyBinding::new("cmd-c", InputCopy, Some("CodexImageInput")),
-        KeyBinding::new("cmd-x", InputCut, Some("CodexImageInput")),
-        KeyBinding::new("cmd-z", InputUndo, Some("CodexImageInput")),
-        KeyBinding::new("cmd-shift-z", InputRedo, Some("CodexImageInput")),
-        KeyBinding::new(
-            "ctrl-cmd-space",
-            InputShowCharacterPalette,
-            Some("CodexImageInput"),
-        ),
-        KeyBinding::new("ctrl-a", InputHome, Some("CodexImageInput")),
-        KeyBinding::new("ctrl-e", InputEnd, Some("CodexImageInput")),
-        KeyBinding::new("ctrl-b", InputLeft, Some("CodexImageInput")),
-        KeyBinding::new("ctrl-f", InputRight, Some("CodexImageInput")),
-        KeyBinding::new("ctrl-p", InputUp, Some("CodexImageInput")),
-        KeyBinding::new("ctrl-n", InputDown, Some("CodexImageInput")),
-        KeyBinding::new("cmd-home", InputDocumentStart, Some("CodexImageInput")),
-        KeyBinding::new("cmd-end", InputDocumentEnd, Some("CodexImageInput")),
-        KeyBinding::new("shift-home", InputSelectHome, Some("CodexImageInput")),
-        KeyBinding::new("shift-end", InputSelectEnd, Some("CodexImageInput")),
-        KeyBinding::new("home", InputHome, Some("CodexImageInput")),
-        KeyBinding::new("end", InputEnd, Some("CodexImageInput")),
-    ]);
-}
-
-fn configure_menus(cx: &mut App) {
-    cx.set_menus([
-        Menu::new(APP_NAME).items([
-            MenuItem::os_submenu("Services", SystemMenuType::Services),
-            MenuItem::separator(),
-            MenuItem::action(format!("Quit {APP_NAME}"), Quit),
-        ]),
-        Menu::new("File").items([MenuItem::action("Attach Images…", AddAttachment)]),
-        Menu::new("Edit").items([
-            MenuItem::os_action("Undo", InputUndo, OsAction::Undo),
-            MenuItem::os_action("Redo", InputRedo, OsAction::Redo),
-            MenuItem::separator(),
-            MenuItem::os_action("Cut", InputCut, OsAction::Cut),
-            MenuItem::os_action("Copy", InputCopy, OsAction::Copy),
-            MenuItem::os_action("Paste", InputPaste, OsAction::Paste),
-            MenuItem::separator(),
-            MenuItem::os_action("Select All", InputSelectAll, OsAction::SelectAll),
-        ]),
-        Menu::new("View").items([
-            MenuItem::action("Boards", OpenBoards),
-            MenuItem::action("Gallery", ToggleGallery),
-            MenuItem::action("Fit Canvas", FitCanvas),
-            MenuItem::action("Zoom In", ZoomIn),
-            MenuItem::action("Zoom Out", ZoomOut),
-        ]),
-    ]);
 }
 
 impl AppView {
@@ -839,65 +539,16 @@ impl AppView {
                 .nodes
                 .iter()
                 .map(|node| {
-                    let node_prompt_lines = prompt_lines
-                        .get(&node.id)
-                        .cloned()
-                        .unwrap_or_else(|| vec![SharedString::default()]);
-                    let collapsed_prompt_lines = node_prompt_lines
-                        .iter()
-                        .take(COLLAPSED_PROMPT_LINES)
-                        .enumerate()
-                        .map(|(index, line)| {
-                            if node_prompt_lines.len() > COLLAPSED_PROMPT_LINES
-                                && index + 1 == COLLAPSED_PROMPT_LINES
-                            {
-                                SharedString::from(format!("{line}…"))
-                            } else {
-                                line.clone()
-                            }
-                        })
-                        .collect();
-                    let displayed_images = displayed_urls(node)
-                        .iter()
-                        .map(|url| CanvasImage {
-                            url: url.clone(),
-                            asset: self.canvas_image_asset(url),
-                        })
-                        .collect();
-                    let attachment_images = node
-                        .attachments
-                        .iter()
-                        .map(|url| self.canvas_image_asset(url))
-                        .collect();
-                    let mut canvas_node = CanvasNode {
-                        node: node.clone(),
-                        prompt_lines: node_prompt_lines,
-                        collapsed_prompt_lines,
-                        output_layout: output_layouts
+                    CanvasNode::build(
+                        node,
+                        prompt_lines.get(&node.id).cloned().unwrap_or_default(),
+                        output_layouts
                             .get(&node.id)
                             .cloned()
                             .unwrap_or(OutputLayout::None),
-                        displayed_images,
-                        attachment_images,
-                        date: format_date(node.created_at).into(),
-                        done_footer: done_footer(node).into(),
-                        status_message: status_message(node).into(),
-                        scene: CardScene::default(),
-                        sprite_images: Vec::new(),
-                        last_ready_sprite_tier: AtomicU8::new(NO_SPRITE_TIER),
-                    };
-                    canvas_node.scene =
-                        build_card_scene(&canvas_node, self.expanded_prompts.contains(&node.id));
-                    canvas_node.sprite_images = CARD_SPRITE_WIDTHS
-                        .into_iter()
-                        .map(|width| {
-                            Arc::new(Image::from_bytes(
-                                ImageFormat::Svg,
-                                card_scene_svg(&canvas_node.scene, width).into_bytes(),
-                            ))
-                        })
-                        .collect();
-                    canvas_node
+                        self.expanded_prompts.contains(&node.id),
+                        |url| self.canvas_image_asset(url),
+                    )
                 })
                 .collect();
             self.prompt_lines = prompt_lines;
@@ -1035,12 +686,7 @@ impl AppView {
         cx.notify();
     }
 
-    fn open_board(
-        &mut self,
-        id: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn open_board(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.board_id = Some(id.clone());
         self.board = self.engine.repository().board(&id);
         self.overlay = Overlay::None;
@@ -1097,83 +743,95 @@ impl AppView {
         self.zoom_at(point(viewport.width / 2., viewport.height / 2.), 0.8, cx);
     }
 
+    /// Enter submits whichever surface is open: the lightbox's quick-continue
+    /// field, a modal, or the composer.
     fn generate(&mut self, _: &Generate, window: &mut Window, cx: &mut Context<Self>) {
         match &self.overlay {
-            Overlay::Lightbox(lightbox) => {
-                let text = self.modal_input.read(cx).content().trim().to_owned();
-                if text.is_empty() {
-                    return;
-                }
-                let request = NewNodesRequest {
-                    prompt: text,
-                    parent_id: Some(lightbox.node_id.clone()),
-                    source_images: Some(vec![lightbox.image.clone()]),
-                    aspect: self
-                        .board
-                        .as_ref()
-                        .and_then(|board| {
-                            board.nodes.iter().find(|node| node.id == lightbox.node_id)
-                        })
-                        .map(|node| node.aspect.clone())
-                        .unwrap_or_else(|| "auto".into()),
-                    count: 1,
-                    attachment_paths: vec![],
-                    attachment_urls: vec![],
-                };
-                let result = self
-                    .board_id()
-                    .map(str::to_owned)
-                    .and_then(|id| self.engine.add_and_start(&id, request).map(|_| id));
-                match result {
-                    Ok(_) => {
-                        self.modal_input.update(cx, |input, cx| input.clear(cx));
-                        self.overlay = Overlay::None;
-                        window.focus(&self.focus, cx);
-                    }
-                    Err(error) => self.show_error(error, cx),
-                }
-                cx.notify();
-                return;
-            }
-            Overlay::EditNode(node_id) => {
-                let prompt = self.modal_input.read(cx).content().trim().to_owned();
-                if prompt.is_empty() {
-                    return;
-                }
-                let node_id = node_id.clone();
-                let result = self.board_id().map(str::to_owned).and_then(|board_id| {
-                    self.engine
-                        .regenerate(&board_id, &node_id, Some(prompt), None)
-                });
-                match result {
-                    Ok(()) => {
-                        self.overlay = Overlay::None;
-                        window.focus(&self.focus, cx);
-                    }
-                    Err(error) => self.show_error(error, cx),
-                }
-                cx.notify();
-                return;
-            }
-            Overlay::RenameBoard(board_id) => {
-                let title = self.modal_input.read(cx).content().trim().to_owned();
-                let board_id = board_id.clone();
-                match self.engine.repository().rename_board(&board_id, &title) {
-                    Ok(()) => {
-                        self.overlay = Overlay::Boards;
-                        window.focus(&self.search_input.focus_handle(cx), cx);
-                    }
-                    Err(error) => self.show_error(error, cx),
-                }
-                cx.notify();
-                return;
-            }
-            Overlay::Boards | Overlay::Gallery | Overlay::QuitConfirm => return,
-            Overlay::None => {}
+            Overlay::Lightbox(_) => self.continue_from_lightbox(window, cx),
+            Overlay::EditNode(_) => self.save_edited_prompt(window, cx),
+            Overlay::RenameBoard(_) => self.rename_open_board(window, cx),
+            Overlay::Boards | Overlay::Gallery | Overlay::QuitConfirm => {}
+            Overlay::None => self.generate_from_composer(window, cx),
         }
+    }
 
-        let text = self.prompt.read(cx).content().trim().to_owned();
-        if text.is_empty() {
+    fn continue_from_lightbox(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Overlay::Lightbox(lightbox) = &self.overlay else {
+            return;
+        };
+        let (node_id, image) = (lightbox.node_id.clone(), lightbox.image.clone());
+        let prompt = self.modal_input.read(cx).content().trim().to_owned();
+        if prompt.is_empty() {
+            return;
+        }
+        let request = NewNodesRequest {
+            prompt,
+            parent_id: Some(node_id.clone()),
+            source_images: Some(vec![image]),
+            aspect: self
+                .node(&node_id)
+                .map(|node| node.aspect)
+                .unwrap_or_else(|| "auto".into()),
+            count: 1,
+            attachment_paths: Vec::new(),
+            attachment_urls: Vec::new(),
+        };
+        match self
+            .board_id()
+            .map(str::to_owned)
+            .and_then(|board_id| self.engine.add_and_start(&board_id, request))
+        {
+            Ok(_) => {
+                self.modal_input.update(cx, |input, cx| input.clear(cx));
+                self.overlay = Overlay::None;
+                window.focus(&self.focus, cx);
+            }
+            Err(error) => self.show_error(error, cx),
+        }
+        cx.notify();
+    }
+
+    fn save_edited_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Overlay::EditNode(node_id) = &self.overlay else {
+            return;
+        };
+        let node_id = node_id.clone();
+        let prompt = self.modal_input.read(cx).content().trim().to_owned();
+        if prompt.is_empty() {
+            return;
+        }
+        match self.board_id().map(str::to_owned).and_then(|board_id| {
+            self.engine
+                .regenerate(&board_id, &node_id, Some(prompt), None)
+        }) {
+            Ok(()) => {
+                self.overlay = Overlay::None;
+                window.focus(&self.focus, cx);
+            }
+            Err(error) => self.show_error(error, cx),
+        }
+        cx.notify();
+    }
+
+    fn rename_open_board(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Overlay::RenameBoard(board_id) = &self.overlay else {
+            return;
+        };
+        let board_id = board_id.clone();
+        let title = self.modal_input.read(cx).content().trim().to_owned();
+        match self.engine.repository().rename_board(&board_id, &title) {
+            Ok(()) => {
+                self.overlay = Overlay::Boards;
+                window.focus(&self.search_input.focus_handle(cx), cx);
+            }
+            Err(error) => self.show_error(error, cx),
+        }
+        cx.notify();
+    }
+
+    fn generate_from_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let prompt = self.prompt.read(cx).content().trim().to_owned();
+        if prompt.is_empty() {
             return;
         }
         let board_id = match self.ensure_board() {
@@ -1183,11 +841,13 @@ impl AppView {
                 return;
             }
         };
-        let target = self.target.clone();
+        let target = self.target.take();
         let request = NewNodesRequest {
-            prompt: text,
+            prompt,
             parent_id: target.as_ref().map(|target| target.node_id.clone()),
-            source_images: target.and_then(|target| target.source_image.map(|image| vec![image])),
+            source_images: target
+                .as_ref()
+                .and_then(|target| target.source_image.clone().map(|image| vec![image])),
             aspect: ASPECTS[self.aspect_index].to_owned(),
             count: self.count,
             attachment_paths: self.attachments.clone(),
@@ -1195,24 +855,49 @@ impl AppView {
         };
         match self.engine.add_and_start(&board_id, request) {
             Ok(_) => {
-                for path in self.attachments.drain(..) {
-                    if path.starts_with(
-                        self.engine
-                            .repository()
-                            .paths()
-                            .root
-                            .join("pending-attachments"),
-                    ) {
-                        let _ = fs::remove_file(path);
-                    }
-                }
+                self.discard_pending_attachments();
                 self.prompt.update(cx, |input, cx| input.clear(cx));
-                self.target = None;
                 window.focus(&self.prompt.focus_handle(cx), cx);
             }
-            Err(error) => self.show_error(error, cx),
+            Err(error) => {
+                self.target = target;
+                self.show_error(error, cx);
+            }
         }
         cx.notify();
+    }
+
+    /// Drops the attachment list, deleting the copies made for pasted images.
+    fn discard_pending_attachments(&mut self) {
+        let pending = self
+            .engine
+            .repository()
+            .paths()
+            .root
+            .join("pending-attachments");
+        for path in self.attachments.drain(..) {
+            if path.starts_with(&pending) {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+
+    /// Runs `action` against the open board, reporting any failure as a toast.
+    fn on_board(
+        &mut self,
+        cx: &mut Context<Self>,
+        action: impl FnOnce(&mut Self, &str) -> Result<()>,
+    ) {
+        let board_id = match self.board_id() {
+            Ok(id) => id.to_owned(),
+            Err(error) => {
+                self.show_error(error, cx);
+                return;
+            }
+        };
+        if let Err(error) = action(self, &board_id) {
+            self.show_error(error, cx);
+        }
     }
 
     fn focus_prompt(&mut self, _: &FocusPrompt, window: &mut Window, cx: &mut Context<Self>) {
@@ -1327,13 +1012,9 @@ impl AppView {
     }
 
     fn regenerate_node(&mut self, id: &str, cx: &mut Context<Self>) {
-        let result = self
-            .board_id()
-            .map(str::to_owned)
-            .and_then(|board_id| self.engine.regenerate(&board_id, id, None, None));
-        if let Err(error) = result {
-            self.show_error(error, cx)
-        }
+        self.on_board(cx, |this, board_id| {
+            this.engine.regenerate(board_id, id, None, None)
+        });
     }
 
     fn edit_hovered(&mut self, _: &EditHovered, window: &mut Window, cx: &mut Context<Self>) {
@@ -1373,13 +1054,9 @@ impl AppView {
             attachment_paths: Vec::new(),
             attachment_urls: node.attachments,
         };
-        let result = self
-            .board_id()
-            .map(str::to_owned)
-            .and_then(|board_id| self.engine.add_and_start(&board_id, request).map(|_| ()));
-        if let Err(error) = result {
-            self.show_error(error, cx)
-        }
+        self.on_board(cx, |this, board_id| {
+            this.engine.add_and_start(board_id, request).map(|_| ())
+        });
     }
 
     fn delete_hovered(&mut self, _: &DeleteHovered, _: &mut Window, cx: &mut Context<Self>) {
@@ -1647,16 +1324,7 @@ impl AppView {
             |_, _, _| (),
             move |bounds, _, window, cx| {
                 paint_dot_grid(bounds, camera_x, camera_y, zoom, window);
-                if !edge_points.is_empty() {
-                    let connector_style = ConnectorStyle::for_zoom(zoom);
-                    let mut edges = PathBuilder::stroke(px(connector_style.stroke_width));
-                    for (from, to) in &edge_points {
-                        append_dashed_connector(&mut edges, *from, *to, connector_style);
-                    }
-                    if let Ok(path) = edges.build() {
-                        window.paint_path(path, theme::line());
-                    }
-                }
+                paint_connectors(&edge_points, zoom, window);
                 for frame in &visible_nodes {
                     if let Some(node) = canvas_nodes.get(frame.node_index) {
                         paint_canvas_node(*frame, node, zoom, &activity, now, window, cx);
@@ -1700,13 +1368,21 @@ impl AppView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let scale = self.zoom;
-        let branch_id = node.id.clone();
-        let edit_id = node.id.clone();
-        let regenerate_id = node.id.clone();
-        let duplicate_id = node.id.clone();
-        let delete_id = node.id.clone();
-        let running_id = node.id.clone();
-        let copy_prompt = node.prompt.clone();
+        let id = node.id.clone();
+        let prompt = node.prompt.clone();
+        let running = node.status == NodeStatus::Running;
+        let button = |key: &str, label: &'static str, color: gpui::Hsla| {
+            div()
+                .id(SharedString::from(format!("{key}-{id}")))
+                .px(px(8. * scale))
+                .py(px(4. * scale))
+                .rounded(px(6. * scale))
+                .bg(theme::background().opacity(0.9))
+                .text_color(color)
+                .text_size(px(12. * scale))
+                .child(label)
+        };
+        let node_id = node.id.clone();
         let toolbar = div()
             .absolute()
             .top(px(-36. * scale))
@@ -1714,115 +1390,65 @@ impl AppView {
             .flex()
             .gap(px(4. * scale))
             .occlude()
-            .children((node.status == NodeStatus::Running).then(|| {
-                div()
-                    .id(SharedString::from(format!("stop-{}", running_id)))
-                    .px(px(8. * scale))
-                    .py(px(4. * scale))
-                    .rounded(px(6. * scale))
-                    .bg(theme::background().opacity(0.9))
-                    .text_color(theme::danger())
-                    .text_size(px(12. * scale))
-                    .child("Stop")
+            .children(running.then(|| {
+                let node_id = node_id.clone();
+                button("stop", "Stop", theme::danger())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        this.engine.stop_node(&running_id);
+                        this.engine.stop_node(&node_id);
                     }))
                     .into_any_element()
             }))
-            .children((node.status != NodeStatus::Running).then(|| {
-                div()
-                    .id(SharedString::from(format!("branch-{}", branch_id)))
-                    .px(px(8. * scale))
-                    .py(px(4. * scale))
-                    .rounded(px(6. * scale))
-                    .bg(theme::background().opacity(0.9))
-                    .text_color(theme::ink())
-                    .text_size(px(12. * scale))
-                    .child("Branch")
+            .children((!running).then(|| {
+                let node_id = node_id.clone();
+                button("branch", "Branch", theme::ink())
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
-                        this.branch_node(&branch_id, None, window, cx);
+                        this.branch_node(&node_id, None, window, cx);
                     }))
                     .into_any_element()
             }))
-            .children((node.status != NodeStatus::Running).then(|| {
-                div()
-                    .id(SharedString::from(format!("edit-{}", edit_id)))
-                    .px(px(8. * scale))
-                    .py(px(4. * scale))
-                    .rounded(px(6. * scale))
-                    .bg(theme::background().opacity(0.9))
-                    .text_color(theme::dim())
-                    .text_size(px(12. * scale))
-                    .child("Edit")
+            .children((!running).then(|| {
+                let node_id = node_id.clone();
+                button("edit", "Edit", theme::dim())
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
-                        this.edit_node(&edit_id, window, cx);
+                        this.edit_node(&node_id, window, cx);
                     }))
                     .into_any_element()
             }))
-            .children((node.status != NodeStatus::Running).then(|| {
-                div()
-                    .id(SharedString::from(format!("regen-{}", regenerate_id)))
-                    .px(px(8. * scale))
-                    .py(px(4. * scale))
-                    .rounded(px(6. * scale))
-                    .bg(theme::background().opacity(0.9))
-                    .text_color(theme::dim())
-                    .text_size(px(12. * scale))
-                    .child("Retry")
+            .children((!running).then(|| {
+                let node_id = node_id.clone();
+                button("regen", "Retry", theme::dim())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        this.regenerate_node(&regenerate_id, cx);
+                        this.regenerate_node(&node_id, cx);
                     }))
                     .into_any_element()
             }))
             .child(
-                div()
-                    .id(SharedString::from(format!("copy-prompt-{}", node.id)))
-                    .px(px(8. * scale))
-                    .py(px(4. * scale))
-                    .rounded(px(6. * scale))
-                    .bg(theme::background().opacity(0.9))
-                    .text_color(theme::dim())
-                    .text_size(px(12. * scale))
-                    .child("Copy")
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                button("copy-prompt", "Copy", theme::dim()).on_click(cx.listener(
+                    move |this, _, _, cx| {
                         cx.stop_propagation();
-                        cx.write_to_clipboard(ClipboardItem::new_string(copy_prompt.clone()));
+                        cx.write_to_clipboard(ClipboardItem::new_string(prompt.clone()));
                         this.show_toast("Prompt copied".into(), false, None, cx);
-                    })),
+                    },
+                )),
             )
+            .child(button("dup", "Dup", theme::dim()).on_click({
+                let node_id = node_id.clone();
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.duplicate_node(&node_id, cx);
+                })
+            }))
             .child(
-                div()
-                    .id(SharedString::from(format!("dup-{}", duplicate_id)))
-                    .px(px(8. * scale))
-                    .py(px(4. * scale))
-                    .rounded(px(6. * scale))
-                    .bg(theme::background().opacity(0.9))
-                    .text_color(theme::dim())
-                    .text_size(px(12. * scale))
-                    .child("Dup")
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                button("del", "Delete", theme::danger()).on_click(cx.listener(
+                    move |this, _, _, cx| {
                         cx.stop_propagation();
-                        this.duplicate_node(&duplicate_id, cx);
-                    })),
-            )
-            .child(
-                div()
-                    .id(SharedString::from(format!("del-{}", delete_id)))
-                    .px(px(8. * scale))
-                    .py(px(4. * scale))
-                    .rounded(px(6. * scale))
-                    .bg(theme::background().opacity(0.9))
-                    .text_color(theme::danger())
-                    .text_size(px(12. * scale))
-                    .child("Delete")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.delete_node(&delete_id, cx);
-                    })),
+                        this.delete_node(&node_id, cx);
+                    },
+                )),
             );
         div()
             .absolute()
@@ -2385,6 +2011,42 @@ impl AppView {
         }
     }
 
+    /// The aspect ratio of the image the lightbox is showing, if it is open.
+    fn lightbox_image_ratio(&self) -> Option<f32> {
+        let Overlay::Lightbox(lightbox) = &self.overlay else {
+            return None;
+        };
+        Some(
+            self.image_ratios
+                .get(&lightbox.image)
+                .copied()
+                .unwrap_or(1.),
+        )
+    }
+
+    fn zoom_lightbox(
+        &mut self,
+        factor: f32,
+        focal: Point<Pixels>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(image_ratio) = self.lightbox_image_ratio() else {
+            return;
+        };
+        let viewport = window.viewport_size();
+        if let Overlay::Lightbox(lightbox) = &mut self.overlay {
+            lightbox.zoom_at(
+                factor,
+                focal,
+                f32::from(viewport.width),
+                f32::from(viewport.height),
+                image_ratio,
+            );
+            cx.notify();
+        }
+    }
+
     fn lightbox_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
@@ -2399,13 +2061,8 @@ impl AppView {
         }
         let start = *start;
         let origin = *origin;
-        let image_ratio = match &self.overlay {
-            Overlay::Lightbox(lightbox) => self
-                .image_ratios
-                .get(&lightbox.image)
-                .copied()
-                .unwrap_or(1.),
-            _ => return,
+        let Some(image_ratio) = self.lightbox_image_ratio() else {
+            return;
         };
         let viewport = window.viewport_size();
         if let Overlay::Lightbox(lightbox) = &mut self.overlay {
@@ -2438,14 +2095,12 @@ impl AppView {
         }) = drag
         {
             if let Some(position) = self.transient_positions.remove(&id) {
-                let result = self.board_id().map(str::to_owned).and_then(|board_id| {
-                    self.engine
+                self.on_board(cx, |this, board_id| {
+                    this.engine
                         .repository()
-                        .move_node(&board_id, &id, position.x, position.y)
+                        .move_node(board_id, &id, position.x, position.y)
+                        .map(|_| ())
                 });
-                if let Err(error) = result {
-                    self.show_error(error, cx);
-                }
             } else if let Some(click_target) = click_target {
                 match click_target {
                     CanvasClickTarget::Image { node_id, url } => {
@@ -2593,7 +2248,9 @@ impl AppView {
                         theme::raised()
                     })
                     .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, window, cx| this.open_board(id.clone(), window, cx)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_board(id.clone(), window, cx)
+                    }))
                     .child(thumbnail)
                     .child(
                         div()
@@ -3037,47 +2694,12 @@ impl AppView {
             .bg(gpui::black().opacity(0.97))
             .occlude()
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
-                let image_ratio = match &this.overlay {
-                    Overlay::Lightbox(lightbox) => this
-                        .image_ratios
-                        .get(&lightbox.image)
-                        .copied()
-                        .unwrap_or(1.),
-                    _ => return,
-                };
-                let viewport = window.viewport_size();
-                if let Overlay::Lightbox(lightbox) = &mut this.overlay {
-                    let delta = event.delta.pixel_delta(px(18.));
-                    lightbox.zoom_at(
-                        (-f32::from(delta.y) * 0.004).exp(),
-                        event.position,
-                        f32::from(viewport.width),
-                        f32::from(viewport.height),
-                        image_ratio,
-                    );
-                    cx.notify();
-                }
+                let delta = event.delta.pixel_delta(px(18.));
+                let factor = (-f32::from(delta.y) * 0.004).exp();
+                this.zoom_lightbox(factor, event.position, window, cx);
             }))
             .on_pinch(cx.listener(|this, event: &PinchEvent, window, cx| {
-                let image_ratio = match &this.overlay {
-                    Overlay::Lightbox(lightbox) => this
-                        .image_ratios
-                        .get(&lightbox.image)
-                        .copied()
-                        .unwrap_or(1.),
-                    _ => return,
-                };
-                let viewport = window.viewport_size();
-                if let Overlay::Lightbox(lightbox) = &mut this.overlay {
-                    lightbox.zoom_at(
-                        1. + event.delta,
-                        event.position,
-                        f32::from(viewport.width),
-                        f32::from(viewport.height),
-                        image_ratio,
-                    );
-                    cx.notify();
-                }
+                this.zoom_lightbox(1. + event.delta, event.position, window, cx);
             }))
             .on_mouse_move(cx.listener(Self::lightbox_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::lightbox_mouse_up))
@@ -3650,1450 +3272,34 @@ fn control_button(
         .into_any_element()
 }
 
-const PROMPT_LINE_HEIGHT: f32 = 18.;
-const HEADER_FIXED_HEIGHT: f32 = 50.;
-const SHOW_MORE_HEIGHT: f32 = 18.;
-const ATTACHMENT_ROW_HEIGHT: f32 = 44.;
-const PROMPT_WRAP_COLUMNS: usize = 42;
-const COLLAPSED_PROMPT_LINES: usize = 6;
-const EXPANDED_PROMPT_LINES: usize = 18;
-const MEDIA_GAP: f32 = 1.;
-const GRID_GAP: f32 = 28.;
-const GRID_DOT_SIZE: f32 = 1.4;
-const GRID_TILE_CELLS: usize = 32;
-const GRID_TILE_SIZE: f32 = GRID_GAP * GRID_TILE_CELLS as f32;
-const GRID_TEXTURE_SCALE: u32 = 2;
-const GRID_ANTIALIAS_SAMPLES: u32 = 8;
-const GRID_COLOR_BGRA: [u8; 3] = [0x2d, 0x22, 0x1e];
-const VIEWPORT_CULL_MARGIN: f32 = 96.;
-const CONNECTOR_STROKE_WIDTH: f32 = 1.6;
-const CONNECTOR_DASH_LENGTH: f32 = 7.;
-const CONNECTOR_GAP_LENGTH: f32 = 5.;
-const CARD_SPRITE_WIDTHS: [f32; 4] = [85., 170., 340., 680.];
-const NO_SPRITE_TIER: u8 = u8::MAX;
-
-impl CardScene {
-    fn quad(
-        &mut self,
-        bounds: CardRect,
-        radius: f32,
-        fill: CardColor,
-        border: Option<(f32, CardColor)>,
-    ) {
-        self.primitives.push(CardPrimitive::Quad {
-            bounds,
-            radius,
-            fill,
-            border,
-        });
-    }
-
-    fn text(
-        &mut self,
-        text: impl Into<SharedString>,
-        bounds: CardRect,
-        font_size: f32,
-        line_height: f32,
-        color: CardColor,
-        align: TextAlign,
-    ) {
-        self.primitives.push(CardPrimitive::Text {
-            text: text.into(),
-            bounds,
-            font_size,
-            line_height,
-            color,
-            align,
-        });
-    }
-
-    fn image(&mut self, asset: CanvasImageAsset, bounds: CardRect, fit: CardImageFit, radius: f32) {
-        self.primitives.push(CardPrimitive::Image {
-            asset,
-            bounds,
-            fit,
-            radius,
-        });
-    }
-}
-
-fn build_card_scene(canvas_node: &CanvasNode, expanded: bool) -> CardScene {
-    let node = &canvas_node.node;
-    let mut scene = CardScene {
-        height: card_height_from_metadata(
-            node,
-            expanded,
-            canvas_node.prompt_lines.len(),
-            canvas_node.output_layout.height(),
-        ),
-        primitives: Vec::new(),
-    };
-    let border = if node.status == NodeStatus::Running {
-        CardColor::Accent45
-    } else {
-        CardColor::Line
-    };
-    scene.quad(
-        CardRect::new(0., 0., CARD_WIDTH, scene.height),
-        20.,
-        CardColor::Raised,
-        Some((1., border)),
-    );
-
-    let prompt_clamped = canvas_node.prompt_lines.len() > COLLAPSED_PROMPT_LINES;
-    let visible_prompt_lines = if expanded {
-        &canvas_node.prompt_lines[..canvas_node.prompt_lines.len().min(EXPANDED_PROMPT_LINES)]
-    } else {
-        &canvas_node.collapsed_prompt_lines
-    };
-    let visible_line_count = visible_prompt_lines.len().max(1);
-    let prompt_block_height = 24.
-        + visible_line_count as f32 * PROMPT_LINE_HEIGHT
-        + if prompt_clamped { SHOW_MORE_HEIGHT } else { 0. };
-    for (index, line) in visible_prompt_lines.iter().enumerate() {
-        scene.text(
-            line.clone(),
-            CardRect::new(
-                14.,
-                13. + index as f32 * PROMPT_LINE_HEIGHT,
-                CARD_WIDTH - 28.,
-                PROMPT_LINE_HEIGHT,
-            ),
-            12.5,
-            PROMPT_LINE_HEIGHT,
-            CardColor::Ink90,
-            TextAlign::Left,
-        );
-    }
-    if prompt_clamped {
-        scene.text(
-            if expanded { "Show less" } else { "Show more" },
-            CardRect::new(
-                14.,
-                13. + visible_line_count as f32 * PROMPT_LINE_HEIGHT,
-                CARD_WIDTH - 28.,
-                SHOW_MORE_HEIGHT,
-            ),
-            10.5,
-            SHOW_MORE_HEIGHT,
-            CardColor::Accent,
-            TextAlign::Left,
-        );
-    }
-
-    let mut cursor_y = prompt_block_height;
-    if !canvas_node.attachment_images.is_empty() {
-        for (index, asset) in canvas_node.attachment_images.iter().enumerate() {
-            scene.image(
-                asset.clone(),
-                CardRect::new(14. + index as f32 * 42., cursor_y + 8., 36., 36.),
-                CardImageFit::Cover,
-                6.,
-            );
-        }
-        cursor_y += ATTACHMENT_ROW_HEIGHT;
-    }
-
-    scene.text(
-        "❖ Me",
-        CardRect::new(14., cursor_y, 42., 18.),
-        10.5,
-        18.,
-        CardColor::Faint,
-        TextAlign::Left,
-    );
-    if node.aspect != "auto" {
-        let pill_width = (node.aspect.len() as f32 * 6.2 + 8.).max(28.);
-        let pill = CardRect::new(56., cursor_y + 1., pill_width, 16.);
-        scene.quad(
-            pill,
-            8.,
-            CardColor::Transparent,
-            Some((1., CardColor::Line)),
-        );
-        scene.text(
-            node.aspect.clone(),
-            pill,
-            10.5,
-            16.,
-            CardColor::Faint,
-            TextAlign::Center,
-        );
-    }
-    scene.text(
-        canvas_node.date.clone(),
-        CardRect::new(140., cursor_y, CARD_WIDTH - 154., 18.),
-        10.5,
-        18.,
-        CardColor::Faint,
-        TextAlign::Right,
-    );
-    cursor_y += 26.;
-    scene.quad(
-        CardRect::new(0., cursor_y, CARD_WIDTH, MEDIA_GAP),
-        0.,
-        CardColor::Line,
-        None,
-    );
-    cursor_y += MEDIA_GAP;
-
-    match &canvas_node.output_layout {
-        OutputLayout::None => {}
-        OutputLayout::Tiles { height, cells } => {
-            let media = CardRect::new(0., cursor_y, CARD_WIDTH, *height);
-            scene.quad(media, 0., CardColor::Hover, None);
-            if cells.is_empty() {
-                scene.quad(media, 0., CardColor::Raised, None);
-                scene.text(
-                    "Generating…",
-                    media,
-                    12.,
-                    *height,
-                    CardColor::Faint,
-                    TextAlign::Center,
-                );
-            }
-            for cell in cells {
-                let Some(image) = canvas_node.displayed_images.get(cell.index) else {
-                    continue;
-                };
-                let bounds = CardRect::new(cell.x, cursor_y + cell.y, cell.width, cell.height);
-                scene.quad(bounds, 0., CardColor::Raised, None);
-                scene.image(image.asset.clone(), bounds, CardImageFit::Contain, 0.);
-            }
-            if node.images.is_empty() && !canvas_node.displayed_images.is_empty() {
-                let badge = CardRect::new(CARD_WIDTH - 76., cursor_y + *height - 27., 68., 19.);
-                scene.quad(badge, 5., CardColor::Background82, None);
-                scene.text(
-                    "Unfinalized",
-                    badge,
-                    10.,
-                    19.,
-                    CardColor::Dim,
-                    TextAlign::Center,
-                );
-            }
-            cursor_y += *height;
-        }
-        OutputLayout::Filmstrip {
-            height,
-            hero_height,
-            compact_count,
-            hidden_count,
-            strip_cell_width,
-        } => {
-            scene.quad(
-                CardRect::new(0., cursor_y, CARD_WIDTH, *height),
-                0.,
-                CardColor::Line,
-                None,
-            );
-            if let Some(hero) = canvas_node.displayed_images.first() {
-                let hero_bounds = CardRect::new(0., cursor_y, CARD_WIDTH, *hero_height);
-                scene.quad(hero_bounds, 0., CardColor::Raised, None);
-                scene.image(hero.asset.clone(), hero_bounds, CardImageFit::Contain, 0.);
-            }
-            let badge = CardRect::new(CARD_WIDTH - 57., cursor_y + *hero_height - 25., 49., 19.);
-            scene.quad(badge, 5., CardColor::Background82, None);
-            scene.text(
-                format!("1 / {}", canvas_node.displayed_images.len()),
-                badge,
-                10.,
-                19.,
-                CardColor::Ink,
-                TextAlign::Center,
-            );
-            let strip_y = cursor_y + *hero_height + MEDIA_GAP;
-            for compact_index in 0..*compact_count {
-                let Some(image) = canvas_node.displayed_images.get(compact_index + 1) else {
-                    continue;
-                };
-                let bounds = CardRect::new(
-                    compact_index as f32 * (*strip_cell_width + MEDIA_GAP),
-                    strip_y,
-                    *strip_cell_width,
-                    *strip_cell_width,
-                );
-                scene.quad(bounds, 0., CardColor::Raised, None);
-                scene.image(image.asset.clone(), bounds, CardImageFit::Cover, 0.);
-            }
-            if *hidden_count > 0 {
-                let hidden = CardRect::new(
-                    CARD_WIDTH - *strip_cell_width,
-                    strip_y,
-                    *strip_cell_width,
-                    *strip_cell_width,
-                );
-                scene.quad(hidden, 0., CardColor::Raised, None);
-                scene.text(
-                    format!("+{hidden_count}"),
-                    hidden,
-                    12.,
-                    *strip_cell_width,
-                    CardColor::Dim,
-                    TextAlign::Center,
-                );
-            }
-            cursor_y += *height;
-        }
-    }
-
-    let status_height = status_area_height(node);
-    match node.status {
-        NodeStatus::Running => {}
-        NodeStatus::Done => scene.text(
-            canvas_node.done_footer.clone(),
-            CardRect::new(14., cursor_y, CARD_WIDTH - 28., status_height),
-            10.5,
-            status_height,
-            CardColor::Dim,
-            TextAlign::Left,
-        ),
-        NodeStatus::Error if canvas_node.displayed_images.is_empty() => {
-            scene.text(
-                "!",
-                CardRect::new(0., cursor_y + 17., CARD_WIDTH, 24.),
-                18.,
-                24.,
-                CardColor::Danger,
-                TextAlign::Center,
-            );
-            scene.text(
-                canvas_node.status_message.clone(),
-                CardRect::new(18., cursor_y + 45., CARD_WIDTH - 36., 32.),
-                11.5,
-                16.,
-                CardColor::Danger,
-                TextAlign::Center,
-            );
-            let retry = CardRect::new(CARD_WIDTH / 2. - 29., cursor_y + 88., 58., 26.);
-            scene.quad(
-                retry,
-                7.,
-                CardColor::Transparent,
-                Some((1., CardColor::Line)),
-            );
-            scene.text("Retry", retry, 10.5, 26., CardColor::Dim, TextAlign::Center);
-        }
-        NodeStatus::Error | NodeStatus::Stopped => {
-            scene.text(
-                canvas_node.status_message.clone(),
-                CardRect::new(14., cursor_y, CARD_WIDTH - 90., status_height),
-                10.8,
-                status_height,
-                if node.status == NodeStatus::Error {
-                    CardColor::Danger
-                } else {
-                    CardColor::Faint
-                },
-                TextAlign::Left,
-            );
-            let retry = CardRect::new(
-                CARD_WIDTH - 68.,
-                cursor_y + (status_height - 26.) * 0.5,
-                54.,
-                26.,
-            );
-            scene.quad(
-                retry,
-                7.,
-                CardColor::Transparent,
-                Some((1., CardColor::Line)),
-            );
-            scene.text("Retry", retry, 10.5, 26., CardColor::Dim, TextAlign::Center);
-        }
-    }
-    scene
-}
-
-fn card_scene_svg(scene: &CardScene, rendered_width: f32) -> String {
-    let rendered_height = scene.height * rendered_width / CARD_WIDTH;
-    let mut svg = String::with_capacity(scene.primitives.len() * 180);
-    write!(
-        svg,
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{rendered_width}\" height=\"{rendered_height}\" viewBox=\"0 0 {CARD_WIDTH} {}\">",
-        scene.height
-    )
-    .expect("writing to a String cannot fail");
-    write!(
-        svg,
-        "<defs><clipPath id=\"card\"><rect x=\"0\" y=\"0\" width=\"{CARD_WIDTH}\" height=\"{}\" rx=\"20\"/></clipPath></defs><g clip-path=\"url(#card)\">",
-        scene.height
-    )
-    .expect("writing to a String cannot fail");
-    for (index, primitive) in scene.primitives.iter().enumerate() {
-        match primitive {
-            CardPrimitive::Quad {
-                bounds,
-                radius,
-                fill,
-                border,
-            } => {
-                let (fill_color, fill_opacity) = fill.svg();
-                write!(
-                    svg,
-                    "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"{radius}\" fill=\"{fill_color}\" fill-opacity=\"{fill_opacity}\"",
-                    bounds.x, bounds.y, bounds.width, bounds.height
-                )
-                .expect("writing to a String cannot fail");
-                if let Some((width, color)) = border {
-                    let (stroke, opacity) = color.svg();
-                    write!(
-                        svg,
-                        " stroke=\"{stroke}\" stroke-opacity=\"{opacity}\" stroke-width=\"{width}\""
-                    )
-                    .expect("writing to a String cannot fail");
-                }
-                svg.push_str("/>");
-            }
-            CardPrimitive::Text {
-                text,
-                bounds,
-                font_size,
-                line_height,
-                color,
-                align,
-            } => {
-                let clip_id = format!("text-{index}");
-                write!(
-                    svg,
-                    "<clipPath id=\"{clip_id}\"><rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"/></clipPath>",
-                    bounds.x, bounds.y, bounds.width, bounds.height
-                )
-                .expect("writing to a String cannot fail");
-                let (anchor, x) = match align {
-                    TextAlign::Left => ("start", bounds.x),
-                    TextAlign::Center => ("middle", bounds.x + bounds.width / 2.),
-                    TextAlign::Right => ("end", bounds.x + bounds.width),
-                };
-                let baseline = bounds.y + (line_height - font_size) * 0.5 + font_size * 0.82;
-                let (fill, opacity) = color.svg();
-                write!(
-                    svg,
-                    "<text x=\"{x}\" y=\"{baseline}\" clip-path=\"url(#{clip_id})\" font-family=\"system-ui,sans-serif\" font-size=\"{font_size}\" font-weight=\"400\" text-anchor=\"{anchor}\" fill=\"{fill}\" fill-opacity=\"{opacity}\">"
-                )
-                .expect("writing to a String cannot fail");
-                push_xml_escaped(&mut svg, text);
-                svg.push_str("</text>");
-            }
-            CardPrimitive::Image {
-                asset,
-                bounds,
-                fit,
-                radius,
-            } => {
-                if asset.thumbnail.as_os_str().is_empty() {
-                    continue;
-                }
-                let clip_id = format!("image-{index}");
-                write!(
-                    svg,
-                    "<clipPath id=\"{clip_id}\"><rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"{radius}\"/></clipPath><image x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" clip-path=\"url(#{clip_id})\" preserveAspectRatio=\"xMidYMid {}\" href=\"",
-                    bounds.x,
-                    bounds.y,
-                    bounds.width,
-                    bounds.height,
-                    bounds.x,
-                    bounds.y,
-                    bounds.width,
-                    bounds.height,
-                    match fit {
-                        CardImageFit::Contain => "meet",
-                        CardImageFit::Cover => "slice",
-                    }
-                )
-                .expect("writing to a String cannot fail");
-                push_xml_escaped(&mut svg, &asset.thumbnail.to_string_lossy());
-                svg.push_str("\"/>");
-            }
-        }
-    }
-    svg.push_str("</g></svg>");
-    svg
-}
-
-fn push_xml_escaped(output: &mut String, value: &str) {
-    for character in value.chars() {
-        match character {
-            '&' => output.push_str("&amp;"),
-            '<' => output.push_str("&lt;"),
-            '>' => output.push_str("&gt;"),
-            '\"' => output.push_str("&quot;"),
-            '\'' => output.push_str("&apos;"),
-            _ => output.push(character),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct DotGridMetrics {
-    tile_size: f32,
-    origin_x: f32,
-    origin_y: f32,
-}
-
-fn dot_grid_metrics(camera_x: f32, camera_y: f32, zoom: f32) -> DotGridMetrics {
-    let zoom = zoom.max(0.0001);
-    let tile_size = GRID_TILE_SIZE * zoom;
-    let dot_offset = GRID_GAP * zoom / 2.;
-    DotGridMetrics {
-        tile_size,
-        origin_x: (camera_x - dot_offset).rem_euclid(tile_size) - tile_size,
-        origin_y: (camera_y - dot_offset).rem_euclid(tile_size) - tile_size,
-    }
-}
-
-fn dot_grid_texture_pixels() -> image::RgbaImage {
-    let texture_size = (GRID_TILE_SIZE * GRID_TEXTURE_SCALE as f32).round() as u32;
-    let mut texture = image::RgbaImage::new(texture_size, texture_size);
-    let scale = GRID_TEXTURE_SCALE as f32;
-    let dot_radius = GRID_DOT_SIZE * scale / 2.;
-    let samples_per_pixel = GRID_ANTIALIAS_SAMPLES.pow(2);
-
-    for row in 0..GRID_TILE_CELLS {
-        let center_y = (GRID_GAP / 2. + row as f32 * GRID_GAP) * scale;
-        for column in 0..GRID_TILE_CELLS {
-            let center_x = (GRID_GAP / 2. + column as f32 * GRID_GAP) * scale;
-            let min_x = (center_x - dot_radius).floor().max(0.) as u32;
-            let max_x = (center_x + dot_radius).ceil().min(texture_size as f32) as u32;
-            let min_y = (center_y - dot_radius).floor().max(0.) as u32;
-            let max_y = (center_y + dot_radius).ceil().min(texture_size as f32) as u32;
-
-            for pixel_y in min_y..max_y {
-                for pixel_x in min_x..max_x {
-                    let mut covered_samples = 0;
-                    for sample_y in 0..GRID_ANTIALIAS_SAMPLES {
-                        let sample_y = pixel_y as f32
-                            + (sample_y as f32 + 0.5) / GRID_ANTIALIAS_SAMPLES as f32;
-                        for sample_x in 0..GRID_ANTIALIAS_SAMPLES {
-                            let sample_x = pixel_x as f32
-                                + (sample_x as f32 + 0.5) / GRID_ANTIALIAS_SAMPLES as f32;
-                            let dx = sample_x - center_x;
-                            let dy = sample_y - center_y;
-                            covered_samples +=
-                                u32::from(dx * dx + dy * dy <= dot_radius * dot_radius);
-                        }
-                    }
-                    if covered_samples > 0 {
-                        let alpha = ((covered_samples * 255 + samples_per_pixel / 2)
-                            / samples_per_pixel) as u8;
-                        texture.put_pixel(
-                            pixel_x,
-                            pixel_y,
-                            image::Rgba([
-                                GRID_COLOR_BGRA[0],
-                                GRID_COLOR_BGRA[1],
-                                GRID_COLOR_BGRA[2],
-                                alpha,
-                            ]),
-                        );
-                    }
-                }
-            }
-        }
-    }
-    texture
-}
-
-fn dot_grid_image() -> Arc<gpui::RenderImage> {
-    static IMAGE: OnceLock<Arc<gpui::RenderImage>> = OnceLock::new();
-    IMAGE
-        .get_or_init(|| {
-            Arc::new(gpui::RenderImage::new(vec![image::Frame::new(
-                dot_grid_texture_pixels(),
-            )]))
-        })
-        .clone()
-}
-
-fn paint_dot_grid(
-    bounds: Bounds<Pixels>,
-    camera_x: f32,
-    camera_y: f32,
-    zoom: f32,
-    window: &mut Window,
-) {
-    let image = dot_grid_image();
-    let metrics = dot_grid_metrics(camera_x, camera_y, zoom);
-    let tile_size = px(metrics.tile_size);
-    window.with_content_mask(Some(ContentMask { bounds }), |window| {
-        let mut y = bounds.top() + px(metrics.origin_y);
-        while y < bounds.bottom() {
-            let mut x = bounds.left() + px(metrics.origin_x);
-            while x < bounds.right() {
-                let _ = window.paint_image(
-                    Bounds {
-                        origin: point(x, y),
-                        size: size(tile_size, tile_size),
-                    },
-                    px(0.).into(),
-                    image.clone(),
-                    0,
-                    false,
-                );
-                x += tile_size;
-            }
-            y += tile_size;
-        }
-    });
-}
-
-fn rect_is_visible(
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-    viewport_width: f32,
-    viewport_height: f32,
-    margin: f32,
-) -> bool {
-    x + width >= -margin
-        && y + height >= -margin
-        && x <= viewport_width + margin
-        && y <= viewport_height + margin
-}
-
-fn edge_is_visible(
-    from: Point<Pixels>,
-    to: Point<Pixels>,
-    viewport_width: f32,
-    viewport_height: f32,
-    margin: f32,
-) -> bool {
-    let from_x = f32::from(from.x);
-    let from_y = f32::from(from.y);
-    let to_x = f32::from(to.x);
-    let to_y = f32::from(to.y);
-    rect_is_visible(
-        from_x.min(to_x),
-        from_y.min(to_y),
-        (from_x - to_x).abs(),
-        (from_y - to_y).abs(),
-        viewport_width,
-        viewport_height,
-        margin,
-    )
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum DashCommand {
-    MoveTo(Point<Pixels>),
-    LineTo(Point<Pixels>),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct ConnectorStyle {
-    stroke_width: f32,
-    dash_length: f32,
-    gap_length: f32,
-}
-
-impl ConnectorStyle {
-    fn for_zoom(zoom: f32) -> Self {
-        debug_assert!(zoom > 0.);
-        Self {
-            stroke_width: CONNECTOR_STROKE_WIDTH * zoom,
-            dash_length: CONNECTOR_DASH_LENGTH * zoom,
-            gap_length: CONNECTOR_GAP_LENGTH * zoom,
-        }
-    }
-}
-
-fn append_dashed_connector(
-    path: &mut PathBuilder,
-    from: Point<Pixels>,
-    to: Point<Pixels>,
-    style: ConnectorStyle,
-) {
-    let middle_y = px((f32::from(from.y) + f32::from(to.y)) / 2.);
-    let points = [from, point(from.x, middle_y), point(to.x, middle_y), to];
-    trace_dashed_polyline(
-        &points,
-        style.dash_length,
-        style.gap_length,
-        |command| match command {
-            DashCommand::MoveTo(point) => path.move_to(point),
-            DashCommand::LineTo(point) => path.line_to(point),
-        },
-    );
-}
-
-fn trace_dashed_polyline(
-    points: &[Point<Pixels>],
-    dash_length: f32,
-    gap_length: f32,
-    mut emit: impl FnMut(DashCommand),
-) {
-    debug_assert!(dash_length > 0. && gap_length > 0.);
-    let mut drawing = true;
-    let mut remaining = dash_length;
-    let mut dash_open = false;
-
-    for segment in points.windows(2) {
-        let start_x = f32::from(segment[0].x);
-        let start_y = f32::from(segment[0].y);
-        let delta_x = f32::from(segment[1].x) - start_x;
-        let delta_y = f32::from(segment[1].y) - start_y;
-        let length = delta_x.hypot(delta_y);
-        if length <= f32::EPSILON {
-            continue;
-        }
-        let direction_x = delta_x / length;
-        let direction_y = delta_y / length;
-        let mut traveled = 0.;
-
-        while traveled < length {
-            let step = remaining.min(length - traveled);
-            let fragment_start = point(
-                px(start_x + direction_x * traveled),
-                px(start_y + direction_y * traveled),
-            );
-            traveled += step;
-            let fragment_end = point(
-                px(start_x + direction_x * traveled),
-                px(start_y + direction_y * traveled),
-            );
-
-            if drawing {
-                if !dash_open {
-                    emit(DashCommand::MoveTo(fragment_start));
-                    dash_open = true;
-                }
-                emit(DashCommand::LineTo(fragment_end));
-            }
-
-            remaining -= step;
-            if remaining <= f32::EPSILON {
-                if drawing {
-                    dash_open = false;
-                }
-                drawing = !drawing;
-                remaining = if drawing { dash_length } else { gap_length };
-            }
-        }
-    }
-}
-
-fn canvas_bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<Pixels> {
-    Bounds::new(point(px(x), px(y)), size(px(width), px(height)))
-}
-
-#[derive(Clone, Copy)]
-struct CanvasTextStyle {
-    font_size: f32,
-    line_height: f32,
-    color: gpui::Hsla,
-    align: TextAlign,
-}
-
-impl CanvasTextStyle {
-    fn new(font_size: f32, line_height: f32, color: gpui::Hsla, align: TextAlign) -> Self {
-        Self {
-            font_size,
-            line_height,
-            color,
-            align,
-        }
-    }
-}
-
-fn paint_canvas_text(
-    text: SharedString,
-    bounds: Bounds<Pixels>,
-    style: CanvasTextStyle,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    if text.is_empty() || style.font_size <= 0. {
-        return;
-    }
-    let run = TextRun {
-        len: text.len(),
-        color: style.color,
-        ..Default::default()
-    };
-    let line = window
-        .text_system()
-        .shape_line(text, px(style.font_size), &[run], None);
-    window.with_content_mask(Some(ContentMask { bounds }), |window| {
-        let _ = line.paint(
-            bounds.origin,
-            px(style.line_height),
-            style.align,
-            Some(bounds.size.width),
-            window,
-            cx,
-        );
-    });
-}
-
-fn paint_canvas_image(
-    path: &Arc<Path>,
-    bounds: Bounds<Pixels>,
-    fit: ObjectFit,
-    corner_radius: f32,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let resource = Resource::Path(path.clone());
-    let Some(Ok(data)) = window.use_asset::<ImgResourceLoader>(&resource, cx) else {
-        return;
-    };
-    if data.frame_count() == 0 {
-        return;
-    }
-    let image_bounds = fit.get_bounds(bounds, data.size(0));
-    window.with_content_mask(Some(ContentMask { bounds }), |window| {
-        let _ = window.paint_image(image_bounds, px(corner_radius).into(), data, 0, false);
-    });
-}
-
-fn paint_canvas_node(
-    frame: CanvasNodeFrame,
-    canvas_node: &CanvasNode,
-    zoom: f32,
-    activity: &HashMap<String, String>,
-    now: i64,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let bounds = canvas_bounds(
-        frame.screen_x,
-        frame.screen_y,
-        CARD_WIDTH * zoom,
-        frame.height,
-    );
-    let tier = if zoom <= 0.25 {
-        0
-    } else if zoom <= 0.5 {
-        1
-    } else if zoom <= 1. {
-        2
-    } else {
-        3
-    };
-    let mut sprite = canvas_node
-        .sprite_images
-        .get(tier)
-        .and_then(|image| image.clone().use_render_image(window, cx));
-    if sprite.is_some() {
-        canvas_node
-            .last_ready_sprite_tier
-            .store(tier as u8, Ordering::Relaxed);
-    } else {
-        let previous_tier = canvas_node.last_ready_sprite_tier.load(Ordering::Relaxed) as usize;
-        if previous_tier < canvas_node.sprite_images.len() && previous_tier != tier {
-            sprite = canvas_node.sprite_images[previous_tier]
-                .clone()
-                .use_render_image(window, cx);
-        }
-    }
-    if let Some(sprite) = sprite {
-        let _ = window.paint_image(bounds, px(20. * zoom).into(), sprite, 0, false);
-    } else {
-        paint_card_scene(frame, &canvas_node.scene, zoom, window, cx);
-    }
-
-    paint_high_resolution_card_images(frame, &canvas_node.scene, zoom, window, cx);
-
-    if canvas_node.node.status == NodeStatus::Running {
-        let activity = activity
-            .get(&canvas_node.node.id)
-            .map(String::as_str)
-            .unwrap_or("Working");
-        paint_canvas_text(
-            format!(
-                "Generating · {}s · {activity}",
-                (now - canvas_node
-                    .node
-                    .run_started_at
-                    .unwrap_or(canvas_node.node.created_at))
-                .max(0)
-                    / 1_000
-            )
-            .into(),
-            canvas_bounds(
-                frame.screen_x + 14. * zoom,
-                frame.screen_y + (canvas_node.scene.height - 42.) * zoom,
-                (CARD_WIDTH - 28.) * zoom,
-                42. * zoom,
-            ),
-            CanvasTextStyle::new(10.8 * zoom, 42. * zoom, theme::dim(), TextAlign::Left),
-            window,
-            cx,
-        );
-    }
-
-    if frame.targeted {
-        window.paint_quad(quad(
-            bounds,
-            px(20. * zoom),
-            gpui::transparent_black(),
-            px(zoom),
-            theme::accent(),
-            BorderStyle::Solid,
-        ));
-    }
-}
-
-fn paint_card_scene(
-    frame: CanvasNodeFrame,
-    scene: &CardScene,
-    zoom: f32,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let card_bounds = canvas_bounds(
-        frame.screen_x,
-        frame.screen_y,
-        CARD_WIDTH * zoom,
-        frame.height,
-    );
-    window.with_content_mask(
-        Some(ContentMask {
-            bounds: card_bounds,
-        }),
-        |window| {
-            for primitive in &scene.primitives {
-                match primitive {
-                    CardPrimitive::Quad {
-                        bounds,
-                        radius,
-                        fill,
-                        border,
-                    } => {
-                        let bounds = transform_card_rect(*bounds, frame, zoom);
-                        let (border_width, border_color) = border
-                            .map(|(width, color)| (width * zoom, color.hsla()))
-                            .unwrap_or((0., gpui::transparent_black()));
-                        window.paint_quad(quad(
-                            bounds,
-                            px(radius * zoom),
-                            fill.hsla(),
-                            px(border_width),
-                            border_color,
-                            BorderStyle::Solid,
-                        ));
-                    }
-                    CardPrimitive::Text {
-                        text,
-                        bounds,
-                        font_size,
-                        line_height,
-                        color,
-                        align,
-                    } => paint_canvas_text(
-                        text.clone(),
-                        transform_card_rect(*bounds, frame, zoom),
-                        CanvasTextStyle::new(
-                            font_size * zoom,
-                            line_height * zoom,
-                            color.hsla(),
-                            *align,
-                        ),
-                        window,
-                        cx,
-                    ),
-                    CardPrimitive::Image {
-                        asset,
-                        bounds,
-                        fit,
-                        radius,
-                    } => paint_canvas_image(
-                        &asset.thumbnail,
-                        transform_card_rect(*bounds, frame, zoom),
-                        match fit {
-                            CardImageFit::Contain => ObjectFit::Contain,
-                            CardImageFit::Cover => ObjectFit::Cover,
-                        },
-                        radius * zoom,
-                        window,
-                        cx,
-                    ),
-                }
-            }
-        },
-    );
-}
-
-fn paint_high_resolution_card_images(
-    frame: CanvasNodeFrame,
-    scene: &CardScene,
-    zoom: f32,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let scale_factor = window.scale_factor();
-    for primitive in &scene.primitives {
-        let CardPrimitive::Image {
-            asset,
-            bounds,
-            fit,
-            radius,
-        } = primitive
-        else {
-            continue;
-        };
-        if asset.original.as_ref() == asset.thumbnail.as_ref()
-            || !image_needs_high_resolution(*bounds, zoom, scale_factor)
-        {
-            continue;
-        }
-        paint_canvas_image(
-            &asset.original,
-            transform_card_rect(*bounds, frame, zoom),
-            match fit {
-                CardImageFit::Contain => ObjectFit::Contain,
-                CardImageFit::Cover => ObjectFit::Cover,
-            },
-            radius * zoom,
-            window,
-            cx,
-        );
-    }
-}
-
-fn image_needs_high_resolution(bounds: CardRect, zoom: f32, scale_factor: f32) -> bool {
-    bounds.width.max(bounds.height) * zoom * scale_factor > THUMBNAIL_MAX_DIMENSION as f32
-}
-
-fn transform_card_rect(bounds: CardRect, frame: CanvasNodeFrame, zoom: f32) -> Bounds<Pixels> {
-    canvas_bounds(
-        frame.screen_x + bounds.x * zoom,
-        frame.screen_y + bounds.y * zoom,
-        bounds.width * zoom,
-        bounds.height * zoom,
-    )
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct OutputCell {
-    index: usize,
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum OutputLayout {
-    None,
-    Tiles {
-        height: f32,
-        cells: Vec<OutputCell>,
-    },
-    Filmstrip {
-        height: f32,
-        hero_height: f32,
-        compact_count: usize,
-        hidden_count: usize,
-        strip_cell_width: f32,
-    },
-}
-
-impl OutputLayout {
-    fn height(&self) -> f32 {
-        match self {
-            Self::None => 0.,
-            Self::Tiles { height, .. } | Self::Filmstrip { height, .. } => *height,
-        }
-    }
-}
-
-fn card_height(node: &BoardNode, expanded: bool, ratios: &HashMap<String, f32>) -> f32 {
-    card_height_from_metadata(
-        node,
-        expanded,
-        wrap_prompt(&node.prompt, PROMPT_WRAP_COLUMNS).len(),
-        output_layout(node, ratios).height(),
-    )
-}
-
-fn card_height_from_metadata(
-    node: &BoardNode,
-    expanded: bool,
-    total_prompt_lines: usize,
-    output_height: f32,
-) -> f32 {
-    let (prompt_lines, prompt_clamped) =
-        prompt_metrics_from_line_count(total_prompt_lines, expanded);
-    HEADER_FIXED_HEIGHT
-        + prompt_lines * PROMPT_LINE_HEIGHT
-        + if prompt_clamped { SHOW_MORE_HEIGHT } else { 0. }
-        + if node.attachments.is_empty() {
-            0.
-        } else {
-            ATTACHMENT_ROW_HEIGHT
-        }
-        + MEDIA_GAP
-        + output_height
-        + status_area_height(node)
-}
-
-fn prompt_metrics_from_line_count(total_lines: usize, expanded: bool) -> (f32, bool) {
-    let line_limit = if expanded {
-        EXPANDED_PROMPT_LINES
-    } else {
-        COLLAPSED_PROMPT_LINES
-    };
-    (
-        total_lines.min(line_limit).max(1) as f32,
-        total_lines > COLLAPSED_PROMPT_LINES,
-    )
-}
-
-fn wrap_prompt(value: &str, max_graphemes: usize) -> Vec<String> {
-    assert!(max_graphemes > 0, "prompt wrap width must be non-zero");
-    let mut lines = Vec::new();
-
-    for paragraph in value.split('\n') {
-        if paragraph.is_empty() {
-            lines.push(String::new());
-            continue;
-        }
-
-        let mut current = String::new();
-        let mut current_len = 0;
-        for word in paragraph.split_whitespace() {
-            let graphemes = UnicodeSegmentation::graphemes(word, true).collect::<Vec<_>>();
-            if graphemes.len() <= max_graphemes {
-                let separator_len = usize::from(!current.is_empty());
-                if current_len + separator_len + graphemes.len() <= max_graphemes {
-                    if separator_len == 1 {
-                        current.push(' ');
-                    }
-                    current.push_str(word);
-                    current_len += separator_len + graphemes.len();
-                } else {
-                    lines.push(std::mem::take(&mut current));
-                    current.push_str(word);
-                    current_len = graphemes.len();
-                }
-                continue;
-            }
-
-            if !current.is_empty() {
-                lines.push(std::mem::take(&mut current));
-                current_len = 0;
-            }
-            for chunk in graphemes.chunks(max_graphemes) {
-                let chunk = chunk.concat();
-                if chunk.graphemes(true).count() == max_graphemes {
-                    lines.push(chunk);
-                } else {
-                    current_len = chunk.graphemes(true).count();
-                    current = chunk;
-                }
-            }
-        }
-
-        if !current.is_empty() {
-            lines.push(current);
-        } else if paragraph.chars().all(char::is_whitespace) {
-            lines.push(String::new());
-        }
-    }
-
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines
-}
-
-fn displayed_urls(node: &BoardNode) -> &[String] {
-    if node.images.is_empty() {
-        node.attempts
-            .last()
-            .map(std::slice::from_ref)
-            .unwrap_or_default()
-    } else {
-        &node.images
-    }
-}
-
-fn output_layout(node: &BoardNode, ratios: &HashMap<String, f32>) -> OutputLayout {
-    let urls = displayed_urls(node);
-    match urls.len() {
-        0 if node.status == NodeStatus::Running => OutputLayout::Tiles {
-            height: CARD_WIDTH,
-            cells: Vec::new(),
-        },
-        0 => OutputLayout::None,
-        1 => {
-            let height = image_height(CARD_WIDTH, output_ratio(node, &urls[0], ratios));
-            OutputLayout::Tiles {
-                height,
-                cells: vec![OutputCell {
-                    index: 0,
-                    x: 0.,
-                    y: 0.,
-                    width: CARD_WIDTH,
-                    height,
-                }],
-            }
-        }
-        2..=4 => {
-            let cell_width = (CARD_WIDTH - MEDIA_GAP) / 2.;
-            let mut cells = Vec::with_capacity(urls.len());
-            let mut y = 0.;
-            for (row, chunk) in urls.chunks(2).enumerate() {
-                let row_height = chunk
-                    .iter()
-                    .map(|url| image_height(cell_width, output_ratio(node, url, ratios)))
-                    .fold(0_f32, f32::max);
-                for (column, _) in chunk.iter().enumerate() {
-                    cells.push(OutputCell {
-                        index: row * 2 + column,
-                        x: column as f32 * (cell_width + MEDIA_GAP),
-                        y,
-                        width: cell_width,
-                        height: row_height,
-                    });
-                }
-                y += row_height;
-                if row * 2 + chunk.len() < urls.len() {
-                    y += MEDIA_GAP;
-                }
-            }
-            OutputLayout::Tiles { height: y, cells }
-        }
-        _ => {
-            let hero_height = image_height(CARD_WIDTH, output_ratio(node, &urls[0], ratios));
-            let compact_count = if urls.len() > 6 {
-                4
-            } else {
-                (urls.len() - 1).min(5)
-            };
-            let hidden_count = urls.len() - compact_count - 1;
-            let strip_cells = compact_count + usize::from(hidden_count > 0);
-            let strip_cell_width = (CARD_WIDTH - MEDIA_GAP * strip_cells.saturating_sub(1) as f32)
-                / strip_cells as f32;
-            OutputLayout::Filmstrip {
-                height: hero_height + MEDIA_GAP + strip_cell_width,
-                hero_height,
-                compact_count,
-                hidden_count,
-                strip_cell_width,
-            }
-        }
-    }
-}
-
-fn status_area_height(node: &BoardNode) -> f32 {
-    let has_images = !displayed_urls(node).is_empty();
-    match node.status {
-        NodeStatus::Running | NodeStatus::Done => 42.,
-        NodeStatus::Error if has_images => 64.,
-        NodeStatus::Error => 132.,
-        NodeStatus::Stopped => 52.,
-    }
-}
-
-fn output_ratio(node: &BoardNode, url: &str, ratios: &HashMap<String, f32>) -> f32 {
-    ratios
-        .get(url)
-        .copied()
-        .or_else(|| parse_aspect_ratio(&node.aspect))
-        .unwrap_or(1.)
-        .clamp(0.2, 5.)
-}
-
-fn parse_aspect_ratio(aspect: &str) -> Option<f32> {
-    let (width, height) = aspect.split_once(':')?;
-    let (Ok(width), Ok(height)) = (width.parse::<f32>(), height.parse::<f32>()) else {
-        return None;
-    };
-    (width.is_finite() && height.is_finite() && width > 0. && height > 0.).then_some(width / height)
-}
-
-fn image_height(width: f32, ratio: f32) -> f32 {
-    (width / ratio).clamp(width * 0.28, width * 2.)
-}
-
-fn read_image_ratio(path: &Path) -> Option<f32> {
-    let reader = image::ImageReader::open(path)
-        .ok()?
-        .with_guessed_format()
-        .ok()?;
-    let (width, height) = reader.into_dimensions().ok()?;
-    (width > 0 && height > 0).then_some(width as f32 / height as f32)
-}
-
-fn format_tokens(tokens: u64) -> String {
-    if tokens >= 1_000_000 {
-        format!("{:.1}M", tokens as f64 / 1_000_000.)
-    } else if tokens >= 1_000 {
-        format!("{:.1}k", tokens as f64 / 1_000.)
-    } else {
-        tokens.to_string()
-    }
-}
-
-fn done_footer(node: &BoardNode) -> String {
-    let mut footer = format!(
-        "✓ Finished{}",
-        if node.images.len() > 1 {
-            format!(" · {} images", node.images.len())
-        } else {
-            String::new()
-        }
-    );
-    if !node.text.is_empty() {
-        footer.push_str(" · ");
-        footer.extend(node.text.chars().take(90));
-    }
-    if node.token_count() > 0 {
-        footer.push_str(&format!(" · {} tok", format_tokens(node.token_count())));
-    }
-    footer
-}
-
-fn status_message(node: &BoardNode) -> String {
-    let message = match node.status {
-        NodeStatus::Error => node.error.as_deref().unwrap_or("Generation failed"),
-        NodeStatus::Stopped => match node.stop_reason {
-            Some(StopReason::User) => "Stopped by you.",
-            Some(StopReason::AppQuit) => "Stopped when CodexImage quit.",
-            Some(StopReason::Deleted) => "Stopped when this node was deleted.",
-            None => "Stopped.",
-        },
-        NodeStatus::Running | NodeStatus::Done => "",
-    };
-    message
-        .chars()
-        .take(220)
-        .map(|character| if character == '\n' { ' ' } else { character })
-        .collect()
-}
-
-fn format_date(timestamp: i64) -> String {
-    chrono::DateTime::from_timestamp_millis(timestamp)
-        .map(|date| {
-            date.with_timezone(&chrono::Local)
-                .format("%d.%m.%y")
-                .to_string()
-        })
-        .unwrap_or_default()
-}
-
-fn time_ago(timestamp: i64) -> String {
-    let seconds = ((now_ms() - timestamp) / 1_000).max(0);
-    if seconds < 60 {
-        "now".into()
-    } else if seconds < 3_600 {
-        format!("{}m ago", seconds / 60)
-    } else if seconds < 86_400 {
-        format!("{}h ago", seconds / 3_600)
-    } else {
-        format!("{}d ago", seconds / 86_400)
-    }
-}
-
-fn status_label(node: &BoardNode) -> String {
-    match node.status {
-        NodeStatus::Running => "Generating".into(),
-        NodeStatus::Error => "Failed".into(),
-        NodeStatus::Stopped => "Stopped".into(),
-        NodeStatus::Done => format!(
-            "{} image{}",
-            node.images.len(),
-            if node.images.len() == 1 { "" } else { "s" }
-        ),
-    }
-}
-
-fn node_depths(board: &Board) -> HashMap<String, usize> {
-    let by_id: HashMap<_, _> = board
-        .nodes
-        .iter()
-        .map(|node| (node.id.as_str(), node))
-        .collect();
-    board
-        .nodes
-        .iter()
-        .map(|node| {
-            let mut depth = 0;
-            let mut current = node.parent_id.as_deref();
-            let mut seen = HashSet::new();
-            while let Some(id) = current {
-                if !seen.insert(id) {
-                    break;
-                }
-                let Some(parent) = by_id.get(id) else { break };
-                depth += 1;
-                current = parent.parent_id.as_deref();
-            }
-            (node.id.clone(), depth)
-        })
-        .collect()
-}
-
-fn image_format_for_path(path: &Path) -> Option<ImageFormat> {
-    match path
-        .extension()?
-        .to_string_lossy()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "png" => Some(ImageFormat::Png),
-        "jpg" | "jpeg" => Some(ImageFormat::Jpeg),
-        "webp" => Some(ImageFormat::Webp),
-        "gif" => Some(ImageFormat::Gif),
-        "svg" => Some(ImageFormat::Svg),
-        "bmp" => Some(ImageFormat::Bmp),
-        "tif" | "tiff" => Some(ImageFormat::Tiff),
-        "ico" => Some(ImageFormat::Ico),
-        "pnm" | "pbm" | "pgm" | "ppm" => Some(ImageFormat::Pnm),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
-mod card_layout_tests {
-    use super::{
-        CARD_WIDTH, CardColor, CardRect, CardScene, ConnectorStyle, DashCommand, GRID_COLOR_BGRA,
-        GRID_GAP, GRID_TEXTURE_SCALE, GRID_TILE_SIZE, Lightbox, LightboxLocation, OutputLayout,
-        PROMPT_WRAP_COLUMNS, card_height, card_scene_svg, dot_grid_metrics,
-        dot_grid_texture_pixels, edge_is_visible, image_needs_high_resolution, lightbox_target,
-        output_layout, prompt_metrics_from_line_count, rect_is_visible, trace_dashed_polyline,
-        wrap_prompt,
-    };
+mod tests {
+    use super::{Lightbox, LightboxLocation, lightbox_target};
     use crate::model::{Board, BoardNode, NodeStatus};
     use gpui::{point, px};
-    use std::collections::HashMap;
-    use unicode_segmentation::UnicodeSegmentation;
 
-    fn node(images: usize, status: NodeStatus) -> BoardNode {
+    fn tree_node(id: &str, parent_id: Option<&str>, images: &[&str], created_at: i64) -> BoardNode {
         BoardNode {
-            id: "node".into(),
-            parent_id: None,
-            prompt: "A concise prompt that should preserve its line shape while zooming".into(),
+            id: id.into(),
+            parent_id: parent_id.map(str::to_owned),
+            prompt: "prompt".into(),
             aspect: "auto".into(),
             source_images: Vec::new(),
             attachments: Vec::new(),
-            images: (0..images).map(|index| format!("/{index}.png")).collect(),
+            images: images.iter().map(|image| (*image).to_owned()).collect(),
             image_labels: Vec::new(),
             attempts: Vec::new(),
             text: String::new(),
-            status,
+            status: NodeStatus::Done,
             error: None,
             stop_reason: None,
             x: None,
             y: None,
-            created_at: 0,
+            created_at,
             run_started_at: None,
             finished_at: None,
             usage: None,
         }
-    }
-
-    fn tree_node(id: &str, parent_id: Option<&str>, images: &[&str], created_at: i64) -> BoardNode {
-        let mut node = node(0, NodeStatus::Done);
-        node.id = id.into();
-        node.parent_id = parent_id.map(str::to_owned);
-        node.images = images.iter().map(|image| (*image).to_owned()).collect();
-        node.created_at = created_at;
-        node
     }
 
     #[test]
@@ -5215,238 +3421,5 @@ mod card_layout_tests {
         let descendant = lightbox_target(&board, &a0, 0, 1).expect("descendant image");
         assert_eq!(descendant.node_id, "descendant");
         assert_eq!(descendant.image, "d-0");
-    }
-
-    #[test]
-    fn four_outputs_form_two_non_overlapping_columns() {
-        let node = node(4, NodeStatus::Done);
-        let ratios = HashMap::from([
-            ("/0.png".into(), 1.0),
-            ("/1.png".into(), 0.5),
-            ("/2.png".into(), 2.0),
-            ("/3.png".into(), 1.0),
-        ]);
-        let OutputLayout::Tiles { height, cells } = output_layout(&node, &ratios) else {
-            panic!("expected tiled layout")
-        };
-        assert_eq!(cells.len(), 4);
-        assert_eq!(cells[0].x, 0.);
-        assert!(cells[1].x > cells[0].x + cells[0].width);
-        assert!(cells[2].y > cells[0].y);
-        assert!(height >= cells[3].y + cells[3].height);
-    }
-
-    #[test]
-    fn large_output_sets_use_a_bounded_hero_and_filmstrip() {
-        let node = node(9, NodeStatus::Done);
-        let OutputLayout::Filmstrip {
-            hero_height,
-            compact_count,
-            hidden_count,
-            strip_cell_width,
-            ..
-        } = output_layout(&node, &HashMap::new())
-        else {
-            panic!("expected filmstrip layout")
-        };
-        assert_eq!(compact_count, 4);
-        assert_eq!(hidden_count, 4);
-        assert!(hero_height <= CARD_WIDTH * 2.);
-        assert!(strip_cell_width < CARD_WIDTH / 4.);
-    }
-
-    #[test]
-    fn empty_error_state_reserves_more_space_than_a_done_footer() {
-        let error = node(0, NodeStatus::Error);
-        let done = node(0, NodeStatus::Done);
-        assert!(
-            card_height(&error, false, &HashMap::new())
-                > card_height(&done, false, &HashMap::new())
-        );
-    }
-
-    #[test]
-    fn prompt_wrap_is_deterministic_and_grapheme_safe() {
-        let prompt = "alpha beta supercalifragilistic 🌍🌎🌏🌐";
-        let lines = wrap_prompt(prompt, 8);
-        assert!(lines.iter().all(|line| line.graphemes(true).count() <= 8));
-        let source = prompt
-            .chars()
-            .filter(|character| !character.is_whitespace());
-        let wrapped = lines
-            .iter()
-            .flat_map(|line| line.chars())
-            .filter(|character| !character.is_whitespace());
-        assert_eq!(source.collect::<String>(), wrapped.collect::<String>());
-    }
-
-    #[test]
-    fn prompt_wrap_preserves_explicit_blank_lines() {
-        assert_eq!(
-            wrap_prompt("one two\n\nthree", 6),
-            vec!["one", "two", "", "three"]
-        );
-    }
-
-    #[test]
-    fn expanded_prompt_height_uses_the_same_world_space_lines() {
-        let mut node = node(0, NodeStatus::Done);
-        node.prompt = std::iter::repeat_n("stable", 80)
-            .collect::<Vec<_>>()
-            .join(" ");
-        let total_lines = wrap_prompt(&node.prompt, PROMPT_WRAP_COLUMNS).len();
-        let (collapsed_lines, clamped) = prompt_metrics_from_line_count(total_lines, false);
-        let (expanded_lines, expanded_clamped) = prompt_metrics_from_line_count(total_lines, true);
-        assert_eq!(collapsed_lines, 6.);
-        assert!(expanded_lines > collapsed_lines);
-        assert!(clamped && expanded_clamped);
-    }
-
-    #[test]
-    fn viewport_culling_keeps_intersecting_cards_and_rejects_distant_ones() {
-        assert!(rect_is_visible(-40., 40., 100., 100., 800., 600., 16.));
-        assert!(rect_is_visible(790., 590., 30., 30., 800., 600., 16.));
-        assert!(!rect_is_visible(-200., 40., 100., 100., 800., 600., 16.));
-        assert!(!rect_is_visible(900., 40., 30., 30., 800., 600., 16.));
-    }
-
-    #[test]
-    fn edge_culling_uses_the_full_connector_bounds() {
-        assert!(edge_is_visible(
-            point(px(-100.), px(300.)),
-            point(px(900.), px(300.)),
-            800.,
-            600.,
-            16.,
-        ));
-        assert!(!edge_is_visible(
-            point(px(-200.), px(-100.)),
-            point(px(-100.), px(-40.)),
-            800.,
-            600.,
-            16.,
-        ));
-    }
-
-    #[test]
-    fn connector_style_scales_with_canvas_zoom() {
-        assert_eq!(
-            ConnectorStyle::for_zoom(1.),
-            ConnectorStyle {
-                stroke_width: 1.6,
-                dash_length: 7.,
-                gap_length: 5.,
-            }
-        );
-        assert_eq!(
-            ConnectorStyle::for_zoom(0.25),
-            ConnectorStyle {
-                stroke_width: 0.4,
-                dash_length: 1.75,
-                gap_length: 1.25,
-            }
-        );
-    }
-
-    #[test]
-    fn connector_dash_remains_continuous_around_elbows() {
-        let points = [
-            point(px(0.), px(0.)),
-            point(px(0.), px(4.)),
-            point(px(4.), px(4.)),
-        ];
-        let mut commands = Vec::new();
-        let style = ConnectorStyle::for_zoom(1.);
-        trace_dashed_polyline(&points, style.dash_length, style.gap_length, |command| {
-            commands.push(command)
-        });
-
-        assert_eq!(
-            commands,
-            vec![
-                DashCommand::MoveTo(point(px(0.), px(0.))),
-                DashCommand::LineTo(point(px(0.), px(4.))),
-                DashCommand::LineTo(point(px(3.), px(4.))),
-            ]
-        );
-    }
-
-    #[test]
-    fn sprite_tiers_preserve_one_world_space_scene() {
-        let mut scene = CardScene {
-            height: 510.,
-            primitives: Vec::new(),
-        };
-        scene.quad(
-            CardRect::new(0., 0., CARD_WIDTH, scene.height),
-            20.,
-            CardColor::Raised,
-            Some((1., CardColor::Line)),
-        );
-        scene.text(
-            "A <stable> & exact card",
-            CardRect::new(14., 12., CARD_WIDTH - 28., 24.),
-            14.,
-            18.,
-            CardColor::Ink,
-            gpui::TextAlign::Left,
-        );
-
-        for width in super::CARD_SPRITE_WIDTHS {
-            let svg = card_scene_svg(&scene, width);
-            assert!(svg.contains("viewBox=\"0 0 340 510\""));
-            assert!(svg.contains("A &lt;stable&gt; &amp; exact card"));
-            assert!(svg.contains(&format!("width=\"{width}\"")));
-        }
-    }
-
-    #[test]
-    fn node_images_promote_to_originals_only_when_thumbnails_are_undersized() {
-        let full_card_image = CardRect::new(0., 0., CARD_WIDTH, CARD_WIDTH);
-        assert!(!image_needs_high_resolution(full_card_image, 1., 2.));
-        assert!(image_needs_high_resolution(full_card_image, 1.1, 2.));
-
-        let half_width_tile = CardRect::new(0., 0., 169., 169.);
-        assert!(!image_needs_high_resolution(half_width_tile, 2., 2.));
-
-        let portrait_hero = CardRect::new(0., 0., CARD_WIDTH, CARD_WIDTH * 2.);
-        assert!(image_needs_high_resolution(portrait_hero, 0.6, 2.));
-    }
-
-    #[test]
-    fn dot_grid_tile_is_world_anchored_at_every_zoom() {
-        let grid = dot_grid_metrics(5., -3., 1.);
-        assert!((grid.tile_size - GRID_TILE_SIZE).abs() < f32::EPSILON);
-        let dot_phase_x = (grid.origin_x + GRID_GAP / 2.).rem_euclid(GRID_GAP);
-        let dot_phase_y = (grid.origin_y + GRID_GAP / 2.).rem_euclid(GRID_GAP);
-        assert!((dot_phase_x - 5.).abs() < f32::EPSILON);
-        assert!((dot_phase_y - 25.).abs() < f32::EPSILON);
-
-        let one_tile_right = dot_grid_metrics(5. + GRID_TILE_SIZE, -3., 1.);
-        assert!((one_tile_right.origin_x - grid.origin_x).abs() < f32::EPSILON);
-
-        let distant = dot_grid_metrics(5., -3., 0.08);
-        assert!((distant.tile_size - GRID_TILE_SIZE * 0.08).abs() < f32::EPSILON);
-        let distant_phase = (distant.origin_x + GRID_GAP * 0.08 / 2.).rem_euclid(GRID_GAP * 0.08);
-        assert!((distant_phase - 5_f32.rem_euclid(GRID_GAP * 0.08)).abs() < 0.0001);
-    }
-
-    #[test]
-    fn dot_grid_texture_matches_the_web_canvas_contract() {
-        let texture = dot_grid_texture_pixels();
-        let expected_size = (GRID_TILE_SIZE * GRID_TEXTURE_SCALE as f32) as u32;
-        assert_eq!(texture.dimensions(), (expected_size, expected_size));
-        assert_eq!(texture.get_pixel(0, 0).0, [0, 0, 0, 0]);
-
-        let first_dot = texture.get_pixel(27, 27).0;
-        assert_eq!(&first_dot[..3], &GRID_COLOR_BGRA);
-        assert!(first_dot[3] > 200);
-
-        let last_dot_center = ((GRID_TILE_SIZE - GRID_GAP / 2.) * GRID_TEXTURE_SCALE as f32) as u32;
-        let last_dot = texture
-            .get_pixel(last_dot_center - 1, last_dot_center - 1)
-            .0;
-        assert_eq!(&last_dot[..3], &GRID_COLOR_BGRA);
-        assert!(last_dot[3] > 200);
     }
 }

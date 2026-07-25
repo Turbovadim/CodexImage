@@ -1,0 +1,721 @@
+//! Painting the infinite canvas: the dot grid, the dashed parent connectors,
+//! and each visible card (as a cached sprite when one is ready).
+
+use super::card::{CanvasNode, CardImageFit, CardPrimitive, CardRect, CardScene};
+use super::theme;
+use crate::layout::CARD_WIDTH;
+use crate::model::NodeStatus;
+use crate::storage::THUMBNAIL_MAX_DIMENSION;
+use gpui::{
+    App, BorderStyle, Bounds, ContentMask, ImgResourceLoader, ObjectFit, PathBuilder, Pixels,
+    Point, Resource, SharedString, TextAlign, TextRun, Window, point, px, quad, size,
+};
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, OnceLock};
+
+const GRID_GAP: f32 = 28.;
+const GRID_DOT_SIZE: f32 = 1.4;
+const GRID_TILE_CELLS: usize = 32;
+const GRID_TILE_SIZE: f32 = GRID_GAP * GRID_TILE_CELLS as f32;
+const GRID_TEXTURE_SCALE: u32 = 2;
+const GRID_ANTIALIAS_SAMPLES: u32 = 8;
+const GRID_COLOR_BGRA: [u8; 3] = [0x2d, 0x22, 0x1e];
+pub const VIEWPORT_CULL_MARGIN: f32 = 96.;
+const CONNECTOR_STROKE_WIDTH: f32 = 1.6;
+const CONNECTOR_DASH_LENGTH: f32 = 7.;
+const CONNECTOR_GAP_LENGTH: f32 = 5.;
+
+#[derive(Clone, Copy)]
+pub struct CanvasNodeFrame {
+    pub node_index: usize,
+    pub screen_x: f32,
+    pub screen_y: f32,
+    pub height: f32,
+    pub targeted: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DotGridMetrics {
+    tile_size: f32,
+    origin_x: f32,
+    origin_y: f32,
+}
+
+fn dot_grid_metrics(camera_x: f32, camera_y: f32, zoom: f32) -> DotGridMetrics {
+    let zoom = zoom.max(0.0001);
+    let tile_size = GRID_TILE_SIZE * zoom;
+    let dot_offset = GRID_GAP * zoom / 2.;
+    DotGridMetrics {
+        tile_size,
+        origin_x: (camera_x - dot_offset).rem_euclid(tile_size) - tile_size,
+        origin_y: (camera_y - dot_offset).rem_euclid(tile_size) - tile_size,
+    }
+}
+
+fn dot_grid_texture_pixels() -> image::RgbaImage {
+    let texture_size = (GRID_TILE_SIZE * GRID_TEXTURE_SCALE as f32).round() as u32;
+    let mut texture = image::RgbaImage::new(texture_size, texture_size);
+    let scale = GRID_TEXTURE_SCALE as f32;
+    let dot_radius = GRID_DOT_SIZE * scale / 2.;
+    let samples_per_pixel = GRID_ANTIALIAS_SAMPLES.pow(2);
+
+    for row in 0..GRID_TILE_CELLS {
+        let center_y = (GRID_GAP / 2. + row as f32 * GRID_GAP) * scale;
+        for column in 0..GRID_TILE_CELLS {
+            let center_x = (GRID_GAP / 2. + column as f32 * GRID_GAP) * scale;
+            let min_x = (center_x - dot_radius).floor().max(0.) as u32;
+            let max_x = (center_x + dot_radius).ceil().min(texture_size as f32) as u32;
+            let min_y = (center_y - dot_radius).floor().max(0.) as u32;
+            let max_y = (center_y + dot_radius).ceil().min(texture_size as f32) as u32;
+
+            for pixel_y in min_y..max_y {
+                for pixel_x in min_x..max_x {
+                    let mut covered_samples = 0;
+                    for sample_y in 0..GRID_ANTIALIAS_SAMPLES {
+                        let sample_y = pixel_y as f32
+                            + (sample_y as f32 + 0.5) / GRID_ANTIALIAS_SAMPLES as f32;
+                        for sample_x in 0..GRID_ANTIALIAS_SAMPLES {
+                            let sample_x = pixel_x as f32
+                                + (sample_x as f32 + 0.5) / GRID_ANTIALIAS_SAMPLES as f32;
+                            let dx = sample_x - center_x;
+                            let dy = sample_y - center_y;
+                            covered_samples +=
+                                u32::from(dx * dx + dy * dy <= dot_radius * dot_radius);
+                        }
+                    }
+                    if covered_samples > 0 {
+                        let alpha = ((covered_samples * 255 + samples_per_pixel / 2)
+                            / samples_per_pixel) as u8;
+                        texture.put_pixel(
+                            pixel_x,
+                            pixel_y,
+                            image::Rgba([
+                                GRID_COLOR_BGRA[0],
+                                GRID_COLOR_BGRA[1],
+                                GRID_COLOR_BGRA[2],
+                                alpha,
+                            ]),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    texture
+}
+
+fn dot_grid_image() -> Arc<gpui::RenderImage> {
+    static IMAGE: OnceLock<Arc<gpui::RenderImage>> = OnceLock::new();
+    IMAGE
+        .get_or_init(|| {
+            Arc::new(gpui::RenderImage::new(vec![image::Frame::new(
+                dot_grid_texture_pixels(),
+            )]))
+        })
+        .clone()
+}
+
+pub fn paint_dot_grid(
+    bounds: Bounds<Pixels>,
+    camera_x: f32,
+    camera_y: f32,
+    zoom: f32,
+    window: &mut Window,
+) {
+    let image = dot_grid_image();
+    let metrics = dot_grid_metrics(camera_x, camera_y, zoom);
+    let tile_size = px(metrics.tile_size);
+    window.with_content_mask(Some(ContentMask { bounds }), |window| {
+        let mut y = bounds.top() + px(metrics.origin_y);
+        while y < bounds.bottom() {
+            let mut x = bounds.left() + px(metrics.origin_x);
+            while x < bounds.right() {
+                let _ = window.paint_image(
+                    Bounds {
+                        origin: point(x, y),
+                        size: size(tile_size, tile_size),
+                    },
+                    px(0.).into(),
+                    image.clone(),
+                    0,
+                    false,
+                );
+                x += tile_size;
+            }
+            y += tile_size;
+        }
+    });
+}
+
+pub fn rect_is_visible(
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    viewport_width: f32,
+    viewport_height: f32,
+    margin: f32,
+) -> bool {
+    x + width >= -margin
+        && y + height >= -margin
+        && x <= viewport_width + margin
+        && y <= viewport_height + margin
+}
+
+pub fn edge_is_visible(
+    from: Point<Pixels>,
+    to: Point<Pixels>,
+    viewport_width: f32,
+    viewport_height: f32,
+    margin: f32,
+) -> bool {
+    let from_x = f32::from(from.x);
+    let from_y = f32::from(from.y);
+    let to_x = f32::from(to.x);
+    let to_y = f32::from(to.y);
+    rect_is_visible(
+        from_x.min(to_x),
+        from_y.min(to_y),
+        (from_x - to_x).abs(),
+        (from_y - to_y).abs(),
+        viewport_width,
+        viewport_height,
+        margin,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DashCommand {
+    MoveTo(Point<Pixels>),
+    LineTo(Point<Pixels>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ConnectorStyle {
+    stroke_width: f32,
+    dash_length: f32,
+    gap_length: f32,
+}
+
+impl ConnectorStyle {
+    fn for_zoom(zoom: f32) -> Self {
+        debug_assert!(zoom > 0.);
+        Self {
+            stroke_width: CONNECTOR_STROKE_WIDTH * zoom,
+            dash_length: CONNECTOR_DASH_LENGTH * zoom,
+            gap_length: CONNECTOR_GAP_LENGTH * zoom,
+        }
+    }
+}
+
+/// Strokes every parent → child connector in one dashed path.
+pub fn paint_connectors(edges: &[(Point<Pixels>, Point<Pixels>)], zoom: f32, window: &mut Window) {
+    if edges.is_empty() {
+        return;
+    }
+    let style = ConnectorStyle::for_zoom(zoom);
+    let mut builder = PathBuilder::stroke(px(style.stroke_width));
+    for (from, to) in edges {
+        append_dashed_connector(&mut builder, *from, *to, style);
+    }
+    if let Ok(path) = builder.build() {
+        window.paint_path(path, theme::line());
+    }
+}
+
+fn append_dashed_connector(
+    path: &mut PathBuilder,
+    from: Point<Pixels>,
+    to: Point<Pixels>,
+    style: ConnectorStyle,
+) {
+    let middle_y = px((f32::from(from.y) + f32::from(to.y)) / 2.);
+    let points = [from, point(from.x, middle_y), point(to.x, middle_y), to];
+    trace_dashed_polyline(
+        &points,
+        style.dash_length,
+        style.gap_length,
+        |command| match command {
+            DashCommand::MoveTo(point) => path.move_to(point),
+            DashCommand::LineTo(point) => path.line_to(point),
+        },
+    );
+}
+
+fn trace_dashed_polyline(
+    points: &[Point<Pixels>],
+    dash_length: f32,
+    gap_length: f32,
+    mut emit: impl FnMut(DashCommand),
+) {
+    debug_assert!(dash_length > 0. && gap_length > 0.);
+    let mut drawing = true;
+    let mut remaining = dash_length;
+    let mut dash_open = false;
+
+    for segment in points.windows(2) {
+        let start_x = f32::from(segment[0].x);
+        let start_y = f32::from(segment[0].y);
+        let delta_x = f32::from(segment[1].x) - start_x;
+        let delta_y = f32::from(segment[1].y) - start_y;
+        let length = delta_x.hypot(delta_y);
+        if length <= f32::EPSILON {
+            continue;
+        }
+        let direction_x = delta_x / length;
+        let direction_y = delta_y / length;
+        let mut traveled = 0.;
+
+        while traveled < length {
+            let step = remaining.min(length - traveled);
+            let fragment_start = point(
+                px(start_x + direction_x * traveled),
+                px(start_y + direction_y * traveled),
+            );
+            traveled += step;
+            let fragment_end = point(
+                px(start_x + direction_x * traveled),
+                px(start_y + direction_y * traveled),
+            );
+
+            if drawing {
+                if !dash_open {
+                    emit(DashCommand::MoveTo(fragment_start));
+                    dash_open = true;
+                }
+                emit(DashCommand::LineTo(fragment_end));
+            }
+
+            remaining -= step;
+            if remaining <= f32::EPSILON {
+                if drawing {
+                    dash_open = false;
+                }
+                drawing = !drawing;
+                remaining = if drawing { dash_length } else { gap_length };
+            }
+        }
+    }
+}
+
+fn canvas_bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<Pixels> {
+    Bounds::new(point(px(x), px(y)), size(px(width), px(height)))
+}
+
+#[derive(Clone, Copy)]
+struct CanvasTextStyle {
+    font_size: f32,
+    line_height: f32,
+    color: gpui::Hsla,
+    align: TextAlign,
+}
+
+impl CanvasTextStyle {
+    fn new(font_size: f32, line_height: f32, color: gpui::Hsla, align: TextAlign) -> Self {
+        Self {
+            font_size,
+            line_height,
+            color,
+            align,
+        }
+    }
+}
+
+fn paint_canvas_text(
+    text: SharedString,
+    bounds: Bounds<Pixels>,
+    style: CanvasTextStyle,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if text.is_empty() || style.font_size <= 0. {
+        return;
+    }
+    let run = TextRun {
+        len: text.len(),
+        color: style.color,
+        ..Default::default()
+    };
+    let line = window
+        .text_system()
+        .shape_line(text, px(style.font_size), &[run], None);
+    window.with_content_mask(Some(ContentMask { bounds }), |window| {
+        let _ = line.paint(
+            bounds.origin,
+            px(style.line_height),
+            style.align,
+            Some(bounds.size.width),
+            window,
+            cx,
+        );
+    });
+}
+
+fn paint_canvas_image(
+    path: &Arc<Path>,
+    bounds: Bounds<Pixels>,
+    fit: ObjectFit,
+    corner_radius: f32,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let resource = Resource::Path(path.clone());
+    let Some(Ok(data)) = window.use_asset::<ImgResourceLoader>(&resource, cx) else {
+        return;
+    };
+    if data.frame_count() == 0 {
+        return;
+    }
+    let image_bounds = fit.get_bounds(bounds, data.size(0));
+    window.with_content_mask(Some(ContentMask { bounds }), |window| {
+        let _ = window.paint_image(image_bounds, px(corner_radius).into(), data, 0, false);
+    });
+}
+
+pub fn paint_canvas_node(
+    frame: CanvasNodeFrame,
+    canvas_node: &CanvasNode,
+    zoom: f32,
+    activity: &HashMap<String, String>,
+    now: i64,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let bounds = canvas_bounds(
+        frame.screen_x,
+        frame.screen_y,
+        CARD_WIDTH * zoom,
+        frame.height,
+    );
+    let tier = if zoom <= 0.25 {
+        0
+    } else if zoom <= 0.5 {
+        1
+    } else if zoom <= 1. {
+        2
+    } else {
+        3
+    };
+    let mut sprite = canvas_node
+        .sprite_images
+        .get(tier)
+        .and_then(|image| image.clone().use_render_image(window, cx));
+    if sprite.is_some() {
+        canvas_node
+            .last_ready_sprite_tier
+            .store(tier as u8, Ordering::Relaxed);
+    } else {
+        let previous_tier = canvas_node.last_ready_sprite_tier.load(Ordering::Relaxed) as usize;
+        if previous_tier < canvas_node.sprite_images.len() && previous_tier != tier {
+            sprite = canvas_node.sprite_images[previous_tier]
+                .clone()
+                .use_render_image(window, cx);
+        }
+    }
+    if let Some(sprite) = sprite {
+        let _ = window.paint_image(bounds, px(20. * zoom).into(), sprite, 0, false);
+    } else {
+        paint_card_scene(frame, &canvas_node.scene, zoom, window, cx);
+    }
+
+    paint_high_resolution_card_images(frame, &canvas_node.scene, zoom, window, cx);
+
+    if canvas_node.node.status == NodeStatus::Running {
+        let activity = activity
+            .get(&canvas_node.node.id)
+            .map(String::as_str)
+            .unwrap_or("Working");
+        paint_canvas_text(
+            format!(
+                "Generating · {}s · {activity}",
+                (now - canvas_node
+                    .node
+                    .run_started_at
+                    .unwrap_or(canvas_node.node.created_at))
+                .max(0)
+                    / 1_000
+            )
+            .into(),
+            canvas_bounds(
+                frame.screen_x + 14. * zoom,
+                frame.screen_y + (canvas_node.scene.height - 42.) * zoom,
+                (CARD_WIDTH - 28.) * zoom,
+                42. * zoom,
+            ),
+            CanvasTextStyle::new(10.8 * zoom, 42. * zoom, theme::dim(), TextAlign::Left),
+            window,
+            cx,
+        );
+    }
+
+    if frame.targeted {
+        window.paint_quad(quad(
+            bounds,
+            px(20. * zoom),
+            gpui::transparent_black(),
+            px(zoom),
+            theme::accent(),
+            BorderStyle::Solid,
+        ));
+    }
+}
+
+fn paint_card_scene(
+    frame: CanvasNodeFrame,
+    scene: &CardScene,
+    zoom: f32,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let card_bounds = canvas_bounds(
+        frame.screen_x,
+        frame.screen_y,
+        CARD_WIDTH * zoom,
+        frame.height,
+    );
+    window.with_content_mask(
+        Some(ContentMask {
+            bounds: card_bounds,
+        }),
+        |window| {
+            for primitive in &scene.primitives {
+                match primitive {
+                    CardPrimitive::Quad {
+                        bounds,
+                        radius,
+                        fill,
+                        border,
+                    } => {
+                        let bounds = transform_card_rect(*bounds, frame, zoom);
+                        let (border_width, border_color) = border
+                            .map(|(width, color)| (width * zoom, color.hsla()))
+                            .unwrap_or((0., gpui::transparent_black()));
+                        window.paint_quad(quad(
+                            bounds,
+                            px(radius * zoom),
+                            fill.hsla(),
+                            px(border_width),
+                            border_color,
+                            BorderStyle::Solid,
+                        ));
+                    }
+                    CardPrimitive::Text {
+                        text,
+                        bounds,
+                        font_size,
+                        line_height,
+                        color,
+                        align,
+                    } => paint_canvas_text(
+                        text.clone(),
+                        transform_card_rect(*bounds, frame, zoom),
+                        CanvasTextStyle::new(
+                            font_size * zoom,
+                            line_height * zoom,
+                            color.hsla(),
+                            *align,
+                        ),
+                        window,
+                        cx,
+                    ),
+                    CardPrimitive::Image {
+                        asset,
+                        bounds,
+                        fit,
+                        radius,
+                    } => paint_canvas_image(
+                        &asset.thumbnail,
+                        transform_card_rect(*bounds, frame, zoom),
+                        match fit {
+                            CardImageFit::Contain => ObjectFit::Contain,
+                            CardImageFit::Cover => ObjectFit::Cover,
+                        },
+                        radius * zoom,
+                        window,
+                        cx,
+                    ),
+                }
+            }
+        },
+    );
+}
+
+fn paint_high_resolution_card_images(
+    frame: CanvasNodeFrame,
+    scene: &CardScene,
+    zoom: f32,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let scale_factor = window.scale_factor();
+    for primitive in &scene.primitives {
+        let CardPrimitive::Image {
+            asset,
+            bounds,
+            fit,
+            radius,
+        } = primitive
+        else {
+            continue;
+        };
+        if asset.original.as_ref() == asset.thumbnail.as_ref()
+            || !image_needs_high_resolution(*bounds, zoom, scale_factor)
+        {
+            continue;
+        }
+        paint_canvas_image(
+            &asset.original,
+            transform_card_rect(*bounds, frame, zoom),
+            match fit {
+                CardImageFit::Contain => ObjectFit::Contain,
+                CardImageFit::Cover => ObjectFit::Cover,
+            },
+            radius * zoom,
+            window,
+            cx,
+        );
+    }
+}
+
+fn image_needs_high_resolution(bounds: CardRect, zoom: f32, scale_factor: f32) -> bool {
+    bounds.width.max(bounds.height) * zoom * scale_factor > THUMBNAIL_MAX_DIMENSION as f32
+}
+
+fn transform_card_rect(bounds: CardRect, frame: CanvasNodeFrame, zoom: f32) -> Bounds<Pixels> {
+    canvas_bounds(
+        frame.screen_x + bounds.x * zoom,
+        frame.screen_y + bounds.y * zoom,
+        bounds.width * zoom,
+        bounds.height * zoom,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CARD_WIDTH, CardRect, ConnectorStyle, DashCommand, GRID_COLOR_BGRA, GRID_GAP,
+        GRID_TEXTURE_SCALE, GRID_TILE_SIZE, dot_grid_metrics, dot_grid_texture_pixels,
+        edge_is_visible, image_needs_high_resolution, rect_is_visible, trace_dashed_polyline,
+    };
+    use gpui::{point, px};
+
+    #[test]
+    fn viewport_culling_keeps_intersecting_cards_and_rejects_distant_ones() {
+        assert!(rect_is_visible(-40., 40., 100., 100., 800., 600., 16.));
+        assert!(rect_is_visible(790., 590., 30., 30., 800., 600., 16.));
+        assert!(!rect_is_visible(-200., 40., 100., 100., 800., 600., 16.));
+        assert!(!rect_is_visible(900., 40., 30., 30., 800., 600., 16.));
+    }
+
+    #[test]
+    fn edge_culling_uses_the_full_connector_bounds() {
+        assert!(edge_is_visible(
+            point(px(-100.), px(300.)),
+            point(px(900.), px(300.)),
+            800.,
+            600.,
+            16.,
+        ));
+        assert!(!edge_is_visible(
+            point(px(-200.), px(-100.)),
+            point(px(-100.), px(-40.)),
+            800.,
+            600.,
+            16.,
+        ));
+    }
+
+    #[test]
+    fn connector_style_scales_with_canvas_zoom() {
+        assert_eq!(
+            ConnectorStyle::for_zoom(1.),
+            ConnectorStyle {
+                stroke_width: 1.6,
+                dash_length: 7.,
+                gap_length: 5.,
+            }
+        );
+        assert_eq!(
+            ConnectorStyle::for_zoom(0.25),
+            ConnectorStyle {
+                stroke_width: 0.4,
+                dash_length: 1.75,
+                gap_length: 1.25,
+            }
+        );
+    }
+
+    #[test]
+    fn connector_dash_remains_continuous_around_elbows() {
+        let points = [
+            point(px(0.), px(0.)),
+            point(px(0.), px(4.)),
+            point(px(4.), px(4.)),
+        ];
+        let mut commands = Vec::new();
+        let style = ConnectorStyle::for_zoom(1.);
+        trace_dashed_polyline(&points, style.dash_length, style.gap_length, |command| {
+            commands.push(command)
+        });
+
+        assert_eq!(
+            commands,
+            vec![
+                DashCommand::MoveTo(point(px(0.), px(0.))),
+                DashCommand::LineTo(point(px(0.), px(4.))),
+                DashCommand::LineTo(point(px(3.), px(4.))),
+            ]
+        );
+    }
+    #[test]
+    fn node_images_promote_to_originals_only_when_thumbnails_are_undersized() {
+        let full_card_image = CardRect::new(0., 0., CARD_WIDTH, CARD_WIDTH);
+        assert!(!image_needs_high_resolution(full_card_image, 1., 2.));
+        assert!(image_needs_high_resolution(full_card_image, 1.1, 2.));
+
+        let half_width_tile = CardRect::new(0., 0., 169., 169.);
+        assert!(!image_needs_high_resolution(half_width_tile, 2., 2.));
+
+        let portrait_hero = CardRect::new(0., 0., CARD_WIDTH, CARD_WIDTH * 2.);
+        assert!(image_needs_high_resolution(portrait_hero, 0.6, 2.));
+    }
+
+    #[test]
+    fn dot_grid_tile_is_world_anchored_at_every_zoom() {
+        let grid = dot_grid_metrics(5., -3., 1.);
+        assert!((grid.tile_size - GRID_TILE_SIZE).abs() < f32::EPSILON);
+        let dot_phase_x = (grid.origin_x + GRID_GAP / 2.).rem_euclid(GRID_GAP);
+        let dot_phase_y = (grid.origin_y + GRID_GAP / 2.).rem_euclid(GRID_GAP);
+        assert!((dot_phase_x - 5.).abs() < f32::EPSILON);
+        assert!((dot_phase_y - 25.).abs() < f32::EPSILON);
+
+        let one_tile_right = dot_grid_metrics(5. + GRID_TILE_SIZE, -3., 1.);
+        assert!((one_tile_right.origin_x - grid.origin_x).abs() < f32::EPSILON);
+
+        let distant = dot_grid_metrics(5., -3., 0.08);
+        assert!((distant.tile_size - GRID_TILE_SIZE * 0.08).abs() < f32::EPSILON);
+        let distant_phase = (distant.origin_x + GRID_GAP * 0.08 / 2.).rem_euclid(GRID_GAP * 0.08);
+        assert!((distant_phase - 5_f32.rem_euclid(GRID_GAP * 0.08)).abs() < 0.0001);
+    }
+
+    #[test]
+    fn dot_grid_texture_matches_the_web_canvas_contract() {
+        let texture = dot_grid_texture_pixels();
+        let expected_size = (GRID_TILE_SIZE * GRID_TEXTURE_SCALE as f32) as u32;
+        assert_eq!(texture.dimensions(), (expected_size, expected_size));
+        assert_eq!(texture.get_pixel(0, 0).0, [0, 0, 0, 0]);
+
+        let first_dot = texture.get_pixel(27, 27).0;
+        assert_eq!(&first_dot[..3], &GRID_COLOR_BGRA);
+        assert!(first_dot[3] > 200);
+
+        let last_dot_center = ((GRID_TILE_SIZE - GRID_GAP / 2.) * GRID_TEXTURE_SCALE as f32) as u32;
+        let last_dot = texture
+            .get_pixel(last_dot_center - 1, last_dot_center - 1)
+            .0;
+        assert_eq!(&last_dot[..3], &GRID_COLOR_BGRA);
+        assert!(last_dot[3] > 200);
+    }
+}

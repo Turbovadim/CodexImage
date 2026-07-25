@@ -75,6 +75,35 @@ enum Termination {
     Replaced,
 }
 
+impl Termination {
+    /// The reason recorded on the node, or `None` when the termination is not
+    /// user-visible as a stop (a timeout becomes an error, a replaced job is
+    /// finalized by the run that replaced it).
+    fn stop_reason(self) -> Option<StopReason> {
+        match self {
+            Self::User => Some(StopReason::User),
+            Self::AppQuit => Some(StopReason::AppQuit),
+            Self::Deleted => Some(StopReason::Deleted),
+            Self::Timeout | Self::Replaced => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Sandbox {
+    WorkspaceWrite,
+    ReadOnly,
+}
+
+impl Sandbox {
+    fn as_arg(self) -> &'static str {
+        match self {
+            Self::WorkspaceWrite => "workspace-write",
+            Self::ReadOnly => "read-only",
+        }
+    }
+}
+
 struct Runtime {
     watchers: HashSet<String>,
     sizes: HashMap<PathBuf, u64>,
@@ -274,27 +303,15 @@ impl GenerationEngine {
         let workspace = self.inner.repository.paths().workspaces.join(&board.id);
         fs::create_dir_all(&workspace)?;
         let prompt = build_node_prompt(&self.inner.repository, board, node, index, count);
-        let invocation = self.codex_invocation();
-        let mut command = invocation.command();
-        command
-            .arg("exec")
-            .arg("-s")
-            .arg("workspace-write")
-            .arg("-C")
-            .arg(&workspace)
-            .arg("--json")
-            .arg("--output-schema")
-            .arg(&self.inner.repository.paths().output_schema)
-            .arg("--skip-git-repo-check")
-            .arg(prompt)
-            .current_dir(&workspace)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        configure_process_group(&mut command);
-        let mut child = command
+        let mut child = self
+            .codex_exec(Sandbox::WorkspaceWrite, &workspace, prompt)
             .spawn()
-            .with_context(|| format!("Failed to launch {}", invocation.executable.display()))?;
+            .with_context(|| {
+                format!(
+                    "Failed to launch {}",
+                    self.codex_invocation().executable.display()
+                )
+            })?;
         control.pid.store(child.id() as i32, Ordering::Release);
         if control.termination.lock().is_some() {
             kill_process_group(child.id() as i32, libc::SIGKILL);
@@ -511,40 +528,16 @@ impl GenerationEngine {
     ) -> Result<()> {
         let termination = *control.termination.lock();
         if let Some(termination) = termination {
+            if let Some(reason) = termination.stop_reason() {
+                return self
+                    .inner
+                    .repository
+                    .mark_stopped(&board.id, &node.id, reason);
+            }
+            // A replaced job is finalized by the run that replaced it.
             return match termination {
-                Termination::Replaced => Ok(()),
-                Termination::User | Termination::AppQuit | Termination::Deleted => {
-                    let reason = match termination {
-                        Termination::User => StopReason::User,
-                        Termination::AppQuit => StopReason::AppQuit,
-                        Termination::Deleted => StopReason::Deleted,
-                        _ => unreachable!(),
-                    };
-                    self.inner
-                        .repository
-                        .mark_stopped(&board.id, &node.id, reason)
-                }
-                Termination::Timeout => {
-                    let attempts = self
-                        .inner
-                        .repository
-                        .node(&board.id, &node.id)
-                        .map(|node| node.attempts.len())
-                        .unwrap_or(0);
-                    self.inner.repository.update_node(&board.id, &node.id, |node| {
-                        node.status = NodeStatus::Error;
-                        node.error = Some(format!(
-                            "No generation activity for 20 minutes. {}",
-                            if attempts == 0 {
-                                "No images were generated.".to_owned()
-                            } else {
-                                format!("{attempts} unfinalized image(s) were saved before the timeout.")
-                            }
-                        ));
-                        node.finished_at = Some(now_ms());
-                    })?;
-                    Ok(())
-                }
+                Termination::Timeout => self.record_timeout(board, node),
+                _ => Ok(()),
             };
         }
 
@@ -602,6 +595,30 @@ impl GenerationEngine {
                     NodeStatus::Done
                 };
                 node.error = error;
+                node.finished_at = Some(now_ms());
+            })?;
+        Ok(())
+    }
+
+    fn record_timeout(&self, board: &Board, node: &BoardNode) -> Result<()> {
+        let attempts = self
+            .inner
+            .repository
+            .node(&board.id, &node.id)
+            .map(|node| node.attempts.len())
+            .unwrap_or(0);
+        self.inner
+            .repository
+            .update_node(&board.id, &node.id, |node| {
+                node.status = NodeStatus::Error;
+                node.error = Some(format!(
+                    "No generation activity for 20 minutes. {}",
+                    if attempts == 0 {
+                        "No images were generated.".to_owned()
+                    } else {
+                        format!("{attempts} unfinalized image(s) were saved before the timeout.")
+                    }
+                ));
                 node.finished_at = Some(now_ms());
             })?;
         Ok(())
@@ -668,24 +685,9 @@ impl GenerationEngine {
         }
         let workspace = self.inner.repository.paths().workspaces.join(&board.id);
         let prompt = selection_recovery_prompt(node, runtime.artifacts.keys(), failure);
-        let mut command = self.codex_invocation().command();
-        command
-            .arg("exec")
-            .arg("-s")
-            .arg("read-only")
-            .arg("-C")
-            .arg(&workspace)
-            .arg("--json")
-            .arg("--output-schema")
-            .arg(&self.inner.repository.paths().output_schema)
-            .arg("--skip-git-repo-check")
-            .arg(prompt)
-            .current_dir(&workspace)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        configure_process_group(&mut command);
-        let child = command.spawn()?;
+        let child = self
+            .codex_exec(Sandbox::ReadOnly, &workspace, prompt)
+            .spawn()?;
         control.pid.store(child.id() as i32, Ordering::Release);
         let output = child.wait_with_output()?;
         if control.termination.lock().is_some() {
@@ -717,6 +719,30 @@ impl GenerationEngine {
         } else {
             None
         })
+    }
+
+    /// Builds a `codex exec` invocation that streams JSON events for `prompt`
+    /// from within `workspace`, in its own process group so the whole job tree
+    /// can be signalled at once.
+    fn codex_exec(&self, sandbox: Sandbox, workspace: &Path, prompt: String) -> Command {
+        let mut command = self.codex_invocation().command();
+        command
+            .arg("exec")
+            .arg("-s")
+            .arg(sandbox.as_arg())
+            .arg("-C")
+            .arg(workspace)
+            .arg("--json")
+            .arg("--output-schema")
+            .arg(&self.inner.repository.paths().output_schema)
+            .arg("--skip-git-repo-check")
+            .arg(prompt)
+            .current_dir(workspace)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_process_group(&mut command);
+        command
     }
 
     fn is_current(&self, control: &Arc<JobControl>) -> bool {
@@ -876,7 +902,8 @@ fn tail_chars(value: &str, limit: usize) -> String {
     value.chars().skip(count.saturating_sub(limit)).collect()
 }
 
-fn read_tail(mut reader: impl Read, limit: usize) -> String {
+/// Drains `reader` and keeps at most the last `limit` bytes.
+fn read_tail_bytes(mut reader: impl Read, limit: usize) -> Vec<u8> {
     let mut tail = Vec::with_capacity(limit);
     let mut chunk = [0_u8; 8 * 1024];
     loop {
@@ -890,7 +917,11 @@ fn read_tail(mut reader: impl Read, limit: usize) -> String {
             }
         }
     }
-    String::from_utf8_lossy(&tail).into_owned()
+    tail
+}
+
+fn read_tail(reader: impl Read, limit: usize) -> String {
+    String::from_utf8_lossy(&read_tail_bytes(reader, limit)).into_owned()
 }
 
 impl CodexInvocation {
@@ -1022,23 +1053,6 @@ fn terminate_process(child: &mut std::process::Child) {
     #[cfg(not(unix))]
     let _ = child.kill();
     let _ = child.wait();
-}
-
-fn read_tail_bytes(mut reader: impl Read, limit: usize) -> Vec<u8> {
-    let mut tail = Vec::with_capacity(limit);
-    let mut chunk = [0_u8; 8 * 1024];
-    loop {
-        match reader.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
-            Ok(read) => {
-                tail.extend_from_slice(&chunk[..read]);
-                if tail.len() > limit {
-                    tail.drain(..tail.len() - limit);
-                }
-            }
-        }
-    }
-    tail
 }
 
 #[cfg(unix)]
