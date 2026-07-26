@@ -17,5 +17,6 @@ mod lightbox;
 mod node_actions;
 mod overlays;
 mod theme;
+mod tooltip;
 
 pub use app::run;

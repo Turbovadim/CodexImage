@@ -8,6 +8,7 @@ use super::format::{format_date, format_tokens, node_depths, status_label, time_
 use super::input::TextInputMode;
 use super::keymap::{Generate, OpenBoards, ToggleGallery};
 use super::theme;
+use super::tooltip::{tip, tip_with_shortcut};
 use gpui::{
     AnyElement, Context, Focusable, FontWeight, ObjectFit, Role, SharedString, StyledImage, Window,
     div, img, prelude::*, px,
@@ -33,6 +34,13 @@ impl AppView {
         undo: Option<(String, String)>,
         cx: &mut Context<Self>,
     ) {
+        // Confirmations get out of the way quickly; anything the user may want to
+        // read or act on stays long enough to be useful.
+        let lifetime = match (error, undo.is_some()) {
+            (_, true) => 20,
+            (true, _) => 14,
+            _ => 5,
+        };
         self.toast_serial += 1;
         let serial = self.toast_serial;
         self.toast = Some(Toast {
@@ -42,7 +50,9 @@ impl AppView {
             serial,
         });
         cx.spawn(async move |weak, cx| {
-            cx.background_executor().timer(Duration::from_secs(8)).await;
+            cx.background_executor()
+                .timer(Duration::from_secs(lifetime))
+                .await;
             let _ = weak.update(cx, |view, cx| {
                 if view
                     .toast
@@ -60,6 +70,7 @@ impl AppView {
 
     pub(super) fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.overlay = Overlay::None;
+        self.armed_board_delete = None;
         self.modal_input.update(cx, |input, cx| input.clear(cx));
         window.focus(&self.focus, cx);
     }
@@ -204,6 +215,7 @@ impl AppView {
                         theme::raised()
                     })
                     .cursor_pointer()
+                    .hover(|style| style.bg(theme::hover()))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.open_board(id.clone(), window, cx)
                     }))
@@ -233,7 +245,9 @@ impl AppView {
                             .rounded_md()
                             .text_xs()
                             .text_color(theme::faint())
+                            .cursor_pointer()
                             .hover(|style| style.bg(theme::hover()).text_color(theme::ink()))
+                            .tooltip(tip("Rename this board"))
                             .child("Rename")
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
@@ -260,6 +274,14 @@ impl AppView {
                             .rounded_md()
                             .text_xs()
                             .text_color(theme::danger())
+                            .cursor_pointer()
+                            .hover(|style| style.bg(theme::danger().opacity(0.16)))
+                            .tooltip(tip(if armed {
+                                "Click again to delete this board for good"
+                            } else {
+                                "Delete this board"
+                            }))
+                            .when(armed, |button| button.bg(theme::danger().opacity(0.16)))
                             .child(if armed { "Sure?" } else { "Delete" })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
@@ -324,6 +346,7 @@ impl AppView {
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme::accent())
                     .cursor_pointer()
+                    .hover(|style| style.bg(theme::hover()))
                     .child("＋ New board")
                     .on_click(cx.listener(|this, _, window, cx| {
                         match this.engine.repository().create_board() {
@@ -336,12 +359,11 @@ impl AppView {
     }
 
     pub(super) fn render_gallery(&self, cx: &mut Context<Self>) -> AnyElement {
-        let board = self.board.clone();
+        let board = self.board.as_ref();
         let image_count: usize = board
-            .as_ref()
             .map(|board| board.nodes.iter().map(|node| node.images.len()).sum())
             .unwrap_or(0);
-        let node_count = board.as_ref().map(|board| board.nodes.len()).unwrap_or(0);
+        let node_count = board.map(|board| board.nodes.len()).unwrap_or(0);
         let mut content = div()
             .id("gallery-scroll")
             .flex_1()
@@ -349,9 +371,10 @@ impl AppView {
             .px_6()
             .pb_8();
         if let Some(board) = board {
-            let depths = node_depths(&board);
-            let mut nodes = board.nodes.clone();
-            nodes.sort_by_key(|node| (std::cmp::Reverse(node.created_at), node.id.clone()));
+            let depths = node_depths(board);
+            // Newest first, without cloning every node on each render pass.
+            let mut nodes: Vec<_> = board.nodes.iter().collect();
+            nodes.sort_by_key(|node| (std::cmp::Reverse(node.created_at), &node.id));
             for node in nodes {
                 let depth = depths.get(&node.id).copied().unwrap_or(0);
                 let locate_id = node.id.clone();
@@ -369,7 +392,7 @@ impl AppView {
                             .justify_center()
                             .text_xs()
                             .text_color(theme::faint())
-                            .child(status_label(&node)),
+                            .child(status_label(node)),
                     );
                 } else {
                     for (index, url) in node.images.iter().enumerate() {
@@ -440,7 +463,7 @@ impl AppView {
                                 .child(div().mt_1().text_xs().text_color(theme::faint()).child(
                                     format!(
                                         "{} · {} · {} branch depth",
-                                        status_label(&node),
+                                        status_label(node),
                                         format_date(node.created_at),
                                         depth
                                     ),
@@ -452,6 +475,7 @@ impl AppView {
                                         .text_xs()
                                         .text_color(theme::accent())
                                         .cursor_pointer()
+                                        .hover(|style| style.text_color(theme::ink()))
                                         .child("◎ Show on canvas")
                                         .on_click(cx.listener(move |this, _, window, cx| {
                                             this.locate_node(&locate_id, window, cx);
@@ -522,6 +546,8 @@ impl AppView {
                             .justify_center()
                             .text_color(theme::dim())
                             .cursor_pointer()
+                            .hover(|style| style.bg(theme::hover()).text_color(theme::ink()))
+                            .tooltip(tip_with_shortcut("Close the gallery", Some("Esc")))
                             .child("×")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.close_overlay(window, cx);
@@ -732,6 +758,7 @@ impl AppView {
                     .py_1()
                     .text_color(theme::accent())
                     .cursor_pointer()
+                    .hover(|style| style.bg(theme::accent_strong().opacity(0.2)))
                     .child("Undo")
                     .on_click(cx.listener(move |this, _, _, cx| {
                         match this.engine.repository().undo_delete(&board_id, &undo_id) {
@@ -745,8 +772,12 @@ impl AppView {
         row.child(
             div()
                 .id("dismiss-toast")
+                .px_1()
+                .rounded_md()
                 .text_color(theme::faint())
                 .cursor_pointer()
+                .hover(|style| style.bg(theme::hover()).text_color(theme::ink()))
+                .tooltip(tip("Dismiss"))
                 .child("×")
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.toast = None;

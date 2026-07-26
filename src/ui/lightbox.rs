@@ -9,6 +9,7 @@ use super::format::image_format_for_path;
 use super::input::TextInputMode;
 use super::keymap::{Generate, LightboxDown, LightboxLeft, LightboxRight, LightboxUp};
 use super::theme;
+use super::tooltip::tip_with_shortcut;
 use crate::model::{Board, BoardNode, NewNodesRequest};
 use gpui::{
     AnyElement, ClipboardItem, Context, Focusable, FontWeight, Image, ImgResourceLoader,
@@ -698,6 +699,52 @@ impl AppView {
                             })),
                     )
             );
+        let location = lightbox.displayed_location();
+        for (direction, id, glyph, hint) in [
+            (-1, "lightbox-previous", "‹", "Previous image"),
+            (1, "lightbox-next", "›", "Next image"),
+        ] {
+            if self
+                .board
+                .as_ref()
+                .and_then(|board| lightbox_target(board, &location, direction, 0))
+                .is_none()
+            {
+                continue;
+            }
+            let mut chevron = div()
+                .id(id)
+                .absolute()
+                .top(px(viewport_height / 2. - 26.))
+                .size(px(52.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .border_1()
+                .border_color(theme::line())
+                .bg(theme::raised().opacity(0.82))
+                .text_size(px(26.))
+                .text_color(theme::dim())
+                .cursor_pointer()
+                .occlude()
+                .hover(|style| style.bg(theme::hover()).text_color(theme::ink()))
+                .tooltip(tip_with_shortcut(
+                    hint,
+                    Some(if direction < 0 { "←" } else { "→" }),
+                ))
+                .child(glyph)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.navigate_lightbox(direction, 0, cx);
+                }));
+            chevron = if direction < 0 {
+                chevron.left(px(18.))
+            } else {
+                chevron.right(px(18.))
+            };
+            root = root.child(chevron);
+        }
         if total > 1 {
             root = root.child(
                 div()

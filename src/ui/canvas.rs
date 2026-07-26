@@ -4,13 +4,11 @@
 use super::card::{CanvasNode, CardImageFit, CardPrimitive, CardRect, CardScene};
 use super::theme;
 use crate::layout::CARD_WIDTH;
-use crate::model::NodeStatus;
 use crate::storage::THUMBNAIL_MAX_DIMENSION;
 use gpui::{
     App, BorderStyle, Bounds, ContentMask, ImgResourceLoader, ObjectFit, PathBuilder, Pixels,
     Point, Resource, SharedString, TextAlign, TextRun, Window, point, px, quad, size,
 };
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
@@ -22,33 +20,56 @@ const GRID_TILE_SIZE: f32 = GRID_GAP * GRID_TILE_CELLS as f32;
 const GRID_TEXTURE_SCALE: u32 = 2;
 const GRID_ANTIALIAS_SAMPLES: u32 = 8;
 const GRID_COLOR_BGRA: [u8; 3] = [0x2d, 0x22, 0x1e];
+/// The closest two dots are ever allowed to sit on screen. Zooming out past
+/// this doubles the world-space spacing instead of shrinking the dots into an
+/// illegible haze, which also keeps the tile count bounded.
+const GRID_MIN_SCREEN_GAP: f32 = 22.;
+const GRID_MAX_DENSITY_STEP: f32 = 1_024.;
 pub const VIEWPORT_CULL_MARGIN: f32 = 96.;
 const CONNECTOR_STROKE_WIDTH: f32 = 1.6;
 const CONNECTOR_DASH_LENGTH: f32 = 7.;
 const CONNECTOR_GAP_LENGTH: f32 = 5.;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct CanvasNodeFrame {
     pub node_index: usize,
     pub screen_x: f32,
     pub screen_y: f32,
     pub height: f32,
     pub targeted: bool,
+    /// Pre-rendered "Generating · 12s · …" line, built once per frame so the
+    /// paint pass never formats strings or clones the activity map.
+    pub status_line: Option<SharedString>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct DotGridMetrics {
     tile_size: f32,
+    dot_gap: f32,
     origin_x: f32,
     origin_y: f32,
 }
 
+/// How many world-space cells the tile texture stands in for. The texture is
+/// periodic, so stretching it by a power of two draws a coarser grid with the
+/// same dot size instead of more, smaller tiles.
+fn dot_grid_density(zoom: f32) -> f32 {
+    let mut density = 1.;
+    while GRID_GAP * density * zoom < GRID_MIN_SCREEN_GAP && density < GRID_MAX_DENSITY_STEP {
+        density *= 2.;
+    }
+    density
+}
+
 fn dot_grid_metrics(camera_x: f32, camera_y: f32, zoom: f32) -> DotGridMetrics {
     let zoom = zoom.max(0.0001);
-    let tile_size = GRID_TILE_SIZE * zoom;
-    let dot_offset = GRID_GAP * zoom / 2.;
+    let density = dot_grid_density(zoom);
+    let tile_size = GRID_TILE_SIZE * density * zoom;
+    let dot_gap = GRID_GAP * density * zoom;
+    let dot_offset = dot_gap / 2.;
     DotGridMetrics {
         tile_size,
+        dot_gap,
         origin_x: (camera_x - dot_offset).rem_euclid(tile_size) - tile_size,
         origin_y: (camera_y - dot_offset).rem_euclid(tile_size) - tile_size,
     }
@@ -375,11 +396,9 @@ fn paint_canvas_image(
 }
 
 pub fn paint_canvas_node(
-    frame: CanvasNodeFrame,
+    frame: &CanvasNodeFrame,
     canvas_node: &CanvasNode,
     zoom: f32,
-    activity: &HashMap<String, String>,
-    now: i64,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -422,22 +441,9 @@ pub fn paint_canvas_node(
 
     paint_high_resolution_card_images(frame, &canvas_node.scene, zoom, window, cx);
 
-    if canvas_node.node.status == NodeStatus::Running {
-        let activity = activity
-            .get(&canvas_node.node.id)
-            .map(String::as_str)
-            .unwrap_or("Working");
+    if let Some(status_line) = &frame.status_line {
         paint_canvas_text(
-            format!(
-                "Generating · {}s · {activity}",
-                (now - canvas_node
-                    .node
-                    .run_started_at
-                    .unwrap_or(canvas_node.node.created_at))
-                .max(0)
-                    / 1_000
-            )
-            .into(),
+            status_line.clone(),
             canvas_bounds(
                 frame.screen_x + 14. * zoom,
                 frame.screen_y + (canvas_node.scene.height - 42.) * zoom,
@@ -462,8 +468,54 @@ pub fn paint_canvas_node(
     }
 }
 
+pub struct ToolbarButtonPaint {
+    pub bounds: Bounds<Pixels>,
+    pub label: SharedString,
+    pub color: gpui::Hsla,
+    pub hovered: bool,
+}
+
+/// Draws the hovered card's action buttons in the same paint pass as the cards
+/// themselves. Painting them (rather than laying them out as elements) keeps
+/// them glued to the card during zoom: element layout re-rounds fractional
+/// sizes every frame and shimmers, painted quads and text do not.
+pub fn paint_node_toolbar(
+    buttons: &[ToolbarButtonPaint],
+    zoom: f32,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    for button in buttons {
+        let (background, border) = if button.hovered {
+            (theme::hover(), theme::faint())
+        } else {
+            (theme::raised().opacity(0.96), theme::line())
+        };
+        window.paint_quad(quad(
+            button.bounds,
+            px(5. * zoom),
+            background,
+            px(zoom),
+            border,
+            BorderStyle::Solid,
+        ));
+        paint_canvas_text(
+            button.label.clone(),
+            button.bounds,
+            CanvasTextStyle::new(
+                11. * zoom,
+                f32::from(button.bounds.size.height),
+                button.color,
+                TextAlign::Center,
+            ),
+            window,
+            cx,
+        );
+    }
+}
+
 fn paint_card_scene(
-    frame: CanvasNodeFrame,
+    frame: &CanvasNodeFrame,
     scene: &CardScene,
     zoom: f32,
     window: &mut Window,
@@ -543,7 +595,7 @@ fn paint_card_scene(
 }
 
 fn paint_high_resolution_card_images(
-    frame: CanvasNodeFrame,
+    frame: &CanvasNodeFrame,
     scene: &CardScene,
     zoom: f32,
     window: &mut Window,
@@ -583,7 +635,7 @@ fn image_needs_high_resolution(bounds: CardRect, zoom: f32, scale_factor: f32) -
     bounds.width.max(bounds.height) * zoom * scale_factor > THUMBNAIL_MAX_DIMENSION as f32
 }
 
-fn transform_card_rect(bounds: CardRect, frame: CanvasNodeFrame, zoom: f32) -> Bounds<Pixels> {
+fn transform_card_rect(bounds: CardRect, frame: &CanvasNodeFrame, zoom: f32) -> Bounds<Pixels> {
     canvas_bounds(
         frame.screen_x + bounds.x * zoom,
         frame.screen_y + bounds.y * zoom,
@@ -596,8 +648,9 @@ fn transform_card_rect(bounds: CardRect, frame: CanvasNodeFrame, zoom: f32) -> B
 mod tests {
     use super::{
         CARD_WIDTH, CardRect, ConnectorStyle, DashCommand, GRID_COLOR_BGRA, GRID_GAP,
-        GRID_TEXTURE_SCALE, GRID_TILE_SIZE, dot_grid_metrics, dot_grid_texture_pixels,
-        edge_is_visible, image_needs_high_resolution, rect_is_visible, trace_dashed_polyline,
+        GRID_MIN_SCREEN_GAP, GRID_TEXTURE_SCALE, GRID_TILE_SIZE, dot_grid_metrics,
+        dot_grid_texture_pixels, edge_is_visible, image_needs_high_resolution, rect_is_visible,
+        trace_dashed_polyline,
     };
     use gpui::{point, px};
 
@@ -695,9 +748,29 @@ mod tests {
         assert!((one_tile_right.origin_x - grid.origin_x).abs() < f32::EPSILON);
 
         let distant = dot_grid_metrics(5., -3., 0.08);
-        assert!((distant.tile_size - GRID_TILE_SIZE * 0.08).abs() < f32::EPSILON);
-        let distant_phase = (distant.origin_x + GRID_GAP * 0.08 / 2.).rem_euclid(GRID_GAP * 0.08);
-        assert!((distant_phase - 5_f32.rem_euclid(GRID_GAP * 0.08)).abs() < 0.0001);
+        assert!((distant.tile_size - GRID_TILE_SIZE * 16. * 0.08).abs() < 0.001);
+        let distant_phase = (distant.origin_x + distant.dot_gap / 2.).rem_euclid(distant.dot_gap);
+        assert!((distant_phase - 5_f32.rem_euclid(distant.dot_gap)).abs() < 0.0001);
+    }
+
+    #[test]
+    fn dot_grid_keeps_a_readable_spacing_and_a_bounded_tile_count_at_every_zoom() {
+        let mut zoom = 2.;
+        while zoom >= 0.08 {
+            let grid = dot_grid_metrics(0., 0., zoom);
+            // Never denser than the readable floor, and never coarser than one
+            // doubling past it (or the natural world spacing, when zoomed in).
+            assert!(
+                grid.dot_gap >= GRID_MIN_SCREEN_GAP
+                    && grid.dot_gap <= (GRID_GAP * zoom).max(GRID_MIN_SCREEN_GAP * 2.),
+                "zoom {zoom} produced a {}px dot spacing",
+                grid.dot_gap
+            );
+            // A 1600x1000 viewport never needs more than a handful of tiles.
+            let tiles = (1600. / grid.tile_size).ceil() * (1000. / grid.tile_size).ceil();
+            assert!(tiles <= 12., "zoom {zoom} needed {tiles} grid tiles");
+            zoom *= 0.75;
+        }
     }
 
     #[test]

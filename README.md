@@ -30,8 +30,12 @@ boards. New native-only installs use
 
 The renderer virtualizes offscreen graph cards, uses thumbnails until zoomed
 in, and performs persistence, image decoding, and Codex sessions away from the
-GPUI render path. Each generation runs in its own process group so stop,
-replacement, deletion, timeout, and app quit terminate the entire job tree.
+GPUI render path. Cards are cached across board updates and only rebuilt when
+their node, layout, or images actually change, so one finished generation does
+not re-encode the whole board. The dot grid coarsens by powers of two as you
+zoom out, keeping both its density and its tile count constant. Each generation
+runs in its own process group so stop, replacement, deletion, timeout, and app
+quit terminate the entire job tree.
 
 ## Keyboard shortcuts
 
@@ -41,6 +45,7 @@ replacement, deletion, timeout, and app quit terminate the entire job tree.
 | `Enter` / `Shift+Enter` | Generate / newline |
 | `⌘K` | Board switcher |
 | `F` | Fit canvas |
+| `⌘=` / `⌘-` / `⌘0` | Zoom in / out / actual size |
 | `G` | Gallery |
 | `Esc` | Close or cancel |
 | `B`, `R`, `E`, `D`, `Delete` | Branch, regenerate, edit, duplicate, delete hovered node |

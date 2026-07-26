@@ -6,6 +6,7 @@ use super::app::Overlay;
 use super::input::TextInputEvent;
 use super::keymap::{AddAttachment, FocusPrompt, Generate, OpenBoards, ToggleGallery};
 use super::theme;
+use super::tooltip::{tip, tip_with_shortcut};
 use crate::APP_NAME;
 use crate::model::NewNodesRequest;
 use anyhow::Result;
@@ -253,16 +254,26 @@ impl AppView {
                         .child(
                             div()
                                 .id(SharedString::from(format!("remove-attachment-{index}")))
+                                .role(Role::Button)
+                                .aria_label("Remove attachment")
                                 .absolute()
                                 .top(px(-5.))
                                 .right(px(-5.))
                                 .size(px(16.))
                                 .rounded_full()
+                                .border_1()
+                                .border_color(theme::line())
                                 .bg(theme::background())
                                 .text_center()
                                 .text_xs()
-                                .text_color(theme::ink())
+                                .text_color(theme::dim())
                                 .cursor_pointer()
+                                .hover(|style| {
+                                    style
+                                        .bg(theme::danger().opacity(0.2))
+                                        .text_color(theme::danger())
+                                })
+                                .tooltip(tip("Remove attachment"))
                                 .child("×")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     if index < this.attachments.len() {
@@ -275,57 +286,57 @@ impl AppView {
             }
             composer = composer.child(strip);
         }
+        let pill = |id: &'static str, label: String| {
+            div()
+                .id(id)
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .border_1()
+                .border_color(theme::line())
+                .text_xs()
+                .text_color(theme::dim())
+                .cursor_pointer()
+                .hover(|style| style.border_color(theme::faint()).text_color(theme::ink()))
+                .child(label)
+        };
+        let ready = !self.prompt.read(cx).content().trim().is_empty();
+        let attachments_full = self.attachments.len() >= crate::model::MAX_ATTACHMENTS;
         composer = composer.child(
             div()
                 .flex()
                 .items_end()
                 .gap_2()
                 .child(
-                    div()
-                        .id("aspect")
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(theme::line())
-                        .text_xs()
-                        .text_color(theme::dim())
-                        .cursor_pointer()
-                        .child(ASPECTS[self.aspect_index])
+                    pill("aspect", ASPECTS[self.aspect_index].to_owned())
+                        .tooltip(tip("Aspect ratio — click to cycle"))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.aspect_index = (this.aspect_index + 1) % ASPECTS.len();
                             cx.notify();
                         })),
                 )
                 .child(
-                    div()
-                        .id("count")
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(theme::line())
-                        .text_xs()
-                        .text_color(theme::dim())
-                        .cursor_pointer()
-                        .child(format!("×{}", self.count))
+                    pill("count", format!("×{}", self.count))
+                        .tooltip(tip("Images per run — click to cycle 1–4"))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.count = this.count % 4 + 1;
                             cx.notify();
                         })),
                 )
                 .child(
-                    div()
-                        .id("attach")
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(theme::line())
-                        .text_xs()
-                        .text_color(theme::dim())
-                        .cursor_pointer()
-                        .child("Attach")
+                    pill("attach", "Attach".into())
+                        .when(attachments_full, |pill| {
+                            pill.text_color(theme::faint())
+                                .border_color(theme::line().opacity(0.5))
+                        })
+                        .tooltip(tip_with_shortcut(
+                            if attachments_full {
+                                "Attachment limit reached"
+                            } else {
+                                "Attach reference images"
+                            },
+                            Some("⌘O"),
+                        ))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.add_attachment(&AddAttachment, window, cx)
                         })),
@@ -334,14 +345,30 @@ impl AppView {
                 .child(
                     div()
                         .id("send")
+                        .role(Role::Button)
+                        .aria_label("Generate")
                         .size(px(28.))
                         .rounded_lg()
                         .flex()
                         .items_center()
                         .justify_center()
-                        .bg(theme::accent_strong().opacity(0.18))
-                        .text_color(theme::accent())
-                        .cursor_pointer()
+                        .when(ready, |send| {
+                            send.bg(theme::accent_strong().opacity(0.18))
+                                .text_color(theme::accent())
+                                .cursor_pointer()
+                                .hover(|style| style.bg(theme::accent_strong().opacity(0.32)))
+                        })
+                        .when(!ready, |send| {
+                            send.bg(theme::hover()).text_color(theme::faint())
+                        })
+                        .tooltip(tip_with_shortcut(
+                            if ready {
+                                "Generate · ⇧↵ for a new line"
+                            } else {
+                                "Describe an image first"
+                            },
+                            Some("↵"),
+                        ))
                         .child("↑")
                         .on_click(
                             cx.listener(|this, _, window, cx| this.generate(&Generate, window, cx)),
@@ -359,11 +386,11 @@ impl AppView {
             .justify_center()
             .gap_2()
             .w(px(600.));
-        for sample in SAMPLES {
+        for (index, sample) in SAMPLES.iter().enumerate() {
             let text = (*sample).to_owned();
             samples = samples.child(
                 div()
-                    .id(SharedString::from(format!("sample-{}", sample.len())))
+                    .id(SharedString::from(format!("sample-{index}")))
                     .rounded_full()
                     .border_1()
                     .border_color(theme::line())
@@ -372,6 +399,11 @@ impl AppView {
                     .text_sm()
                     .text_color(theme::dim())
                     .cursor_pointer()
+                    .hover(|style| {
+                        style
+                            .border_color(theme::accent().opacity(0.6))
+                            .text_color(theme::ink())
+                    })
                     .child(*sample)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.prompt
@@ -385,7 +417,7 @@ impl AppView {
             .child(div().mt_2().text_size(px(26.)).font_weight(FontWeight::SEMIBOLD).text_color(theme::ink()).child("What should we create?"))
             .child(div().mt_2().w(px(600.)).text_center().text_sm().text_color(theme::dim()).child("Ask for one image or a complete ordered series. Use ×N for parallel takes, then branch, continue, and regenerate on an infinite canvas."))
             .child(samples)
-            .child(div().mt_5().text_xs().text_color(theme::faint()).child("/ prompt   ⌘K boards   G gallery   F fit view   Esc cancel"))
+            .child(div().mt_5().text_xs().text_color(theme::faint()).child("/ prompt   ⌘K boards   G gallery   F fit view   ⌘0 actual size   Esc cancel"))
             .into_any_element()
     }
 
@@ -412,6 +444,8 @@ impl AppView {
             .py_2()
             .cursor_pointer()
             .occlude()
+            .hover(|style| style.border_color(theme::faint()).bg(theme::hover()))
+            .tooltip(tip_with_shortcut("Switch board", Some("⌘K")))
             .on_click(cx.listener(|this, _, window, cx| this.open_boards(&OpenBoards, window, cx)))
             .child(div().text_color(theme::accent()).child("❖"))
             .child(
@@ -452,6 +486,16 @@ impl AppView {
                     .text_color(theme::dim())
                     .cursor_pointer()
                     .occlude()
+                    .hover(|style| {
+                        style
+                            .border_color(theme::faint())
+                            .bg(theme::hover())
+                            .text_color(theme::ink())
+                    })
+                    .tooltip(tip_with_shortcut(
+                        "Browse every image on this board",
+                        Some("G"),
+                    ))
                     .child("▦  Gallery")
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_gallery(&ToggleGallery, window, cx)

@@ -24,7 +24,7 @@ pub enum StopReason {
     Deleted,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BoardNode {
     pub id: String,

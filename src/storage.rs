@@ -666,7 +666,7 @@ fn remove_image_and_thumbnail(source: &Path) {
     }
 }
 
-fn thumbnail_path_for(source: &Path) -> Option<PathBuf> {
+pub fn thumbnail_path_for(source: &Path) -> Option<PathBuf> {
     let name = source.file_name()?.to_string_lossy();
     let suffix = if is_svg_embeddable_raster(source) {
         String::new()

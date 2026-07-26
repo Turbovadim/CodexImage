@@ -4,15 +4,16 @@
 use super::app::AppView;
 use super::app::Overlay;
 use super::canvas::{
-    CanvasNodeFrame, VIEWPORT_CULL_MARGIN, edge_is_visible, paint_canvas_node, paint_connectors,
-    paint_dot_grid, rect_is_visible,
+    CanvasNodeFrame, ToolbarButtonPaint, VIEWPORT_CULL_MARGIN, edge_is_visible, paint_canvas_node,
+    paint_connectors, paint_dot_grid, paint_node_toolbar, rect_is_visible,
 };
 use super::card::{
-    ATTACHMENT_ROW_HEIGHT, COLLAPSED_PROMPT_LINES, CanvasNode, EXPANDED_PROMPT_LINES, MEDIA_GAP,
-    OutputLayout, PROMPT_LINE_HEIGHT, SHOW_MORE_HEIGHT, status_area_height,
+    ATTACHMENT_ROW_HEIGHT, COLLAPSED_PROMPT_LINES, CanvasNode, CardRect, EXPANDED_PROMPT_LINES,
+    MEDIA_GAP, OutputLayout, PROMPT_LINE_HEIGHT, SHOW_MORE_HEIGHT, status_area_height,
 };
-use super::keymap::{FitCanvas, ZoomIn, ZoomOut};
+use super::keymap::{FitCanvas, ResetZoom, ZoomIn, ZoomOut};
 use super::theme;
+use super::tooltip::{tip, tip_with_shortcut};
 use crate::layout::CARD_WIDTH;
 use crate::layout::Position;
 use crate::model::{BoardNode, NodeStatus};
@@ -24,12 +25,106 @@ use gpui::{
 };
 
 pub(super) const NODE_TOOLBAR_HEIGHT: f32 = 36.;
+/// World-space toolbar metrics; everything scales with the canvas zoom so the
+/// toolbar keeps a fixed size relative to its card.
+const TOOLBAR_BUTTON_HEIGHT: f32 = 22.;
+const TOOLBAR_GAP: f32 = 4.;
+const TOOLBAR_CARD_GAP: f32 = 6.;
+const TOOLBAR_RIGHT_MARGIN: f32 = 4.;
+const MIN_ZOOM: f32 = 0.08;
+const MAX_ZOOM: f32 = 2.;
+const MINIMAP_WIDTH: f32 = 142.;
+const MINIMAP_HEIGHT: f32 = 96.;
+const MINIMAP_RIGHT: f32 = 18.;
+const MINIMAP_BOTTOM: f32 = 24.;
+/// Vertical band reserved for the board switcher and gallery button.
+const HEADER_CLEARANCE: f32 = 60.;
 
 #[derive(Clone)]
 pub(super) enum CanvasClickTarget {
-    Image { node_id: String, url: String },
+    Image {
+        node_id: String,
+        url: String,
+    },
     TogglePrompt(String),
     Retry(String),
+    Toolbar {
+        node_id: String,
+        action: ToolbarAction,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ToolbarAction {
+    Stop,
+    Branch,
+    Edit,
+    Retry,
+    Copy,
+    Duplicate,
+    Delete,
+}
+
+impl ToolbarAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Stop => "Stop",
+            Self::Branch => "Branch",
+            Self::Edit => "Edit",
+            Self::Retry => "Retry",
+            Self::Copy => "Copy",
+            Self::Duplicate => "Dup",
+            Self::Delete => "Delete",
+        }
+    }
+
+    fn color(self) -> gpui::Hsla {
+        match self {
+            Self::Stop | Self::Delete => theme::danger(),
+            Self::Branch => theme::ink(),
+            _ => theme::dim(),
+        }
+    }
+}
+
+/// The card-local world-space rectangles of the hovered card's action buttons,
+/// right-aligned above the card (or below it near the viewport top).
+fn toolbar_layout(running: bool, below: bool, card_height: f32) -> Vec<(ToolbarAction, CardRect)> {
+    let actions: &[ToolbarAction] = if running {
+        &[
+            ToolbarAction::Stop,
+            ToolbarAction::Copy,
+            ToolbarAction::Duplicate,
+            ToolbarAction::Delete,
+        ]
+    } else {
+        &[
+            ToolbarAction::Branch,
+            ToolbarAction::Edit,
+            ToolbarAction::Retry,
+            ToolbarAction::Copy,
+            ToolbarAction::Duplicate,
+            ToolbarAction::Delete,
+        ]
+    };
+    let width_of = |action: ToolbarAction| 14. + action.label().chars().count() as f32 * 6.6;
+    let total = actions.iter().map(|action| width_of(*action)).sum::<f32>()
+        + TOOLBAR_GAP * actions.len().saturating_sub(1) as f32;
+    let y = if below {
+        card_height + TOOLBAR_CARD_GAP
+    } else {
+        -(TOOLBAR_CARD_GAP + TOOLBAR_BUTTON_HEIGHT)
+    };
+    let mut x = CARD_WIDTH - TOOLBAR_RIGHT_MARGIN - total;
+    actions
+        .iter()
+        .map(|action| {
+            let width = width_of(*action);
+            let rect = CardRect::new(x, y, width, TOOLBAR_BUTTON_HEIGHT);
+            x += width + TOOLBAR_GAP;
+            (*action, rect)
+        })
+        .collect()
 }
 
 pub(super) enum DragState {
@@ -73,7 +168,7 @@ impl AppView {
         let height = f32::from(viewport.height) - 150.;
         self.zoom = (width / (max_x - min_x).max(1.))
             .min(height / (max_y - min_y).max(1.))
-            .clamp(0.08, 1.);
+            .clamp(MIN_ZOOM, 1.);
         self.camera_x =
             (f32::from(viewport.width) - (max_x - min_x) * self.zoom) / 2. - min_x * self.zoom;
         self.camera_y =
@@ -102,9 +197,27 @@ impl AppView {
         self.zoom_at(point(viewport.width / 2., viewport.height / 2.), 0.8, cx);
     }
 
+    /// Returns the canvas to 1:1 without moving what is under the viewport centre.
+    pub(super) fn reset_zoom(
+        &mut self,
+        _: &ResetZoom,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(self.overlay, Overlay::None) {
+            return;
+        }
+        let viewport = window.viewport_size();
+        self.zoom_at(
+            point(viewport.width / 2., viewport.height / 2.),
+            1. / self.zoom,
+            cx,
+        );
+    }
+
     fn zoom_at(&mut self, position: Point<Pixels>, factor: f32, cx: &mut Context<Self>) {
         let old = self.zoom;
-        let new = (old * factor).clamp(0.08, 2.);
+        let new = (old * factor).clamp(MIN_ZOOM, MAX_ZOOM);
         let world_x = (f32::from(position.x) - self.camera_x) / old;
         let world_y = (f32::from(position.y) - self.camera_y) / old;
         self.camera_x = f32::from(position.x) - world_x * new;
@@ -128,9 +241,11 @@ impl AppView {
     pub(super) fn render_canvas(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let viewport = window.viewport_size();
         let minimap = self.render_minimap(viewport, cx);
+        let zoom_controls = self.render_zoom_controls(cx);
         let viewport_width = f32::from(viewport.width);
         let viewport_height = f32::from(viewport.height);
         let board = self.board.as_ref();
+        let now = now_ms();
 
         let visible_nodes = board
             .into_iter()
@@ -158,15 +273,16 @@ impl AppView {
                         .target
                         .as_ref()
                         .is_some_and(|target| target.node_id == node.id),
+                    status_line: (node.status == NodeStatus::Running)
+                        .then(|| self.running_status_line(node, now)),
                 })
             })
             .collect::<Vec<_>>();
 
-        let hovered_toolbar = self.hovered_node.as_deref().and_then(|hovered_id| {
+        let toolbar_buttons = self.hovered_node.as_deref().and_then(|hovered_id| {
             visible_nodes.iter().find_map(|frame| {
                 let node = self.canvas_nodes.get(frame.node_index)?;
-                (node.node.id == hovered_id)
-                    .then(|| self.render_node_toolbar(&node.node, *frame, cx))
+                (node.node.id == hovered_id).then(|| self.toolbar_paint_buttons(node, frame))
             })
         });
         let edge_points: Vec<_> = board
@@ -196,11 +312,9 @@ impl AppView {
             })
             .collect();
         let canvas_nodes = self.canvas_nodes.clone();
-        let activity = self.activity.clone();
         let zoom = self.zoom;
         let camera_x = self.camera_x;
         let camera_y = self.camera_y;
-        let now = now_ms();
         let background = canvas(
             |_, _, _| (),
             move |bounds, _, window, cx| {
@@ -208,24 +322,38 @@ impl AppView {
                 paint_connectors(&edge_points, zoom, window);
                 for frame in &visible_nodes {
                     if let Some(node) = canvas_nodes.get(frame.node_index) {
-                        paint_canvas_node(*frame, node, zoom, &activity, now, window, cx);
+                        paint_canvas_node(frame, node, zoom, window, cx);
                     }
+                }
+                if let Some(buttons) = &toolbar_buttons {
+                    paint_node_toolbar(buttons, zoom, window, cx);
                 }
             },
         )
         .size_full();
 
+        let cursor = match &self.drag {
+            Some(DragState::Canvas { .. }) => gpui::CursorStyle::ClosedHand,
+            Some(DragState::Node { .. }) => gpui::CursorStyle::ClosedHand,
+            _ if self.hovered_node.is_some() => gpui::CursorStyle::PointingHand,
+            _ => gpui::CursorStyle::OpenHand,
+        };
         let mut layer = div()
             .id("canvas")
             .absolute()
             .inset_0()
             .overflow_hidden()
             .bg(theme::background())
-            .cursor(gpui::CursorStyle::OpenHand)
+            .cursor(cursor)
             .on_scroll_wheel(
                 cx.listener(|this, event: &ScrollWheelEvent, _, cx| this.scroll_canvas(event, cx)),
             )
-            .on_pinch(cx.listener(|this, event: &PinchEvent, _, cx| this.pinch_canvas(event, cx)))
+            // Capture phase: bubble-phase pinch only fires when the canvas itself
+            // is hovered, so any chrome on top would block zooming. `pinch_canvas`
+            // stays inert while an overlay owns the screen.
+            .capture_pinch(
+                cx.listener(|this, event: &PinchEvent, _, cx| this.pinch_canvas(event, cx)),
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -233,112 +361,151 @@ impl AppView {
                 }),
             )
             .child(background);
-        if let Some(toolbar) = hovered_toolbar {
-            layer = layer.child(toolbar);
-        }
         if let Some(minimap) = minimap {
             layer = layer.child(minimap);
         }
-        layer.into_any_element()
+        layer.child(zoom_controls).into_any_element()
     }
 
-    fn render_node_toolbar(
-        &self,
-        node: &BoardNode,
-        frame: CanvasNodeFrame,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let scale = self.zoom;
-        let id = node.id.clone();
-        let prompt = node.prompt.clone();
-        let running = node.status == NodeStatus::Running;
-        let button = |key: &str, label: &'static str, color: gpui::Hsla| {
+    fn running_status_line(&self, node: &BoardNode, now: i64) -> SharedString {
+        let started = node.run_started_at.unwrap_or(node.created_at);
+        let activity = self
+            .activity
+            .get(&node.id)
+            .map(String::as_str)
+            .unwrap_or("Working");
+        format!(
+            "Generating · {}s · {activity}",
+            (now - started).max(0) / 1_000
+        )
+        .into()
+    }
+
+    /// The zoom readout doubles as a reset button. The cluster lives in the
+    /// bottom-left corner, the only edge the composer and minimap leave free.
+    fn render_zoom_controls(&self, cx: &mut Context<Self>) -> AnyElement {
+        let button = |id: &'static str, label: &'static str| {
             div()
-                .id(SharedString::from(format!("{key}-{id}")))
-                .px(px(8. * scale))
-                .py(px(4. * scale))
-                .rounded(px(6. * scale))
-                .bg(theme::background().opacity(0.9))
-                .text_color(color)
-                .text_size(px(12. * scale))
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(24.))
+                .rounded_md()
+                .text_sm()
+                .text_color(theme::dim())
+                .cursor_pointer()
+                .hover(|style| style.bg(theme::hover()).text_color(theme::ink()))
                 .child(label)
         };
-        let node_id = node.id.clone();
-        let toolbar = div()
-            .absolute()
-            .top(px(-36. * scale))
-            .right(px(4. * scale))
-            .flex()
-            .gap(px(4. * scale))
-            .occlude()
-            .children(running.then(|| {
-                let node_id = node_id.clone();
-                button("stop", "Stop", theme::danger())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.engine.stop_node(&node_id);
-                    }))
-                    .into_any_element()
-            }))
-            .children((!running).then(|| {
-                let node_id = node_id.clone();
-                button("branch", "Branch", theme::ink())
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.branch_node(&node_id, None, window, cx);
-                    }))
-                    .into_any_element()
-            }))
-            .children((!running).then(|| {
-                let node_id = node_id.clone();
-                button("edit", "Edit", theme::dim())
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.edit_node(&node_id, window, cx);
-                    }))
-                    .into_any_element()
-            }))
-            .children((!running).then(|| {
-                let node_id = node_id.clone();
-                button("regen", "Retry", theme::dim())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.regenerate_node(&node_id, cx);
-                    }))
-                    .into_any_element()
-            }))
-            .child(
-                button("copy-prompt", "Copy", theme::dim()).on_click(cx.listener(
-                    move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        cx.write_to_clipboard(ClipboardItem::new_string(prompt.clone()));
-                        this.show_toast("Prompt copied".into(), false, None, cx);
-                    },
-                )),
-            )
-            .child(button("dup", "Dup", theme::dim()).on_click({
-                let node_id = node_id.clone();
-                cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.duplicate_node(&node_id, cx);
-                })
-            }))
-            .child(
-                button("del", "Delete", theme::danger()).on_click(cx.listener(
-                    move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.delete_node(&node_id, cx);
-                    },
-                )),
-            );
         div()
+            .id("zoom-controls")
             .absolute()
-            .left(px(frame.screen_x))
-            .top(px(frame.screen_y))
-            .w(px(CARD_WIDTH * scale))
-            .h(px(frame.height))
-            .child(toolbar)
+            .left(px(MINIMAP_RIGHT))
+            .bottom(px(MINIMAP_BOTTOM))
+            .flex()
+            .items_center()
+            .gap_1()
+            .rounded_lg()
+            .border_1()
+            .border_color(theme::line())
+            .bg(theme::raised().opacity(0.94))
+            .p(px(3.))
+            .block_mouse_except_scroll()
+            .child(
+                button("zoom-out", "−")
+                    .tooltip(tip_with_shortcut("Zoom out", Some("⌘−")))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.zoom_out(&ZoomOut, window, cx)),
+                    ),
+            )
+            .child(
+                div()
+                    .id("zoom-level")
+                    .px_1()
+                    .min_w(px(42.))
+                    .text_center()
+                    .text_xs()
+                    .text_color(theme::dim())
+                    .cursor_pointer()
+                    .hover(|style| style.text_color(theme::ink()))
+                    .tooltip(tip_with_shortcut("Actual size", Some("⌘0")))
+                    .child(format!("{}%", (self.zoom * 100.).round() as i32))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.reset_zoom(&ResetZoom, window, cx)),
+                    ),
+            )
+            .child(
+                button("zoom-in", "+")
+                    .tooltip(tip_with_shortcut("Zoom in", Some("⌘+")))
+                    .on_click(cx.listener(|this, _, window, cx| this.zoom_in(&ZoomIn, window, cx))),
+            )
+            .child(
+                button("zoom-fit", "⤢")
+                    .tooltip(tip_with_shortcut("Fit board to view", Some("F")))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.fit_action(&FitCanvas, window, cx)),
+                    ),
+            )
             .into_any_element()
+    }
+
+    /// Cards near the top of the viewport carry their toolbar underneath, so it
+    /// is never clipped off screen or buried under the board switcher.
+    pub(super) fn node_toolbar_is_below(&self, screen_y: f32) -> bool {
+        screen_y - NODE_TOOLBAR_HEIGHT * self.zoom < HEADER_CLEARANCE
+    }
+
+    /// Screen-space paint data for the hovered card's toolbar.
+    fn toolbar_paint_buttons(
+        &self,
+        canvas_node: &CanvasNode,
+        frame: &CanvasNodeFrame,
+    ) -> Vec<ToolbarButtonPaint> {
+        let running = canvas_node.node.status == NodeStatus::Running;
+        let below = self.node_toolbar_is_below(frame.screen_y);
+        let card_height = self.card_height(&canvas_node.node);
+        toolbar_layout(running, below, card_height)
+            .into_iter()
+            .enumerate()
+            .map(|(index, (action, rect))| ToolbarButtonPaint {
+                bounds: Bounds::new(
+                    point(
+                        px(frame.screen_x + rect.x * self.zoom),
+                        px(frame.screen_y + rect.y * self.zoom),
+                    ),
+                    size(px(rect.width * self.zoom), px(rect.height * self.zoom)),
+                ),
+                label: action.label().into(),
+                color: action.color(),
+                hovered: self.hovered_toolbar_button == Some(index),
+            })
+            .collect()
+    }
+
+    /// Which toolbar button, if any, sits under `position` on this card.
+    fn toolbar_action_at(
+        &self,
+        canvas_node: &CanvasNode,
+        position: Point<Pixels>,
+        world_position: Position,
+    ) -> Option<(usize, ToolbarAction)> {
+        let local_x = (f32::from(position.x) - self.camera_x) / self.zoom - world_position.x;
+        let local_y = (f32::from(position.y) - self.camera_y) / self.zoom - world_position.y;
+        let running = canvas_node.node.status == NodeStatus::Running;
+        let screen_y = self.camera_y + world_position.y * self.zoom;
+        let below = self.node_toolbar_is_below(screen_y);
+        let card_height = self.card_height(&canvas_node.node);
+        toolbar_layout(running, below, card_height)
+            .into_iter()
+            .enumerate()
+            .find_map(|(index, (action, rect))| {
+                (local_x >= rect.x
+                    && local_x <= rect.x + rect.width
+                    && local_y >= rect.y
+                    && local_y <= rect.y + rect.height)
+                    .then_some((index, action))
+            })
     }
 
     fn render_minimap(
@@ -346,11 +513,11 @@ impl AppView {
         viewport: gpui::Size<Pixels>,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        const WIDTH: f32 = 142.;
-        const HEIGHT: f32 = 96.;
+        const WIDTH: f32 = MINIMAP_WIDTH;
+        const HEIGHT: f32 = MINIMAP_HEIGHT;
         const PADDING: f32 = 6.;
-        const RIGHT: f32 = 18.;
-        const BOTTOM: f32 = 24.;
+        const RIGHT: f32 = MINIMAP_RIGHT;
+        const BOTTOM: f32 = MINIMAP_BOTTOM;
 
         let board = self.board.as_ref()?;
         if board.nodes.len() < 2 {
@@ -443,7 +610,9 @@ impl AppView {
                 .border_color(theme::line())
                 .bg(theme::raised().opacity(0.94))
                 .cursor_pointer()
-                .occlude()
+                .hover(|style| style.border_color(theme::faint()))
+                .tooltip(tip("Click to jump the camera"))
+                .block_mouse_except_scroll()
                 .child(map)
                 .on_mouse_down(
                     MouseButton::Left,
@@ -475,11 +644,15 @@ impl AppView {
                 let screen_y = self.camera_y + world_position.y * self.zoom;
                 let width = CARD_WIDTH * self.zoom;
                 let height = self.card_height(&canvas_node.node) * self.zoom;
-                let toolbar_top = screen_y - NODE_TOOLBAR_HEIGHT * self.zoom;
-                (x >= screen_x
-                    && x <= screen_x + width
-                    && y >= toolbar_top
-                    && y <= screen_y + height)
+                // The toolbar scales with the card, so its strip matches the
+                // card's width on whichever side of the card it is drawn.
+                let toolbar_height = NODE_TOOLBAR_HEIGHT * self.zoom;
+                let (top, bottom) = if self.node_toolbar_is_below(screen_y) {
+                    (screen_y, screen_y + height + toolbar_height)
+                } else {
+                    (screen_y - toolbar_height, screen_y + height)
+                };
+                (x >= screen_x && x <= screen_x + width && y >= top && y <= bottom)
                     .then_some((index, world_position))
             })
     }
@@ -490,6 +663,12 @@ impl AppView {
         position: Point<Pixels>,
         world_position: Position,
     ) -> Option<CanvasClickTarget> {
+        if let Some((_, action)) = self.toolbar_action_at(canvas_node, position, world_position) {
+            return Some(CanvasClickTarget::Toolbar {
+                node_id: canvas_node.node.id.clone(),
+                action,
+            });
+        }
         let local_x = (f32::from(position.x) - self.camera_x) / self.zoom - world_position.x;
         let local_y = (f32::from(position.y) - self.camera_y) / self.zoom - world_position.y;
         let expanded = self.expanded_prompts.contains(&canvas_node.node.id);
@@ -658,12 +837,18 @@ impl AppView {
                 cx.notify();
             }
             _ if !event.dragging() => {
-                let hovered = self
-                    .canvas_node_at(event.position)
+                let hit = self.canvas_node_at(event.position);
+                let hovered = hit
                     .and_then(|(index, _)| self.canvas_nodes.get(index))
                     .map(|node| node.node.id.clone());
-                if hovered != self.hovered_node {
+                let hovered_button = hit.and_then(|(index, world_position)| {
+                    let canvas_node = self.canvas_nodes.get(index)?;
+                    self.toolbar_action_at(canvas_node, event.position, world_position)
+                        .map(|(button_index, _)| button_index)
+                });
+                if hovered != self.hovered_node || hovered_button != self.hovered_toolbar_button {
                     self.hovered_node = hovered;
+                    self.hovered_toolbar_button = hovered_button;
                     cx.notify();
                 }
             }
@@ -705,9 +890,35 @@ impl AppView {
                         self.refresh_layout();
                     }
                     CanvasClickTarget::Retry(node_id) => self.regenerate_node(&node_id, cx),
+                    CanvasClickTarget::Toolbar { node_id, action } => {
+                        self.run_toolbar_action(&node_id, action, window, cx)
+                    }
                 }
             }
         }
         cx.notify();
+    }
+
+    fn run_toolbar_action(
+        &mut self,
+        node_id: &str,
+        action: ToolbarAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            ToolbarAction::Stop => self.engine.stop_node(node_id),
+            ToolbarAction::Branch => self.branch_node(node_id, None, window, cx),
+            ToolbarAction::Edit => self.edit_node(node_id, window, cx),
+            ToolbarAction::Retry => self.regenerate_node(node_id, cx),
+            ToolbarAction::Copy => {
+                if let Some(node) = self.node(node_id) {
+                    cx.write_to_clipboard(ClipboardItem::new_string(node.prompt));
+                    self.show_toast("Prompt copied".into(), false, None, cx);
+                }
+            }
+            ToolbarAction::Duplicate => self.duplicate_node(node_id, cx),
+            ToolbarAction::Delete => self.delete_node(node_id, cx),
+        }
     }
 }

@@ -17,7 +17,7 @@ use crate::APP_NAME;
 use crate::generation::GenerationEngine;
 use crate::layout::{Position, compute_layout};
 use crate::model::{Board, BoardNode};
-use crate::storage::{RepositoryEvent, create_thumbnail};
+use crate::storage::{RepositoryEvent, create_thumbnail, thumbnail_path_for};
 use anyhow::{Context as _, Result};
 use gpui::{
     App, AppContext, Bounds, Context, Entity, ExternalPaths, FocusHandle, Focusable, MouseButton,
@@ -45,6 +45,16 @@ pub(super) struct ImageAsset {
     pub(super) thumbnail: PathBuf,
 }
 
+/// Thumbnail encoding and header reads for one image, performed off the render
+/// thread so a finished generation never stalls the canvas.
+#[derive(Clone)]
+struct ImageJob {
+    url: String,
+    original: PathBuf,
+    thumbnail: Option<PathBuf>,
+    read_ratio: bool,
+}
+
 pub(super) struct AppView {
     pub(super) engine: GenerationEngine,
     pub(super) receiver: async_channel::Receiver<RepositoryEvent>,
@@ -62,6 +72,7 @@ pub(super) struct AppView {
     pub(super) count: usize,
     pub(super) activity: HashMap<String, String>,
     pub(super) hovered_node: Option<String>,
+    pub(super) hovered_toolbar_button: Option<usize>,
     pub(super) expanded_prompts: HashSet<String>,
     pub(super) armed_board_delete: Option<String>,
     pub(super) toast: Option<Toast>,
@@ -70,9 +81,10 @@ pub(super) struct AppView {
     pub(super) heights: HashMap<String, f32>,
     pub(super) prompt_lines: HashMap<String, Vec<SharedString>>,
     pub(super) output_layouts: HashMap<String, OutputLayout>,
-    pub(super) canvas_nodes: Arc<Vec<CanvasNode>>,
+    pub(super) canvas_nodes: Arc<Vec<Arc<CanvasNode>>>,
     pub(super) image_ratios: HashMap<String, f32>,
     pub(super) image_assets: HashMap<String, ImageAsset>,
+    pending_image_jobs: HashSet<String>,
     pub(super) transient_positions: HashMap<String, Position>,
     pub(super) camera_x: f32,
     pub(super) camera_y: f32,
@@ -176,6 +188,7 @@ impl AppView {
             count: 1,
             activity: HashMap::new(),
             hovered_node: None,
+            hovered_toolbar_button: None,
             expanded_prompts: HashSet::new(),
             armed_board_delete: None,
             toast: None,
@@ -187,13 +200,14 @@ impl AppView {
             canvas_nodes: Arc::new(Vec::new()),
             image_ratios: HashMap::new(),
             image_assets: HashMap::new(),
+            pending_image_jobs: HashSet::new(),
             transient_positions: HashMap::new(),
             camera_x: 80.,
             camera_y: 90.,
             zoom: 1.,
             drag: None,
         };
-        view.refresh_image_metadata();
+        view.refresh_image_metadata(cx);
         view.refresh_layout();
         let receiver = view.receiver.clone();
         cx.spawn(async move |weak, cx| {
@@ -233,7 +247,7 @@ impl AppView {
                 if let Some(id) = self.board_id.as_deref() {
                     self.board = self.engine.repository().board(id);
                 }
-                self.refresh_image_metadata();
+                self.refresh_image_metadata(cx);
                 self.refresh_layout();
             }
             RepositoryEvent::Activity { node_id, text } => {
@@ -243,19 +257,31 @@ impl AppView {
         cx.notify();
     }
 
+    /// Rebuilds the derived board state. Cards whose node, layout, and images
+    /// are all unchanged are carried over wholesale, so a single finished
+    /// generation no longer re-wraps every prompt or re-encodes every sprite.
     pub(super) fn refresh_layout(&mut self) {
+        let previous = std::mem::take(&mut self.canvas_nodes);
+        let cached: HashMap<&str, &Arc<CanvasNode>> = previous
+            .iter()
+            .map(|canvas_node| (canvas_node.node.id.as_str(), canvas_node))
+            .collect();
         if let Some(board) = &self.board {
             let prompt_lines = board
                 .nodes
                 .iter()
                 .map(|node| {
-                    (
-                        node.id.clone(),
-                        wrap_prompt(&node.prompt, PROMPT_WRAP_COLUMNS)
-                            .into_iter()
-                            .map(SharedString::from)
-                            .collect::<Vec<_>>(),
-                    )
+                    let lines = cached
+                        .get(node.id.as_str())
+                        .filter(|previous| previous.node.prompt == node.prompt)
+                        .map(|previous| previous.prompt_lines.clone())
+                        .unwrap_or_else(|| {
+                            wrap_prompt(&node.prompt, PROMPT_WRAP_COLUMNS)
+                                .into_iter()
+                                .map(SharedString::from)
+                                .collect()
+                        });
+                    (node.id.clone(), lines)
                 })
                 .collect::<HashMap<_, _>>();
             let output_layouts = board
@@ -288,16 +314,26 @@ impl AppView {
                 .nodes
                 .iter()
                 .map(|node| {
-                    CanvasNode::build(
+                    let expanded = self.expanded_prompts.contains(&node.id);
+                    let output_layout = output_layouts
+                        .get(&node.id)
+                        .cloned()
+                        .unwrap_or(OutputLayout::None);
+                    if let Some(reusable) = cached.get(node.id.as_str()).filter(|previous| {
+                        previous.expanded == expanded
+                            && previous.output_layout == output_layout
+                            && previous.node == *node
+                            && self.canvas_node_assets_are_current(previous)
+                    }) {
+                        return Arc::clone(reusable);
+                    }
+                    Arc::new(CanvasNode::build(
                         node,
                         prompt_lines.get(&node.id).cloned().unwrap_or_default(),
-                        output_layouts
-                            .get(&node.id)
-                            .cloned()
-                            .unwrap_or(OutputLayout::None),
-                        self.expanded_prompts.contains(&node.id),
+                        output_layout,
+                        expanded,
                         |url| self.canvas_image_asset(url),
-                    )
+                    ))
                 })
                 .collect();
             self.prompt_lines = prompt_lines;
@@ -314,14 +350,18 @@ impl AppView {
         }
     }
 
-    fn refresh_image_metadata(&mut self) {
+    /// Resolves each image to the file the canvas should draw. Anything that
+    /// requires decoding — building a missing thumbnail, reading an aspect
+    /// ratio — is handed to the background executor and applied when it lands.
+    fn refresh_image_metadata(&mut self, cx: &mut Context<Self>) {
         let (Some(board_id), Some(board)) = (self.board_id.as_deref(), self.board.as_ref()) else {
             self.image_assets.clear();
+            self.image_ratios.clear();
             return;
         };
         let repository = self.engine.repository();
         let mut assets = HashMap::new();
-        let mut ratio_candidates = Vec::new();
+        let mut jobs = Vec::new();
         let mut seen = HashSet::new();
         for url in board.nodes.iter().flat_map(|node| {
             node.images
@@ -333,34 +373,129 @@ impl AppView {
             if !seen.insert(url.clone()) {
                 continue;
             }
+            if let Some(resolved) = self.image_assets.remove(url) {
+                assets.insert(url.clone(), resolved);
+                continue;
+            }
             let Some(original) = repository.image_path(board_id, url) else {
                 continue;
             };
             let thumbnail_path = repository.thumbnail_path(board_id, url);
-            if thumbnail_path.as_ref().is_some_and(|path| !path.exists()) {
-                let _ = create_thumbnail(&original);
-            }
-            let thumbnail = thumbnail_path
+            let ready_thumbnail = thumbnail_path
+                .as_ref()
                 .filter(|path| path.exists())
-                .unwrap_or_else(|| original.clone());
-            if !self.image_ratios.contains_key(url) {
-                ratio_candidates.push((url.clone(), thumbnail.clone()));
+                .cloned();
+            let read_ratio = !self.image_ratios.contains_key(url);
+            if (ready_thumbnail.is_none() || read_ratio) && !self.pending_image_jobs.contains(url) {
+                self.pending_image_jobs.insert(url.clone());
+                jobs.push(ImageJob {
+                    url: url.clone(),
+                    original: original.clone(),
+                    thumbnail: thumbnail_path,
+                    read_ratio,
+                });
             }
             assets.insert(
                 url.clone(),
                 ImageAsset {
+                    thumbnail: ready_thumbnail.unwrap_or_else(|| original.clone()),
                     original,
-                    thumbnail,
                 },
             );
         }
         self.image_ratios.retain(|url, _| seen.contains(url));
+        self.pending_image_jobs.retain(|url| seen.contains(url));
         self.image_assets = assets;
-        for (url, path) in ratio_candidates {
-            if let Some(ratio) = read_image_ratio(&path) {
-                self.image_ratios.insert(url, ratio);
+        self.spawn_image_jobs(jobs, cx);
+    }
+
+    /// Decodes in batches so a board full of new images costs one layout pass
+    /// per batch rather than one per image, while still filling in progressively.
+    fn spawn_image_jobs(&mut self, jobs: Vec<ImageJob>, cx: &mut Context<Self>) {
+        const BATCH: usize = 8;
+        if jobs.is_empty() {
+            return;
+        }
+        cx.spawn(async move |weak, cx| {
+            for batch in jobs.chunks(BATCH) {
+                let batch = batch.to_vec();
+                let resolved = smol::unblock(move || {
+                    batch
+                        .into_iter()
+                        .map(|job| {
+                            let mut thumbnail = job.thumbnail.filter(|path| path.exists());
+                            if thumbnail.is_none() && create_thumbnail(&job.original).is_ok() {
+                                thumbnail =
+                                    thumbnail_path_for(&job.original).filter(|path| path.exists());
+                            }
+                            let ratio = job
+                                .read_ratio
+                                .then(|| {
+                                    read_image_ratio(thumbnail.as_deref().unwrap_or(&job.original))
+                                })
+                                .flatten();
+                            (job.url, thumbnail, ratio)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+                if weak
+                    .update(cx, |view, cx| view.apply_image_metadata(resolved, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn apply_image_metadata(
+        &mut self,
+        resolved: Vec<(String, Option<PathBuf>, Option<f32>)>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut changed = false;
+        for (url, thumbnail, ratio) in resolved {
+            self.pending_image_jobs.remove(&url);
+            if let Some(thumbnail) = thumbnail
+                && let Some(asset) = self.image_assets.get_mut(&url)
+                && asset.thumbnail != thumbnail
+            {
+                asset.thumbnail = thumbnail;
+                changed = true;
+            }
+            if let Some(ratio) = ratio
+                && self.image_ratios.insert(url, ratio) != Some(ratio)
+            {
+                changed = true;
             }
         }
+        if changed {
+            self.refresh_layout();
+            cx.notify();
+        }
+    }
+
+    /// Whether a cached card still points at the files the app would resolve
+    /// today; a background thumbnail landing invalidates only the cards using it.
+    fn canvas_node_assets_are_current(&self, canvas_node: &CanvasNode) -> bool {
+        let unchanged = |url: &str, used: &CanvasImageAsset| {
+            self.image_assets.get(url).is_none_or(|current| {
+                current.thumbnail.as_path() == used.thumbnail.as_ref()
+                    && current.original.as_path() == used.original.as_ref()
+            })
+        };
+        canvas_node
+            .displayed_images
+            .iter()
+            .all(|image| unchanged(&image.url, &image.asset))
+            && canvas_node
+                .node
+                .attachments
+                .iter()
+                .zip(&canvas_node.attachment_images)
+                .all(|(url, asset)| unchanged(url, asset))
     }
 
     pub(super) fn card_height(&self, node: &BoardNode) -> f32 {
@@ -409,7 +544,7 @@ impl AppView {
         self.camera_x = 80.;
         self.camera_y = 90.;
         self.zoom = 1.;
-        self.refresh_image_metadata();
+        self.refresh_image_metadata(cx);
         self.refresh_layout();
         window.focus(&self.focus, cx);
         cx.notify();
@@ -507,6 +642,7 @@ impl Render for AppView {
             .on_action(cx.listener(Self::fit_action))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
+            .on_action(cx.listener(Self::reset_zoom))
             .on_action(cx.listener(Self::escape))
             .on_action(cx.listener(Self::branch_hovered))
             .on_action(cx.listener(Self::regenerate_hovered))

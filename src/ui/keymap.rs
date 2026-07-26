@@ -27,6 +27,7 @@ actions!(
         FitCanvas,
         ZoomIn,
         ZoomOut,
+        ResetZoom,
         Escape,
         BranchHovered,
         RegenerateHovered,
@@ -54,6 +55,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("f", FitCanvas, Some(CANVAS_CONTEXT)),
         KeyBinding::new("cmd-=", ZoomIn, None),
         KeyBinding::new("cmd--", ZoomOut, None),
+        KeyBinding::new("cmd-0", ResetZoom, None),
         KeyBinding::new("escape", Escape, None),
         KeyBinding::new("b", BranchHovered, Some(CANVAS_CONTEXT)),
         KeyBinding::new("r", RegenerateHovered, Some(CANVAS_CONTEXT)),
@@ -176,6 +178,7 @@ pub fn configure_menus(cx: &mut App) {
             MenuItem::action("Fit Canvas", FitCanvas),
             MenuItem::action("Zoom In", ZoomIn),
             MenuItem::action("Zoom Out", ZoomOut),
+            MenuItem::action("Actual Size", ResetZoom),
         ]),
     ]);
 }

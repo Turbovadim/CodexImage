@@ -38,6 +38,7 @@ pub struct CanvasImage {
 
 pub struct CanvasNode {
     pub node: BoardNode,
+    pub expanded: bool,
     pub prompt_lines: Vec<SharedString>,
     pub collapsed_prompt_lines: Vec<SharedString>,
     pub output_layout: OutputLayout,
@@ -79,6 +80,7 @@ impl CanvasNode {
             attachment_images: node.attachments.iter().map(|url| asset_for(url)).collect(),
             prompt_lines,
             output_layout,
+            expanded,
             date: format_date(node.created_at).into(),
             done_footer: done_footer(node).into(),
             status_message: status_message(node).into(),
