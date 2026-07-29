@@ -11,8 +11,8 @@ use super::theme;
 use super::tooltip::{tip, tip_with_shortcut};
 use crate::model::BoardNode;
 use gpui::{
-    AnyElement, Context, Focusable, FontWeight, ObjectFit, Role, SharedString, StyledImage,
-    WeakEntity, Window, div, img, list, prelude::*, px,
+    AnyElement, ClipboardItem, Context, Focusable, FontWeight, ObjectFit, Role, SharedString,
+    StyledImage, WeakEntity, Window, div, img, list, prelude::*, px,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -237,6 +237,7 @@ impl AppView {
             Overlay::Lightbox(_)
                 | Overlay::EditNode(_)
                 | Overlay::RenameBoard(_)
+                | Overlay::NodeText(_)
                 | Overlay::QuitConfirm
         ) {
             return;
@@ -676,6 +677,94 @@ impl AppView {
                                     })),
                             ),
                     ),
+            )
+            .into_any_element()
+    }
+
+    /// The full text and error message of one node, shown when its truncated
+    /// status line is clicked.
+    pub(super) fn render_node_text(&self, node_id: &str, cx: &mut Context<Self>) -> AnyElement {
+        let node = self.node(node_id);
+        let error = node
+            .as_ref()
+            .and_then(|node| node.error.clone())
+            .filter(|error| !error.is_empty());
+        let text = node
+            .map(|node| node.text)
+            .filter(|text| !text.is_empty())
+            // The card would only offer this popup for one of the two, but a
+            // stale click can race a refresh; degrade to a placeholder.
+            .or_else(|| error.is_none().then(|| "No message was recorded.".into()));
+        let copy_text = text.clone();
+        let mut body = div()
+            .id("node-text-body")
+            .mt_3()
+            .max_h(px(420.))
+            .overflow_y_scroll()
+            .rounded_lg()
+            .border_1()
+            .border_color(theme::line())
+            .bg(theme::background())
+            .px_4()
+            .py_3()
+            .flex()
+            .flex_col()
+            .gap_3();
+        if let Some(error) = error {
+            body = body.child(div().text_sm().text_color(theme::danger()).child(error));
+        }
+        if let Some(text) = text {
+            body = body.child(div().text_sm().text_color(theme::ink()).child(text));
+        }
+        let mut buttons = div().mt_4().flex().justify_end().gap_2();
+        if let Some(copy_text) = copy_text {
+            buttons = buttons.child(control_button(
+                "Copy",
+                cx.listener(move |this, _, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                    this.show_toast("Message copied".into(), false, None, cx);
+                }),
+            ));
+        }
+        buttons = buttons.child(control_button(
+            "Close",
+            cx.listener(|this, _, window, cx| {
+                this.close_overlay(window, cx);
+                cx.notify();
+            }),
+        ));
+        div()
+            .id("node-text-overlay")
+            .absolute()
+            .inset_0()
+            .bg(gpui::black().opacity(0.72))
+            .flex()
+            .items_center()
+            .justify_center()
+            .occlude()
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.close_overlay(window, cx);
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .id("node-text-panel")
+                    .w(px(560.))
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(theme::line())
+                    .bg(theme::raised())
+                    .p_5()
+                    .occlude()
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::ink())
+                            .child("Codex message"),
+                    )
+                    .child(body)
+                    .child(buttons),
             )
             .into_any_element()
     }

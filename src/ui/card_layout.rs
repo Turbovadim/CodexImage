@@ -225,14 +225,27 @@ pub fn output_layout(node: &BoardNode, ratios: &HashMap<String, f32>) -> OutputL
     }
 }
 
+pub const ATTACHED_TEXT_HEIGHT: f32 = 20.;
+
+/// The extra status-area room an error or stopped card needs to show the
+/// text the agent attached.
+pub fn attached_text_height(node: &BoardNode) -> f32 {
+    if node.attached_text().is_some() {
+        ATTACHED_TEXT_HEIGHT
+    } else {
+        0.
+    }
+}
+
 pub fn status_area_height(node: &BoardNode) -> f32 {
     let has_images = !displayed_urls(node).is_empty();
-    match node.status {
+    let base = match node.status {
         NodeStatus::Running | NodeStatus::Done => 42.,
         NodeStatus::Error if has_images => 64.,
         NodeStatus::Error => 132.,
         NodeStatus::Stopped => 52.,
-    }
+    };
+    base + attached_text_height(node)
 }
 
 fn output_ratio(node: &BoardNode, url: &str, ratios: &HashMap<String, f32>) -> f32 {
@@ -260,7 +273,7 @@ fn image_height(width: f32, ratio: f32) -> f32 {
 mod tests {
     use super::{
         OutputLayout, PROMPT_WRAP_COLUMNS, card_height, output_layout,
-        prompt_metrics_from_line_count, wrap_prompt,
+        prompt_metrics_from_line_count, status_area_height, wrap_prompt,
     };
     use crate::layout::CARD_WIDTH;
     use crate::model::{BoardNode, NodeStatus};
@@ -337,6 +350,18 @@ mod tests {
             card_height(&error, false, &HashMap::new())
                 > card_height(&done, false, &HashMap::new())
         );
+    }
+
+    #[test]
+    fn attached_text_grows_the_error_status_area() {
+        let plain = node(0, NodeStatus::Error);
+        let mut with_text = node(0, NodeStatus::Error);
+        with_text.text = "The agent explained what went wrong".into();
+        assert!(status_area_height(&with_text) > status_area_height(&plain));
+
+        // A summary reused as the error message is already visible.
+        with_text.error = Some(with_text.text.clone());
+        assert_eq!(status_area_height(&with_text), status_area_height(&plain));
     }
 
     #[test]

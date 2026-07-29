@@ -61,6 +61,19 @@ fn default_aspect() -> String {
 }
 
 impl BoardNode {
+    /// Text the agent attached that the card does not already show elsewhere:
+    /// the done footer covers `Done`, and the error line covers a summary that
+    /// was reused as the error message.
+    pub fn attached_text(&self) -> Option<&str> {
+        if self.text.is_empty()
+            || !matches!(self.status, NodeStatus::Error | NodeStatus::Stopped)
+            || self.error.as_deref() == Some(self.text.as_str())
+        {
+            return None;
+        }
+        Some(&self.text)
+    }
+
     pub fn token_count(&self) -> u64 {
         let Some(usage) = &self.usage else { return 0 };
         usage.get("input_tokens").copied().unwrap_or(0)

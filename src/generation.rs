@@ -505,6 +505,28 @@ impl GenerationEngine {
         runtime: &mut Runtime,
     ) -> Result<()> {
         let termination = *control.termination.lock();
+        // A replaced job is finalized by the run that replaced it.
+        if termination == Some(Termination::Replaced) {
+            return Ok(());
+        }
+        // Keep whatever text the agent produced so it stays visible even when
+        // the run failed, timed out, or was stopped: the manifest summary when
+        // the message parses, the raw message otherwise.
+        if let Some(message) = runtime.last_agent_message.as_deref() {
+            let text = match crate::manifest::parse(message) {
+                Ok(manifest) => manifest.summary,
+                Err(_) => message.trim().chars().take(20_000).collect(),
+            };
+            if !text.is_empty() {
+                self.inner
+                    .repository
+                    .update_node(&board.id, &node.id, |node| {
+                        if node.status == NodeStatus::Running {
+                            node.text = text;
+                        }
+                    })?;
+            }
+        }
         if let Some(termination) = termination {
             if let Some(reason) = termination.stop_reason() {
                 return self
@@ -512,11 +534,7 @@ impl GenerationEngine {
                     .repository
                     .mark_stopped(&board.id, &node.id, reason);
             }
-            // A replaced job is finalized by the run that replaced it.
-            return match termination {
-                Termination::Timeout => self.record_timeout(board, node),
-                _ => Ok(()),
-            };
+            return self.record_timeout(board, node);
         }
 
         let generation_failure = runtime.failures.first().cloned();

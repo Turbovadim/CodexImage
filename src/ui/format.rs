@@ -44,6 +44,14 @@ pub fn done_footer(node: &BoardNode) -> String {
     footer
 }
 
+/// A one-line excerpt of the text the agent attached to an error or stopped
+/// card; empty when the card already shows that text elsewhere.
+pub fn attached_text_excerpt(node: &BoardNode) -> String {
+    node.attached_text()
+        .map(|text| single_line_excerpt(text, 90))
+        .unwrap_or_default()
+}
+
 fn single_line_excerpt(text: &str, max_chars: usize) -> String {
     text.chars()
         .take(max_chars)

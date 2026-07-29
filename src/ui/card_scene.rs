@@ -2,9 +2,9 @@
 //! painter and the SVG sprite encoder.
 
 use super::card::{
-    ATTACHMENT_ROW_HEIGHT, COLLAPSED_PROMPT_LINES, CanvasImageAsset, CanvasNode,
-    EXPANDED_PROMPT_LINES, MEDIA_GAP, OutputLayout, PROMPT_LINE_HEIGHT, SHOW_MORE_HEIGHT,
-    card_height_from_metadata, status_area_height,
+    ATTACHED_TEXT_HEIGHT, ATTACHMENT_ROW_HEIGHT, COLLAPSED_PROMPT_LINES, CanvasImageAsset,
+    CanvasNode, EXPANDED_PROMPT_LINES, MEDIA_GAP, OutputLayout, PROMPT_LINE_HEIGHT,
+    SHOW_MORE_HEIGHT, attached_text_height, card_height_from_metadata, status_area_height,
 };
 use super::theme;
 use crate::layout::CARD_WIDTH;
@@ -424,8 +424,7 @@ pub fn build_card_scene(canvas_node: &CanvasNode, expanded: bool) -> CardScene {
     if running {
         let media_height = canvas_node.output_layout.height();
         if media_height > 0. {
-            scene.generating_media =
-                Some(CardRect::new(0., media_top, CARD_WIDTH, media_height));
+            scene.generating_media = Some(CardRect::new(0., media_top, CARD_WIDTH, media_height));
         }
     }
 
@@ -457,7 +456,23 @@ pub fn build_card_scene(canvas_node: &CanvasNode, expanded: bool) -> CardScene {
                 CardColor::Danger,
                 TextAlign::Center,
             );
-            let retry = CardRect::new(CARD_WIDTH / 2. - 29., cursor_y + 88., 58., 26.);
+            let text_offset = attached_text_height(node);
+            if text_offset > 0. {
+                scene.text(
+                    canvas_node.attached_text.clone(),
+                    CardRect::new(18., cursor_y + 81., CARD_WIDTH - 36., 18.),
+                    10.5,
+                    16.,
+                    CardColor::Dim,
+                    TextAlign::Center,
+                );
+            }
+            let retry = CardRect::new(
+                CARD_WIDTH / 2. - 29.,
+                cursor_y + 88. + text_offset,
+                58.,
+                26.,
+            );
             scene.quad(
                 retry,
                 7.,
@@ -467,11 +482,12 @@ pub fn build_card_scene(canvas_node: &CanvasNode, expanded: bool) -> CardScene {
             scene.text("Retry", retry, 10.5, 26., CardColor::Dim, TextAlign::Center);
         }
         NodeStatus::Error | NodeStatus::Stopped => {
+            let message_height = status_height - attached_text_height(node);
             scene.text(
                 canvas_node.status_message.clone(),
-                CardRect::new(14., cursor_y, CARD_WIDTH - 90., status_height),
+                CardRect::new(14., cursor_y, CARD_WIDTH - 90., message_height),
                 10.8,
-                status_height,
+                message_height,
                 if node.status == NodeStatus::Error {
                     CardColor::Danger
                 } else {
@@ -479,9 +495,24 @@ pub fn build_card_scene(canvas_node: &CanvasNode, expanded: bool) -> CardScene {
                 },
                 TextAlign::Left,
             );
+            if message_height < status_height {
+                scene.text(
+                    canvas_node.attached_text.clone(),
+                    CardRect::new(
+                        14.,
+                        cursor_y + message_height - 8.,
+                        CARD_WIDTH - 28.,
+                        ATTACHED_TEXT_HEIGHT - 2.,
+                    ),
+                    10.5,
+                    16.,
+                    CardColor::Dim,
+                    TextAlign::Left,
+                );
+            }
             let retry = CardRect::new(
                 CARD_WIDTH - 68.,
-                cursor_y + (status_height - 26.) * 0.5,
+                cursor_y + (message_height - 26.) * 0.5,
                 54.,
                 26.,
             );

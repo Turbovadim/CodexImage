@@ -1,7 +1,7 @@
 //! The world-space model of a board card: how tall it is, where its outputs
 //! sit, and the primitives that draw it either directly or as an SVG sprite.
 
-use super::format::{done_footer, format_date, status_message};
+use super::format::{attached_text_excerpt, done_footer, format_date, status_message};
 use crate::model::BoardNode;
 use gpui::{Image, ImageFormat, SharedString};
 use std::path::Path;
@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
 
 pub use super::card_layout::{
-    OutputLayout, card_height, card_height_from_metadata, displayed_urls, output_layout,
-    status_area_height, wrap_prompt,
+    ATTACHED_TEXT_HEIGHT, OutputLayout, attached_text_height, card_height,
+    card_height_from_metadata, displayed_urls, output_layout, status_area_height, wrap_prompt,
 };
 pub use super::card_scene::{CardImageFit, CardPrimitive, CardRect, CardScene, build_card_scene};
 pub use super::card_svg::card_scene_svg;
@@ -47,6 +47,7 @@ pub struct CanvasNode {
     pub date: SharedString,
     pub done_footer: SharedString,
     pub status_message: SharedString,
+    pub attached_text: SharedString,
     pub scene: CardScene,
     pub sprite_images: Vec<Arc<Image>>,
     pub last_ready_sprite_tier: AtomicU8,
@@ -84,6 +85,7 @@ impl CanvasNode {
             date: format_date(node.created_at).into(),
             done_footer: done_footer(node).into(),
             status_message: status_message(node).into(),
+            attached_text: attached_text_excerpt(node).into(),
             node: node.clone(),
             scene: CardScene::default(),
             sprite_images: Vec::new(),

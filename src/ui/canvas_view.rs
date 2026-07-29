@@ -9,7 +9,8 @@ use super::canvas::{
 };
 use super::card::{
     ATTACHMENT_ROW_HEIGHT, COLLAPSED_PROMPT_LINES, CanvasNode, CardRect, EXPANDED_PROMPT_LINES,
-    MEDIA_GAP, OutputLayout, PROMPT_LINE_HEIGHT, SHOW_MORE_HEIGHT, status_area_height,
+    MEDIA_GAP, OutputLayout, PROMPT_LINE_HEIGHT, SHOW_MORE_HEIGHT, attached_text_height,
+    status_area_height,
 };
 use super::keymap::{FitCanvas, ResetZoom, ZoomIn, ZoomOut};
 use super::theme;
@@ -48,6 +49,7 @@ pub(super) enum CanvasClickTarget {
     },
     TogglePrompt(String),
     Retry(String),
+    NodeText(String),
     Toolbar {
         node_id: String,
         action: ToolbarAction,
@@ -140,8 +142,8 @@ pub(super) enum DragState {
         id: String,
         start: Point<Pixels>,
         origin: Position,
-        click_target: Option<CanvasClickTarget>,
     },
+    NodeClick(CanvasClickTarget),
 }
 
 impl AppView {
@@ -345,6 +347,7 @@ impl AppView {
         let cursor = match &self.drag {
             Some(DragState::Canvas { .. }) => gpui::CursorStyle::ClosedHand,
             Some(DragState::Node { .. }) => gpui::CursorStyle::ClosedHand,
+            Some(DragState::NodeClick(_)) => gpui::CursorStyle::PointingHand,
             _ if self.hovered_node.is_some() => gpui::CursorStyle::PointingHand,
             _ => gpui::CursorStyle::OpenHand,
         };
@@ -754,8 +757,9 @@ impl AppView {
         let status_y = media_top + canvas_node.output_layout.height();
         let in_retry = match canvas_node.node.status {
             NodeStatus::Error if canvas_node.displayed_images.is_empty() => {
+                let retry_top = status_y + 88. + attached_text_height(&canvas_node.node);
                 (CARD_WIDTH / 2. - 29. ..=CARD_WIDTH / 2. + 29.).contains(&local_x)
-                    && (status_y + 88. ..=status_y + 114.).contains(&local_y)
+                    && (retry_top..=retry_top + 26.).contains(&local_y)
             }
             NodeStatus::Error | NodeStatus::Stopped => {
                 (CARD_WIDTH - 68. ..=CARD_WIDTH - 14.).contains(&local_x)
@@ -764,7 +768,24 @@ impl AppView {
             }
             NodeStatus::Running | NodeStatus::Done => false,
         };
-        in_retry.then(|| CanvasClickTarget::Retry(canvas_node.node.id.clone()))
+        if in_retry {
+            return Some(CanvasClickTarget::Retry(canvas_node.node.id.clone()));
+        }
+        // The status area shows only a truncated line; clicking it opens the
+        // full text and error message in a popup.
+        let has_message = !canvas_node.node.text.is_empty()
+            || canvas_node
+                .node
+                .error
+                .as_ref()
+                .is_some_and(|e| !e.is_empty());
+        if has_message
+            && canvas_node.node.status != NodeStatus::Running
+            && (status_y..=status_y + status_area_height(&canvas_node.node)).contains(&local_y)
+        {
+            return Some(CanvasClickTarget::NodeText(canvas_node.node.id.clone()));
+        }
+        None
     }
 
     fn canvas_mouse_down(
@@ -779,12 +800,14 @@ impl AppView {
         window.focus(&self.focus, cx);
         if let Some((index, origin)) = self.canvas_node_at(event.position) {
             let canvas_node = &self.canvas_nodes[index];
-            self.drag = Some(DragState::Node {
-                id: canvas_node.node.id.clone(),
-                start: event.position,
-                origin,
-                click_target: self.canvas_click_target(canvas_node, event.position, origin),
-            });
+            self.drag = match self.canvas_click_target(canvas_node, event.position, origin) {
+                Some(target) => Some(DragState::NodeClick(target)),
+                None => Some(DragState::Node {
+                    id: canvas_node.node.id.clone(),
+                    start: event.position,
+                    origin,
+                }),
+            };
         } else {
             self.drag = Some(DragState::Canvas {
                 start: event.position,
@@ -877,32 +900,44 @@ impl AppView {
             return;
         }
         let drag = self.drag.take();
-        if let Some(DragState::Node {
-            id, click_target, ..
-        }) = drag
-        {
+        if let Some(DragState::Node { id, .. }) = drag {
             if let Some(position) = self.transient_positions.remove(&id) {
                 self.on_board(cx, |this, board_id| {
                     this.engine
                         .repository()
-                        .move_node(board_id, &id, position.x, position.y)
-                        .map(|_| ())
+                        .move_node(board_id, &id, position.x, position.y)?;
+                    // The repository confirms the move through an async event a
+                    // few frames from now; apply it to the local copy too so the
+                    // card never falls back to its pre-drag layout slot.
+                    if let Some(node) = this
+                        .board
+                        .as_mut()
+                        .and_then(|board| board.nodes.iter_mut().find(|node| node.id == id))
+                    {
+                        node.x = Some(position.x);
+                        node.y = Some(position.y);
+                    }
+                    this.refresh_layout();
+                    Ok(())
                 });
-            } else if let Some(click_target) = click_target {
-                match click_target {
-                    CanvasClickTarget::Image { node_id, url } => {
-                        self.open_lightbox(node_id, url, window, cx);
+            }
+        } else if let Some(DragState::NodeClick(click_target)) = drag {
+            match click_target {
+                CanvasClickTarget::Image { node_id, url } => {
+                    self.open_lightbox(node_id, url, window, cx);
+                }
+                CanvasClickTarget::TogglePrompt(node_id) => {
+                    if !self.expanded_prompts.remove(&node_id) {
+                        self.expanded_prompts.insert(node_id);
                     }
-                    CanvasClickTarget::TogglePrompt(node_id) => {
-                        if !self.expanded_prompts.remove(&node_id) {
-                            self.expanded_prompts.insert(node_id);
-                        }
-                        self.refresh_layout();
-                    }
-                    CanvasClickTarget::Retry(node_id) => self.regenerate_node(&node_id, cx),
-                    CanvasClickTarget::Toolbar { node_id, action } => {
-                        self.run_toolbar_action(&node_id, action, window, cx)
-                    }
+                    self.refresh_layout();
+                }
+                CanvasClickTarget::Retry(node_id) => self.regenerate_node(&node_id, cx),
+                CanvasClickTarget::NodeText(node_id) => {
+                    self.overlay = Overlay::NodeText(node_id);
+                }
+                CanvasClickTarget::Toolbar { node_id, action } => {
+                    self.run_toolbar_action(&node_id, action, window, cx)
                 }
             }
         }

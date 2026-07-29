@@ -19,7 +19,14 @@ To create a self-contained macOS application bundle:
 
 ```bash
 ./scripts/package-macos.sh
-open "dist/CodexImage GPUI.app"
+open "dist/CodexImage.app"
+```
+
+Use `--install` to copy the bundle to `/Applications`, and `--open` to
+launch it after packaging:
+
+```bash
+./scripts/package-macos.sh --install --open
 ```
 
 On first launch, the app opens the Electron data at

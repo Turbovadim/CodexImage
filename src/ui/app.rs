@@ -40,6 +40,7 @@ pub(super) enum Overlay {
     Lightbox(Lightbox),
     EditNode(String),
     RenameBoard(String),
+    NodeText(String),
     QuitConfirm,
 }
 
@@ -595,7 +596,7 @@ impl AppView {
             Overlay::Lightbox(_) => self.continue_from_lightbox(window, cx),
             Overlay::EditNode(_) => self.save_edited_prompt(window, cx),
             Overlay::RenameBoard(_) => self.rename_open_board(window, cx),
-            Overlay::Boards | Overlay::Gallery | Overlay::QuitConfirm => {}
+            Overlay::Boards | Overlay::Gallery | Overlay::NodeText(_) | Overlay::QuitConfirm => {}
             Overlay::None => self.generate_from_composer(window, cx),
         }
     }
@@ -736,6 +737,10 @@ impl Render for AppView {
                 "Rename",
                 cx,
             )),
+            Overlay::NodeText(node_id) => {
+                let node_id = node_id.clone();
+                root.child(self.render_node_text(&node_id, cx))
+            }
             Overlay::QuitConfirm => root.child(self.render_quit_confirm(cx)),
         };
         if let Some(toast) = &self.toast {
