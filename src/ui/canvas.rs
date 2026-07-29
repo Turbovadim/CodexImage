@@ -2,12 +2,13 @@
 //! and each visible card (as a cached sprite when one is ready).
 
 use super::card::{CanvasNode, CardImageFit, CardPrimitive, CardRect, CardScene};
+use super::image_cache::{CardSpriteCache, DecodedImageCache};
 use super::theme;
 use crate::layout::CARD_WIDTH;
 use crate::storage::THUMBNAIL_MAX_DIMENSION;
 use gpui::{
-    App, BorderStyle, Bounds, ContentMask, ImgResourceLoader, ObjectFit, PathBuilder, Pixels,
-    Point, Resource, SharedString, TextAlign, TextRun, Window, point, px, quad, size,
+    App, BorderStyle, Bounds, ContentMask, Entity, ObjectFit, PathBuilder, Pixels, Point, Resource,
+    SharedString, TextAlign, TextRun, Window, point, px, quad, size,
 };
 use std::path::Path;
 use std::sync::atomic::Ordering;
@@ -374,24 +375,41 @@ fn paint_canvas_text(
     });
 }
 
+struct CanvasImageStyle {
+    fit: ObjectFit,
+    corner_radius: f32,
+    blurred: bool,
+}
+
 fn paint_canvas_image(
     path: &Arc<Path>,
     bounds: Bounds<Pixels>,
-    fit: ObjectFit,
-    corner_radius: f32,
+    style: CanvasImageStyle,
+    image_cache: &Entity<DecodedImageCache>,
     window: &mut Window,
     cx: &mut App,
 ) {
     let resource = Resource::Path(path.clone());
-    let Some(Ok(data)) = window.use_asset::<ImgResourceLoader>(&resource, cx) else {
-        return;
+    let data = if style.blurred {
+        let Some(data) =
+            image_cache.update(cx, |cache, cx| cache.load_blurred(&resource, window, cx))
+        else {
+            return;
+        };
+        data
+    } else {
+        let Some(Ok(data)) = image_cache.update(cx, |cache, cx| cache.load(&resource, window, cx))
+        else {
+            return;
+        };
+        data
     };
     if data.frame_count() == 0 {
         return;
     }
-    let image_bounds = fit.get_bounds(bounds, data.size(0));
+    let image_bounds = style.fit.get_bounds(bounds, data.size(0));
     window.with_content_mask(Some(ContentMask { bounds }), |window| {
-        let _ = window.paint_image(image_bounds, px(corner_radius).into(), data, 0, false);
+        let _ = window.paint_image(image_bounds, px(style.corner_radius).into(), data, 0, false);
     });
 }
 
@@ -399,6 +417,8 @@ pub fn paint_canvas_node(
     frame: &CanvasNodeFrame,
     canvas_node: &CanvasNode,
     zoom: f32,
+    image_cache: &Entity<DecodedImageCache>,
+    sprite_cache: &Entity<CardSpriteCache>,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -417,10 +437,9 @@ pub fn paint_canvas_node(
     } else {
         3
     };
-    let mut sprite = canvas_node
-        .sprite_images
-        .get(tier)
-        .and_then(|image| image.clone().use_render_image(window, cx));
+    let mut sprite = canvas_node.sprite_images.get(tier).and_then(|image| {
+        sprite_cache.update(cx, |cache, cx| cache.load(image.clone(), window, cx))
+    });
     if sprite.is_some() {
         canvas_node
             .last_ready_sprite_tier
@@ -428,18 +447,24 @@ pub fn paint_canvas_node(
     } else {
         let previous_tier = canvas_node.last_ready_sprite_tier.load(Ordering::Relaxed) as usize;
         if previous_tier < canvas_node.sprite_images.len() && previous_tier != tier {
-            sprite = canvas_node.sprite_images[previous_tier]
-                .clone()
-                .use_render_image(window, cx);
+            sprite = sprite_cache.update(cx, |cache, _| {
+                cache.ready(&canvas_node.sprite_images[previous_tier], window)
+            });
         }
     }
     if let Some(sprite) = sprite {
         let _ = window.paint_image(bounds, px(20. * zoom).into(), sprite, 0, false);
     } else {
-        paint_card_scene(frame, &canvas_node.scene, zoom, window, cx);
+        paint_card_scene(frame, &canvas_node.scene, zoom, image_cache, window, cx);
     }
 
-    paint_high_resolution_card_images(frame, &canvas_node.scene, zoom, window, cx);
+    paint_high_resolution_card_images(frame, &canvas_node.scene, zoom, image_cache, window, cx);
+
+    if frame.status_line.is_some()
+        && let Some(media) = canvas_node.scene.generating_media
+    {
+        paint_generating_shimmer(transform_card_rect(media, frame, zoom), window);
+    }
 
     if let Some(status_line) = &frame.status_line {
         paint_canvas_text(
@@ -466,6 +491,47 @@ pub fn paint_canvas_node(
             BorderStyle::Solid,
         ));
     }
+}
+
+/// One shimmer cycle across the media area, as in a skeleton placeholder. The
+/// phase comes from wall-clock time, so every running card sweeps in unison
+/// and the app timer only has to trigger repaints.
+fn paint_generating_shimmer(bounds: Bounds<Pixels>, window: &mut Window) {
+    const SWEEP_PERIOD_SECONDS: f32 = 1.8;
+    static SHIMMER_EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    let elapsed = SHIMMER_EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs_f32();
+    let phase = (elapsed / SWEEP_PERIOD_SECONDS).fract();
+
+    let width = f32::from(bounds.size.width);
+    let height = f32::from(bounds.size.height);
+    if width <= 0. || height <= 0. {
+        return;
+    }
+    let band_width = width * 0.55;
+    let band_left = f32::from(bounds.left()) + phase * (width + band_width) - band_width;
+    let top = f32::from(bounds.top());
+    let peak = theme::ink().opacity(0.08);
+    let edge = theme::ink().opacity(0.);
+    window.with_content_mask(Some(ContentMask { bounds }), |window| {
+        let half = band_width / 2.;
+        for (offset, from, to) in [(0., edge, peak), (half, peak, edge)] {
+            window.paint_quad(quad(
+                canvas_bounds(band_left + offset, top, half, height),
+                px(0.),
+                gpui::linear_gradient(
+                    90.,
+                    gpui::linear_color_stop(from, 0.),
+                    gpui::linear_color_stop(to, 1.),
+                ),
+                px(0.),
+                gpui::transparent_black(),
+                BorderStyle::Solid,
+            ));
+        }
+    });
 }
 
 pub struct ToolbarButtonPaint {
@@ -518,6 +584,7 @@ fn paint_card_scene(
     frame: &CanvasNodeFrame,
     scene: &CardScene,
     zoom: f32,
+    image_cache: &Entity<DecodedImageCache>,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -577,14 +644,19 @@ fn paint_card_scene(
                         bounds,
                         fit,
                         radius,
+                        blurred,
                     } => paint_canvas_image(
                         &asset.thumbnail,
                         transform_card_rect(*bounds, frame, zoom),
-                        match fit {
-                            CardImageFit::Contain => ObjectFit::Contain,
-                            CardImageFit::Cover => ObjectFit::Cover,
+                        CanvasImageStyle {
+                            fit: match fit {
+                                CardImageFit::Contain => ObjectFit::Contain,
+                                CardImageFit::Cover => ObjectFit::Cover,
+                            },
+                            corner_radius: radius * zoom,
+                            blurred: *blurred,
                         },
-                        radius * zoom,
+                        image_cache,
                         window,
                         cx,
                     ),
@@ -598,6 +670,7 @@ fn paint_high_resolution_card_images(
     frame: &CanvasNodeFrame,
     scene: &CardScene,
     zoom: f32,
+    image_cache: &Entity<DecodedImageCache>,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -608,11 +681,14 @@ fn paint_high_resolution_card_images(
             bounds,
             fit,
             radius,
+            blurred,
         } = primitive
         else {
             continue;
         };
-        if asset.original.as_ref() == asset.thumbnail.as_ref()
+        // A blurred stand-in never benefits from more pixels.
+        if *blurred
+            || asset.original.as_ref() == asset.thumbnail.as_ref()
             || !image_needs_high_resolution(*bounds, zoom, scale_factor)
         {
             continue;
@@ -620,11 +696,15 @@ fn paint_high_resolution_card_images(
         paint_canvas_image(
             &asset.original,
             transform_card_rect(*bounds, frame, zoom),
-            match fit {
-                CardImageFit::Contain => ObjectFit::Contain,
-                CardImageFit::Cover => ObjectFit::Cover,
+            CanvasImageStyle {
+                fit: match fit {
+                    CardImageFit::Contain => ObjectFit::Contain,
+                    CardImageFit::Cover => ObjectFit::Cover,
+                },
+                corner_radius: radius * zoom,
+                blurred: false,
             },
-            radius * zoom,
+            image_cache,
             window,
             cx,
         );

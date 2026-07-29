@@ -36,12 +36,22 @@ pub fn done_footer(node: &BoardNode) -> String {
     );
     if !node.text.is_empty() {
         footer.push_str(" · ");
-        footer.extend(node.text.chars().take(90));
+        footer.push_str(&single_line_excerpt(&node.text, 90));
     }
     if node.token_count() > 0 {
         footer.push_str(&format!(" · {} tok", format_tokens(node.token_count())));
     }
     footer
+}
+
+fn single_line_excerpt(text: &str, max_chars: usize) -> String {
+    text.chars()
+        .take(max_chars)
+        .map(|character| match character {
+            '\n' | '\r' => ' ',
+            character => character,
+        })
+        .collect()
 }
 
 pub fn status_message(node: &BoardNode) -> String {
@@ -141,5 +151,15 @@ pub fn image_format_for_path(path: &Path) -> Option<ImageFormat> {
         "ico" => Some(ImageFormat::Ico),
         "pnm" | "pbm" | "pgm" | "ppm" => Some(ImageFormat::Pnm),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::single_line_excerpt;
+
+    #[test]
+    fn single_line_excerpt_removes_line_breaks_and_limits_characters() {
+        assert_eq!(single_line_excerpt("one\ntwo\rthree", 9), "one two t");
     }
 }

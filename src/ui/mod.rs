@@ -7,6 +7,7 @@ mod card_scene;
 mod card_svg;
 mod composer;
 mod format;
+mod image_cache;
 mod input;
 mod input_actions;
 mod input_element;

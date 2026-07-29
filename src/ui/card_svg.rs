@@ -81,14 +81,25 @@ pub fn card_scene_svg(scene: &CardScene, rendered_width: f32) -> String {
                 bounds,
                 fit,
                 radius,
+                blurred,
             } => {
                 if asset.thumbnail.as_os_str().is_empty() {
                     continue;
                 }
+                let mut filter = String::new();
+                if *blurred {
+                    let filter_id = format!("blur-{index}");
+                    write!(
+                        svg,
+                        "<filter id=\"{filter_id}\" x=\"-20%\" y=\"-20%\" width=\"140%\" height=\"140%\"><feGaussianBlur stdDeviation=\"14\"/></filter>",
+                    )
+                    .expect("writing to a String cannot fail");
+                    filter = format!(" filter=\"url(#{filter_id})\"");
+                }
                 let clip_id = format!("image-{index}");
                 write!(
                     svg,
-                    "<clipPath id=\"{clip_id}\"><rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"{radius}\"/></clipPath><image x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" clip-path=\"url(#{clip_id})\" preserveAspectRatio=\"xMidYMid {}\" href=\"",
+                    "<clipPath id=\"{clip_id}\"><rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"{radius}\"/></clipPath><image x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" clip-path=\"url(#{clip_id})\"{filter} preserveAspectRatio=\"xMidYMid {}\" href=\"",
                     bounds.x,
                     bounds.y,
                     bounds.width,
@@ -129,14 +140,17 @@ fn push_xml_escaped(output: &mut String, value: &str) {
 mod tests {
     use super::card_scene_svg;
     use crate::layout::CARD_WIDTH;
-    use crate::ui::card::CARD_SPRITE_WIDTHS;
-    use crate::ui::card_scene::{CardColor, CardRect, CardScene};
+    use crate::ui::card::{CARD_SPRITE_WIDTHS, CanvasImageAsset};
+    use crate::ui::card_scene::{CardColor, CardImageFit, CardRect, CardScene};
+    use std::path::Path;
+    use std::sync::Arc;
 
     #[test]
     fn sprite_tiers_preserve_one_world_space_scene() {
         let mut scene = CardScene {
             height: 510.,
             primitives: Vec::new(),
+            generating_media: None,
         };
         scene.quad(
             CardRect::new(0., 0., CARD_WIDTH, scene.height),
@@ -159,5 +173,28 @@ mod tests {
             assert!(svg.contains("A &lt;stable&gt; &amp; exact card"));
             assert!(svg.contains(&format!("width=\"{width}\"")));
         }
+    }
+
+    #[test]
+    fn only_blurred_images_receive_a_gaussian_filter() {
+        let asset = || CanvasImageAsset {
+            original: Arc::from(Path::new("/images/full.png")),
+            thumbnail: Arc::from(Path::new("/images/thumb.png")),
+        };
+        let bounds = CardRect::new(0., 0., CARD_WIDTH, CARD_WIDTH);
+        let mut scene = CardScene {
+            height: CARD_WIDTH,
+            primitives: Vec::new(),
+            generating_media: None,
+        };
+        scene.image(asset(), bounds, CardImageFit::Contain, 0., false);
+        let svg = card_scene_svg(&scene, CARD_WIDTH);
+        assert!(!svg.contains("feGaussianBlur"));
+
+        scene.primitives.clear();
+        scene.image(asset(), bounds, CardImageFit::Contain, 0., true);
+        let svg = card_scene_svg(&scene, CARD_WIDTH);
+        assert!(svg.contains("feGaussianBlur"));
+        assert!(svg.contains("filter=\"url(#blur-0)\""));
     }
 }

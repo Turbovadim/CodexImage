@@ -12,9 +12,9 @@ use super::theme;
 use super::tooltip::tip_with_shortcut;
 use crate::model::{Board, BoardNode, NewNodesRequest};
 use gpui::{
-    AnyElement, ClipboardItem, Context, Focusable, FontWeight, Image, ImgResourceLoader,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PinchEvent, Pixels,
-    Point, Resource, Role, ScrollWheelEvent, StyledImage, Window, div, img, prelude::*, px,
+    AnyElement, ClipboardItem, Context, Focusable, FontWeight, Image, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ObjectFit, PinchEvent, Pixels, Point, Resource, Role,
+    ScrollWheelEvent, StyledImage, Window, div, img, prelude::*, px,
 };
 use std::collections::VecDeque;
 use std::fs;
@@ -352,7 +352,10 @@ impl AppView {
         let mut load_error = None;
         if let Some(pending) = pending {
             let resource = Resource::Path(Arc::from(self.display_image_path(&pending.image, true)));
-            match window.use_asset::<ImgResourceLoader>(&resource, cx) {
+            match self
+                .image_cache
+                .update(cx, |cache, cx| cache.load(&resource, window, cx))
+            {
                 Some(Ok(image)) if image.frame_count() > 0 => {
                     if let Overlay::Lightbox(lightbox) = &mut self.overlay {
                         lightbox.commit_pending(&pending);
@@ -380,7 +383,9 @@ impl AppView {
         };
         let current_resource =
             Resource::Path(Arc::from(self.display_image_path(&current.image, true)));
-        let _ = window.use_asset::<ImgResourceLoader>(&current_resource, cx);
+        let _ = self
+            .image_cache
+            .update(cx, |cache, cx| cache.load(&current_resource, window, cx));
 
         let mut previous_path = None;
         for horizontal in [-1, 1] {
@@ -393,7 +398,9 @@ impl AppView {
             }
             previous_path = Some(path.clone());
             let resource = Resource::Path(Arc::from(path));
-            let _ = window.use_asset::<ImgResourceLoader>(&resource, cx);
+            let _ = self
+                .image_cache
+                .update(cx, |cache, cx| cache.load(&resource, window, cx));
         }
     }
 
@@ -515,7 +522,10 @@ impl AppView {
         let path = self.display_image_path(&lightbox.image, true);
         let thumbnail_path = self.display_image_path(&lightbox.image, false);
         let resource = Resource::Path(Arc::from(path.clone()));
-        let display_image = match window.use_asset::<ImgResourceLoader>(&resource, cx) {
+        let display_image = match self
+            .image_cache
+            .update(cx, |cache, cx| cache.load(&resource, window, cx))
+        {
             Some(Ok(image)) if image.frame_count() > 0 => img(image),
             _ => img(thumbnail_path),
         };

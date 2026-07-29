@@ -108,6 +108,9 @@ pub enum CardPrimitive {
         bounds: CardRect,
         fit: CardImageFit,
         radius: f32,
+        /// Draw an unrecognizable, heavily blurred version so an in-progress
+        /// generation never spoils its final image.
+        blurred: bool,
     },
 }
 
@@ -115,6 +118,9 @@ pub enum CardPrimitive {
 pub struct CardScene {
     pub height: f32,
     pub primitives: Vec<CardPrimitive>,
+    /// The media area of a running card, in card-local coordinates. The canvas
+    /// paints the animated generating shimmer over this rectangle.
+    pub generating_media: Option<CardRect>,
 }
 
 impl CardScene {
@@ -158,12 +164,14 @@ impl CardScene {
         bounds: CardRect,
         fit: CardImageFit,
         radius: f32,
+        blurred: bool,
     ) {
         self.primitives.push(CardPrimitive::Image {
             asset,
             bounds,
             fit,
             radius,
+            blurred,
         });
     }
 }
@@ -178,7 +186,12 @@ pub fn build_card_scene(canvas_node: &CanvasNode, expanded: bool) -> CardScene {
             canvas_node.output_layout.height(),
         ),
         primitives: Vec::new(),
+        generating_media: None,
     };
+    // While the generation runs, any displayed image is an intermediate
+    // attempt; blur it so the card marks progress without spoiling the result.
+    let running = node.status == NodeStatus::Running;
+    let blur_outputs = running && node.images.is_empty();
     let border = if node.status == NodeStatus::Running {
         CardColor::Accent45
     } else {
@@ -240,6 +253,7 @@ pub fn build_card_scene(canvas_node: &CanvasNode, expanded: bool) -> CardScene {
                 CardRect::new(14. + index as f32 * 42., cursor_y + 8., 36., 36.),
                 CardImageFit::Cover,
                 6.,
+                false,
             );
         }
         cursor_y += ATTACHMENT_ROW_HEIGHT;
@@ -288,6 +302,7 @@ pub fn build_card_scene(canvas_node: &CanvasNode, expanded: bool) -> CardScene {
     );
     cursor_y += MEDIA_GAP;
 
+    let media_top = cursor_y;
     match &canvas_node.output_layout {
         OutputLayout::None => {}
         OutputLayout::Tiles { height, cells } => {
@@ -310,7 +325,13 @@ pub fn build_card_scene(canvas_node: &CanvasNode, expanded: bool) -> CardScene {
                 };
                 let bounds = CardRect::new(cell.x, cursor_y + cell.y, cell.width, cell.height);
                 scene.quad(bounds, 0., CardColor::Raised, None);
-                scene.image(image.asset.clone(), bounds, CardImageFit::Contain, 0.);
+                scene.image(
+                    image.asset.clone(),
+                    bounds,
+                    CardImageFit::Contain,
+                    0.,
+                    blur_outputs,
+                );
             }
             if node.images.is_empty() && !canvas_node.displayed_images.is_empty() {
                 let badge = CardRect::new(CARD_WIDTH - 76., cursor_y + *height - 27., 68., 19.);
@@ -342,7 +363,13 @@ pub fn build_card_scene(canvas_node: &CanvasNode, expanded: bool) -> CardScene {
             if let Some(hero) = canvas_node.displayed_images.first() {
                 let hero_bounds = CardRect::new(0., cursor_y, CARD_WIDTH, *hero_height);
                 scene.quad(hero_bounds, 0., CardColor::Raised, None);
-                scene.image(hero.asset.clone(), hero_bounds, CardImageFit::Contain, 0.);
+                scene.image(
+                    hero.asset.clone(),
+                    hero_bounds,
+                    CardImageFit::Contain,
+                    0.,
+                    blur_outputs,
+                );
             }
             let badge = CardRect::new(CARD_WIDTH - 57., cursor_y + *hero_height - 25., 49., 19.);
             scene.quad(badge, 5., CardColor::Background82, None);
@@ -366,7 +393,13 @@ pub fn build_card_scene(canvas_node: &CanvasNode, expanded: bool) -> CardScene {
                     *strip_cell_width,
                 );
                 scene.quad(bounds, 0., CardColor::Raised, None);
-                scene.image(image.asset.clone(), bounds, CardImageFit::Cover, 0.);
+                scene.image(
+                    image.asset.clone(),
+                    bounds,
+                    CardImageFit::Cover,
+                    0.,
+                    blur_outputs,
+                );
             }
             if *hidden_count > 0 {
                 let hidden = CardRect::new(
@@ -386,6 +419,13 @@ pub fn build_card_scene(canvas_node: &CanvasNode, expanded: bool) -> CardScene {
                 );
             }
             cursor_y += *height;
+        }
+    }
+    if running {
+        let media_height = canvas_node.output_layout.height();
+        if media_height > 0. {
+            scene.generating_media =
+                Some(CardRect::new(0., media_top, CARD_WIDTH, media_height));
         }
     }
 

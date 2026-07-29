@@ -9,10 +9,13 @@ use super::input::TextInputMode;
 use super::keymap::{Generate, OpenBoards, ToggleGallery};
 use super::theme;
 use super::tooltip::{tip, tip_with_shortcut};
+use crate::model::BoardNode;
 use gpui::{
-    AnyElement, Context, Focusable, FontWeight, ObjectFit, Role, SharedString, StyledImage, Window,
-    div, img, prelude::*, px,
+    AnyElement, Context, Focusable, FontWeight, ObjectFit, Role, SharedString, StyledImage,
+    WeakEntity, Window, div, img, list, prelude::*, px,
 };
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub(super) struct Toast {
@@ -20,6 +23,133 @@ pub(super) struct Toast {
     pub(super) error: bool,
     pub(super) undo: Option<(String, String)>,
     pub(super) serial: u64,
+}
+
+struct GalleryRow {
+    node: BoardNode,
+    depth: usize,
+    thumbnails: Vec<PathBuf>,
+}
+
+fn render_gallery_row(row: &GalleryRow, view: WeakEntity<AppView>) -> AnyElement {
+    let node = &row.node;
+    let mut strip = div().flex_1().flex().flex_wrap().gap_2();
+    if node.images.is_empty() {
+        strip = strip.child(
+            div()
+                .h(px(96.))
+                .flex_1()
+                .rounded_lg()
+                .border_1()
+                .border_color(theme::line())
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_xs()
+                .text_color(theme::faint())
+                .child(status_label(node)),
+        );
+    } else {
+        for (index, (url, thumbnail)) in node.images.iter().zip(&row.thumbnails).enumerate() {
+            let node_id = node.id.clone();
+            let image_url = url.clone();
+            let image_view = view.clone();
+            strip = strip.child(
+                div()
+                    .relative()
+                    .child(
+                        img(thumbnail.clone())
+                            .id(SharedString::from(format!(
+                                "gallery-image-{}-{index}",
+                                node.id
+                            )))
+                            .role(Role::Button)
+                            .aria_label(format!(
+                                "Open image {} of {}",
+                                index + 1,
+                                node.images.len()
+                            ))
+                            .size(px(148.))
+                            .rounded_lg()
+                            .object_fit(ObjectFit::Cover)
+                            .cursor_pointer()
+                            .on_click(move |_, window, cx| {
+                                let _ = image_view.update(cx, |this, cx| {
+                                    this.open_lightbox(
+                                        node_id.clone(),
+                                        image_url.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            }),
+                    )
+                    .when(node.images.len() > 1, |cell| {
+                        cell.child(
+                            div()
+                                .absolute()
+                                .right_1()
+                                .bottom_1()
+                                .rounded_md()
+                                .bg(theme::background().opacity(0.78))
+                                .px_1()
+                                .text_xs()
+                                .text_color(theme::ink())
+                                .child(format!("{}/{}", index + 1, node.images.len())),
+                        )
+                    }),
+            );
+        }
+    }
+
+    let locate_id = node.id.clone();
+    let locate_view = view;
+    div()
+        .border_b_1()
+        .border_color(theme::line().opacity(0.7))
+        .py_4()
+        .flex()
+        .gap_5()
+        .child(
+            div()
+                .w(px(330.))
+                .pl(px(row.depth as f32 * 18.))
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(theme::ink())
+                        .child(node.prompt.clone()),
+                )
+                .child(
+                    div()
+                        .mt_1()
+                        .text_xs()
+                        .text_color(theme::faint())
+                        .child(format!(
+                            "{} · {} · {} branch depth",
+                            status_label(node),
+                            format_date(node.created_at),
+                            row.depth
+                        )),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!("locate-{}", node.id)))
+                        .mt_2()
+                        .text_xs()
+                        .text_color(theme::accent())
+                        .cursor_pointer()
+                        .hover(|style| style.text_color(theme::ink()))
+                        .child("◎ Show on canvas")
+                        .on_click(move |_, window, cx| {
+                            let _ = locate_view.update(cx, |this, cx| {
+                                this.locate_node(&locate_id, window, cx);
+                            });
+                        }),
+                ),
+        )
+        .child(strip)
+        .into_any_element()
 }
 
 impl AppView {
@@ -283,11 +413,12 @@ impl AppView {
                             }))
                             .when(armed, |button| button.bg(theme::danger().opacity(0.16)))
                             .child(if armed { "Sure?" } else { "Delete" })
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 if this.armed_board_delete.as_deref() == Some(&delete_id) {
                                     match this.engine.delete_board(&delete_id) {
                                         Ok(()) => {
+                                            this.clear_render_caches(window, cx);
                                             let next = this
                                                 .engine
                                                 .repository()
@@ -364,128 +495,35 @@ impl AppView {
             .map(|board| board.nodes.iter().map(|node| node.images.len()).sum())
             .unwrap_or(0);
         let node_count = board.map(|board| board.nodes.len()).unwrap_or(0);
-        let mut content = div()
-            .id("gallery-scroll")
-            .flex_1()
-            .overflow_y_scroll()
-            .px_6()
-            .pb_8();
-        if let Some(board) = board {
+        let rows = if let Some(board) = board {
             let depths = node_depths(board);
-            // Newest first, without cloning every node on each render pass.
             let mut nodes: Vec<_> = board.nodes.iter().collect();
             nodes.sort_by_key(|node| (std::cmp::Reverse(node.created_at), &node.id));
-            for node in nodes {
-                let depth = depths.get(&node.id).copied().unwrap_or(0);
-                let locate_id = node.id.clone();
-                let mut strip = div().flex_1().flex().flex_wrap().gap_2();
-                if node.images.is_empty() {
-                    strip = strip.child(
-                        div()
-                            .h(px(96.))
-                            .flex_1()
-                            .rounded_lg()
-                            .border_1()
-                            .border_color(theme::line())
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_xs()
-                            .text_color(theme::faint())
-                            .child(status_label(node)),
-                    );
-                } else {
-                    for (index, url) in node.images.iter().enumerate() {
-                        let node_id = node.id.clone();
-                        let image_url = url.clone();
-                        strip = strip.child(
-                            div()
-                                .relative()
-                                .child(
-                                    img(self.display_image_path(url, false))
-                                        .id(SharedString::from(format!(
-                                            "gallery-image-{}-{index}",
-                                            node.id
-                                        )))
-                                        .role(Role::Button)
-                                        .aria_label(format!(
-                                            "Open image {} of {}",
-                                            index + 1,
-                                            node.images.len()
-                                        ))
-                                        .size(px(148.))
-                                        .rounded_lg()
-                                        .object_fit(ObjectFit::Cover)
-                                        .cursor_pointer()
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.open_lightbox(
-                                                node_id.clone(),
-                                                image_url.clone(),
-                                                window,
-                                                cx,
-                                            );
-                                        })),
-                                )
-                                .when(node.images.len() > 1, |cell| {
-                                    cell.child(
-                                        div()
-                                            .absolute()
-                                            .right_1()
-                                            .bottom_1()
-                                            .rounded_md()
-                                            .bg(theme::background().opacity(0.78))
-                                            .px_1()
-                                            .text_xs()
-                                            .text_color(theme::ink())
-                                            .child(format!("{}/{}", index + 1, node.images.len())),
-                                    )
-                                }),
-                        );
-                    }
-                }
-                content = content.child(
-                    div()
-                        .border_b_1()
-                        .border_color(theme::line().opacity(0.7))
-                        .py_4()
-                        .flex()
-                        .gap_5()
-                        .child(
-                            div()
-                                .w(px(330.))
-                                .pl(px(depth as f32 * 18.))
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(theme::ink())
-                                        .child(node.prompt.clone()),
-                                )
-                                .child(div().mt_1().text_xs().text_color(theme::faint()).child(
-                                    format!(
-                                        "{} · {} · {} branch depth",
-                                        status_label(node),
-                                        format_date(node.created_at),
-                                        depth
-                                    ),
-                                ))
-                                .child(
-                                    div()
-                                        .id(SharedString::from(format!("locate-{}", locate_id)))
-                                        .mt_2()
-                                        .text_xs()
-                                        .text_color(theme::accent())
-                                        .cursor_pointer()
-                                        .hover(|style| style.text_color(theme::ink()))
-                                        .child("◎ Show on canvas")
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.locate_node(&locate_id, window, cx);
-                                        })),
-                                ),
-                        )
-                        .child(strip),
-                );
-            }
-        }
+            nodes
+                .into_iter()
+                .map(|node| GalleryRow {
+                    depth: depths.get(&node.id).copied().unwrap_or(0),
+                    thumbnails: node
+                        .images
+                        .iter()
+                        .map(|url| self.display_image_path(url, false))
+                        .collect(),
+                    node: node.clone(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let rows = Arc::new(rows);
+        let rows_for_list = rows.clone();
+        let view = cx.weak_entity();
+        let content = div().flex_1().min_h_0().px_6().pb_8().child(
+            list(
+                self.gallery_list_state.clone(),
+                move |index, _window, _cx| render_gallery_row(&rows_for_list[index], view.clone()),
+            )
+            .size_full(),
+        );
         div()
             .id("gallery")
             .role(Role::Dialog)

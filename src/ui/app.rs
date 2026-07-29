@@ -8,6 +8,9 @@ use super::card::{
 };
 use super::composer::ComposerTarget;
 use super::format::read_image_ratio;
+use super::image_cache::{
+    CARD_SPRITE_CACHE_BUDGET, CardSpriteCache, DECODED_IMAGE_CACHE_BUDGET, DecodedImageCache,
+};
 use super::input::TextInput;
 use super::keymap::{Escape, Generate, Quit, bind_keys, configure_menus};
 use super::lightbox::Lightbox;
@@ -20,9 +23,9 @@ use crate::model::{Board, BoardNode};
 use crate::storage::{RepositoryEvent, create_thumbnail, thumbnail_path_for};
 use anyhow::{Context as _, Result};
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, ExternalPaths, FocusHandle, Focusable, MouseButton,
-    Render, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions, div, point,
-    prelude::*, px, size,
+    App, AppContext, Bounds, Context, Entity, ExternalPaths, FocusHandle, Focusable, ListAlignment,
+    ListState, MouseButton, Render, SharedString, TitlebarOptions, Window, WindowBounds,
+    WindowOptions, div, point, prelude::*, px, size,
 };
 use gpui_platform::application;
 use std::collections::{HashMap, HashSet};
@@ -82,6 +85,9 @@ pub(super) struct AppView {
     pub(super) prompt_lines: HashMap<String, Vec<SharedString>>,
     pub(super) output_layouts: HashMap<String, OutputLayout>,
     pub(super) canvas_nodes: Arc<Vec<Arc<CanvasNode>>>,
+    pub(super) image_cache: Entity<DecodedImageCache>,
+    pub(super) sprite_cache: Entity<CardSpriteCache>,
+    pub(super) gallery_list_state: ListState,
     pub(super) image_ratios: HashMap<String, f32>,
     pub(super) image_assets: HashMap<String, ImageAsset>,
     pending_image_jobs: HashSet<String>,
@@ -161,6 +167,8 @@ impl AppView {
         let prompt = cx.new(|cx| TextInput::auto_growing("Describe the image you want…", 7, cx));
         let modal_input = cx.new(|cx| TextInput::single_line("Type here…", cx));
         let search_input = cx.new(|cx| TextInput::single_line("Search boards…", cx));
+        let image_cache = cx.new(|cx| DecodedImageCache::new(DECODED_IMAGE_CACHE_BUDGET, cx));
+        let sprite_cache = cx.new(|cx| CardSpriteCache::new(CARD_SPRITE_CACHE_BUDGET, cx));
         cx.subscribe(&prompt, |this, _, event, cx| {
             this.handle_input_event(event, cx)
         })
@@ -171,6 +179,11 @@ impl AppView {
         let board = board_id
             .as_deref()
             .and_then(|id| engine.repository().board(id));
+        let gallery_list_state = ListState::new(
+            board.as_ref().map_or(0, |board| board.nodes.len()),
+            ListAlignment::Top,
+            px(600.),
+        );
         let mut view = Self {
             engine,
             receiver,
@@ -198,6 +211,9 @@ impl AppView {
             prompt_lines: HashMap::new(),
             output_layouts: HashMap::new(),
             canvas_nodes: Arc::new(Vec::new()),
+            image_cache,
+            sprite_cache,
+            gallery_list_state,
             image_ratios: HashMap::new(),
             image_assets: HashMap::new(),
             pending_image_jobs: HashSet::new(),
@@ -221,19 +237,27 @@ impl AppView {
             }
         })
         .detach();
+        // While a generation runs the canvas animates (shimmer over the media
+        // area), so repaint at animation rate; otherwise idle at a slow poll
+        // that exists only to pick up newly started work.
         cx.spawn(async move |weak, cx| {
+            let mut interval = Duration::from_millis(250);
             loop {
-                cx.background_executor().timer(Duration::from_secs(1)).await;
-                if weak
-                    .update(cx, |view, cx| {
-                        if view.engine.active_count() > 0 {
-                            cx.notify();
-                        }
-                    })
-                    .is_err()
-                {
+                cx.background_executor().timer(interval).await;
+                let Ok(active) = weak.update(cx, |view, cx| {
+                    let active = view.engine.active_count() > 0;
+                    if active {
+                        cx.notify();
+                    }
+                    active
+                }) else {
                     break;
-                }
+                };
+                interval = if active {
+                    Duration::from_millis(33)
+                } else {
+                    Duration::from_millis(250)
+                };
             }
         })
         .detach();
@@ -261,6 +285,12 @@ impl AppView {
     /// are all unchanged are carried over wholesale, so a single finished
     /// generation no longer re-wraps every prompt or re-encodes every sprite.
     pub(super) fn refresh_layout(&mut self) {
+        let node_count = self.board.as_ref().map_or(0, |board| board.nodes.len());
+        if self.gallery_list_state.item_count() == node_count {
+            self.gallery_list_state.remeasure();
+        } else {
+            self.gallery_list_state.reset(node_count);
+        }
         let previous = std::mem::take(&mut self.canvas_nodes);
         let cached: HashMap<&str, &Arc<CanvasNode>> = previous
             .iter()
@@ -535,6 +565,7 @@ impl AppView {
     }
 
     pub(super) fn open_board(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_render_caches(window, cx);
         self.board_id = Some(id.clone());
         self.board = self.engine.repository().board(&id);
         self.overlay = Overlay::None;
@@ -548,6 +579,13 @@ impl AppView {
         self.refresh_layout();
         window.focus(&self.focus, cx);
         cx.notify();
+    }
+
+    pub(super) fn clear_render_caches(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.image_cache
+            .update(cx, |cache, cx| cache.clear(window, cx));
+        self.sprite_cache
+            .update(cx, |cache, cx| cache.clear(window, cx));
     }
 
     /// Enter submits whichever surface is open: the lightbox's quick-continue
@@ -629,8 +667,10 @@ impl Render for AppView {
             .board
             .as_ref()
             .is_none_or(|board| board.nodes.is_empty());
+        let overlay_covers_canvas = matches!(self.overlay, Overlay::Gallery | Overlay::Lightbox(_));
         let mut root = div()
             .key_context("CodexImage")
+            .image_cache(self.image_cache.clone())
             .track_focus(&self.focus)
             .size_full()
             .overflow_hidden()
@@ -667,16 +707,18 @@ impl Render for AppView {
                 cx.notify();
             }));
 
-        if !empty {
-            root = root.child(self.render_canvas(window, cx));
-        } else {
-            root = root.child(self.render_empty(window, cx));
+        if !overlay_covers_canvas {
+            if !empty {
+                root = root.child(self.render_canvas(window, cx));
+            } else {
+                root = root.child(self.render_empty(window, cx));
+            }
+            root = root.child(self.render_header(cx));
+            if let Some(button) = self.render_gallery_button(cx) {
+                root = root.child(button);
+            }
+            root = root.child(self.render_composer(window, cx));
         }
-        root = root.child(self.render_header(cx));
-        if let Some(button) = self.render_gallery_button(cx) {
-            root = root.child(button);
-        }
-        root = root.child(self.render_composer(window, cx));
         root = match &self.overlay {
             Overlay::None => root,
             Overlay::Boards => root.child(self.render_boards(window, cx)),

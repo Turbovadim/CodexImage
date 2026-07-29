@@ -312,6 +312,8 @@ impl AppView {
             })
             .collect();
         let canvas_nodes = self.canvas_nodes.clone();
+        let image_cache = self.image_cache.clone();
+        let sprite_cache = self.sprite_cache.clone();
         let zoom = self.zoom;
         let camera_x = self.camera_x;
         let camera_y = self.camera_y;
@@ -322,7 +324,15 @@ impl AppView {
                 paint_connectors(&edge_points, zoom, window);
                 for frame in &visible_nodes {
                     if let Some(node) = canvas_nodes.get(frame.node_index) {
-                        paint_canvas_node(frame, node, zoom, window, cx);
+                        paint_canvas_node(
+                            frame,
+                            node,
+                            zoom,
+                            &image_cache,
+                            &sprite_cache,
+                            window,
+                            cx,
+                        );
                     }
                 }
                 if let Some(buttons) = &toolbar_buttons {
