@@ -8,6 +8,8 @@ mod card_svg;
 mod composer;
 mod format;
 mod image_cache;
+#[cfg(target_os = "macos")]
+mod imageio;
 mod input;
 mod input_actions;
 mod input_element;

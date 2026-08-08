@@ -49,13 +49,28 @@ impl Asset for CappedImageLoader {
         source: Self::Source,
         cx: &mut App,
     ) -> impl Future<Output = Self::Output> + Send + 'static {
-        let load = ImgResourceLoader::load(source.resource, cx);
+        let load = ImgResourceLoader::load(source.resource.clone(), cx);
         async move {
-            let image = load.await?;
-            Ok(match source.max_dimension {
-                Some(max_dimension) => downscale_to_fit(image, max_dimension),
-                None => image,
-            })
+            match load.await {
+                Ok(image) => Ok(match source.max_dimension {
+                    Some(max_dimension) => downscale_to_fit(image, max_dimension),
+                    None => image,
+                }),
+                // The pure-Rust decoders measure faster than ImageIO for every
+                // format they support, so ImageIO only rescues the ones they
+                // lack entirely (HEIC photo attachments, most notably).
+                Err(error) => {
+                    #[cfg(target_os = "macos")]
+                    if let Resource::Path(path) = &source.resource
+                        && let Ok(bytes) = std::fs::read(path)
+                        && let Some(image) =
+                            super::imageio::decode_render_image(&bytes, source.max_dimension)
+                    {
+                        return Ok(Arc::new(image));
+                    }
+                    Err(error)
+                }
+            }
         }
     }
 }
