@@ -8,6 +8,7 @@ use super::input::TextInputMode;
 use super::keymap::{
     BranchHovered, DeleteHovered, DuplicateHovered, EditHovered, RegenerateHovered,
 };
+use crate::layout::{ESTIMATED_CARD_HEIGHT, free_spot_near};
 use crate::model::NewNodesRequest;
 use anyhow::Result;
 use gpui::{Context, Focusable, Window};
@@ -128,6 +129,24 @@ impl AppView {
 
     pub(super) fn duplicate_node(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(node) = self.node(id) else { return };
+        // Pin the copy to the nearest free column beside the original; left to
+        // the tree layout it would land at the far end of the sibling row.
+        let position = self.current_position(id).map(|anchor| {
+            let occupied = self
+                .layout
+                .iter()
+                .map(|(id, position)| {
+                    let height = self
+                        .heights
+                        .get(id)
+                        .copied()
+                        .unwrap_or(ESTIMATED_CARD_HEIGHT);
+                    (*position, height)
+                })
+                .collect::<Vec<_>>();
+            let spot = free_spot_near(anchor, self.card_height(&node), &occupied);
+            (spot.x, spot.y)
+        });
         let request = NewNodesRequest {
             prompt: node.prompt,
             parent_id: node.parent_id,
@@ -136,6 +155,7 @@ impl AppView {
             count: 1,
             attachment_paths: Vec::new(),
             attachment_urls: node.attachments,
+            position,
         };
         self.on_board(cx, |this, board_id| {
             this.engine.add_and_start(board_id, request).map(|_| ())

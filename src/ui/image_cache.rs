@@ -6,20 +6,90 @@
 //! buffers and GPU atlas entries when the decoded-byte budget is exceeded.
 
 use gpui::{
-    App, Context, Image, ImageCache, ImageCacheError, ImageCacheItem, ImgResourceLoader,
+    App, Asset, Context, Image, ImageCache, ImageCacheError, ImageCacheItem, ImgResourceLoader,
     RenderImage, Resource, Task, WeakEntity, Window,
 };
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::hash::Hash;
 use std::sync::Arc;
 
 // Each decoded buffer normally also has a BGRA copy in the Metal atlas. Keep
 // the CPU-side limits low enough that the combined unified-memory footprint
-// remains well below one gigabyte.
-pub const DECODED_IMAGE_CACHE_BUDGET: usize = 192 * 1024 * 1024;
+// remains well below half a gigabyte.
+pub const DECODED_IMAGE_CACHE_BUDGET: usize = 96 * 1024 * 1024;
 const DECODED_IMAGE_CACHE_MAX_ITEMS: usize = 1_024;
-pub const CARD_SPRITE_CACHE_BUDGET: usize = 32 * 1024 * 1024;
+pub const CARD_SPRITE_CACHE_BUDGET: usize = 16 * 1024 * 1024;
 const CARD_SPRITE_CACHE_MAX_ITEMS: usize = 1_024;
+
+/// The default decode resolution. Sized for the most demanding capped
+/// consumer: a full-card image at the canvas's maximum zoom (2x) on a retina
+/// display. Only the lightbox, zoomed past this, requests the native pixels.
+pub const DECODED_LONG_EDGE_CAP: u32 = 2048;
+
+/// One cache entry per (file, resolution tier). Both tiers of the same file
+/// can coexist while a zoomed lightbox sharpens on top of the capped decode.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct DecodeKey {
+    resource: Resource,
+    max_dimension: Option<u32>,
+}
+
+/// GPUI's stock loader decodes files at native size. This wrapper downscales
+/// oversized decodes so a huge attachment costs display-sized memory instead
+/// of native-sized memory. The full decode still exists transiently, but only
+/// the capped copy is cached and uploaded to the Metal atlas.
+enum CappedImageLoader {}
+
+impl Asset for CappedImageLoader {
+    type Source = DecodeKey;
+    type Output = Result<Arc<RenderImage>, ImageCacheError>;
+
+    fn load(
+        source: Self::Source,
+        cx: &mut App,
+    ) -> impl Future<Output = Self::Output> + Send + 'static {
+        let load = ImgResourceLoader::load(source.resource, cx);
+        async move {
+            let image = load.await?;
+            Ok(match source.max_dimension {
+                Some(max_dimension) => downscale_to_fit(image, max_dimension),
+                None => image,
+            })
+        }
+    }
+}
+
+/// Returns the image unchanged when its long edge already fits within `max`;
+/// otherwise resizes the frame down to it. Animations pass through untouched
+/// because per-frame delays are not reachable through `RenderImage`.
+fn downscale_to_fit(image: Arc<RenderImage>, max: u32) -> Arc<RenderImage> {
+    if image.frame_count() != 1 {
+        return image;
+    }
+    let size = image.size(0);
+    let (width, height) = (size.width.0 as u32, size.height.0 as u32);
+    if width == 0 || height == 0 || width.max(height) <= max {
+        return image;
+    }
+    let Some(buffer) = image
+        .as_bytes(0)
+        .and_then(|bytes| image::RgbaImage::from_raw(width, height, bytes.to_vec()))
+    else {
+        return image;
+    };
+    let scale = max as f32 / width.max(height) as f32;
+    let scaled_width = ((width as f32 * scale).round() as u32).max(1);
+    let scaled_height = ((height as f32 * scale).round() as u32).max(1);
+    // The BGRA channel order survives resizing: every filter works per channel.
+    let resized = image::imageops::resize(
+        &buffer,
+        scaled_width,
+        scaled_height,
+        image::imageops::FilterType::CatmullRom,
+    );
+    Arc::new(RenderImage::new(vec![image::Frame::new(resized)]))
+}
 
 struct CacheEntry {
     image: ImageCacheItem,
@@ -88,15 +158,15 @@ impl<K: Clone + Eq + Hash> EvictionCycle<K> {
 }
 
 pub(super) struct DecodedImageCache {
-    entries: HashMap<Resource, CacheEntry>,
+    entries: HashMap<DecodeKey, CacheEntry>,
     /// Tiny pre-blurred copies of decoded images, shown for in-progress
     /// generations. Each one lives and dies with its base entry.
-    blurred: HashMap<Resource, Arc<RenderImage>>,
+    blurred: HashMap<DecodeKey, Arc<RenderImage>>,
     decoded_bytes: usize,
     byte_budget: usize,
     max_items: usize,
     clock: u64,
-    eviction: EvictionCycle<Resource>,
+    eviction: EvictionCycle<DecodeKey>,
     weak_self: WeakEntity<Self>,
 }
 
@@ -119,21 +189,57 @@ impl DecodedImageCache {
         }
     }
 
+    /// Loads the display-capped decode of an image. This is the tier every
+    /// canvas and element consumer uses.
     pub fn load(
         &mut self,
         resource: &Resource,
         window: &mut Window,
         cx: &mut App,
     ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
-        self.eviction.record(resource.clone());
+        self.load_key(
+            DecodeKey {
+                resource: resource.clone(),
+                max_dimension: Some(DECODED_LONG_EDGE_CAP),
+            },
+            window,
+            cx,
+        )
+    }
+
+    /// Loads the native-resolution decode. Only the lightbox asks for this,
+    /// and only once its zoom outgrows the capped tier.
+    pub fn load_full(
+        &mut self,
+        resource: &Resource,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
+        self.load_key(
+            DecodeKey {
+                resource: resource.clone(),
+                max_dimension: None,
+            },
+            window,
+            cx,
+        )
+    }
+
+    fn load_key(
+        &mut self,
+        key: DecodeKey,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
+        self.eviction.record(key.clone());
         self.clock = self.clock.wrapping_add(1);
         let last_used = self.clock;
 
-        if self.entries.contains_key(resource) {
+        if self.entries.contains_key(&key) {
             let (result, added_bytes) = {
                 let entry = self
                     .entries
-                    .get_mut(resource)
+                    .get_mut(&key)
                     .expect("the cache entry was just found");
                 entry.last_used = last_used;
                 let was_loading = matches!(entry.image, ImageCacheItem::Loading(_));
@@ -153,11 +259,11 @@ impl DecodedImageCache {
                 (result, added_bytes)
             };
             self.decoded_bytes = self.decoded_bytes.saturating_add(added_bytes);
-            self.schedule_eviction(resource, added_bytes > 0, window);
+            self.schedule_eviction(&key, added_bytes > 0, window);
             return result;
         }
 
-        let (task, _) = cx.fetch_asset::<ImgResourceLoader>(resource);
+        let (task, _) = cx.fetch_asset::<CappedImageLoader>(&key);
         let entity = window.current_view();
         let notification_task = task.clone();
         let notification = window.spawn(cx, async move |cx| {
@@ -167,7 +273,7 @@ impl DecodedImageCache {
             });
         });
         self.entries.insert(
-            resource.clone(),
+            key.clone(),
             CacheEntry {
                 image: ImageCacheItem::Loading(task.clone()),
                 decoded_bytes: 0,
@@ -175,7 +281,7 @@ impl DecodedImageCache {
                 _notification: notification,
             },
         );
-        self.schedule_eviction(resource, true, window);
+        self.schedule_eviction(&key, true, window);
         None
     }
 
@@ -189,31 +295,37 @@ impl DecodedImageCache {
         cx: &mut App,
     ) -> Option<Arc<RenderImage>> {
         let base = self.load(resource, window, cx)?.ok()?;
-        if let Some(blurred) = self.blurred.get(resource) {
+        let key = DecodeKey {
+            resource: resource.clone(),
+            max_dimension: Some(DECODED_LONG_EDGE_CAP),
+        };
+        if let Some(blurred) = self.blurred.get(&key) {
             return Some(blurred.clone());
         }
         let blurred = Arc::new(blur_render_image(&base)?);
-        self.blurred.insert(resource.clone(), blurred.clone());
+        self.decoded_bytes = self
+            .decoded_bytes
+            .saturating_add(decoded_image_bytes(&blurred));
+        self.blurred.insert(key, blurred.clone());
         Some(blurred)
     }
 
-    pub fn clear(&mut self, window: &mut Window, cx: &mut App) {
-        self.release_all(Some(window), cx);
+    /// Releases everything, returning whether anything was held. Freeing every
+    /// entry at once also lets the Metal atlas drop all of its image textures,
+    /// which individual LRU evictions cannot: a texture survives until its
+    /// last tile dies, so scattered survivors pin whole textures.
+    pub fn clear(&mut self, window: &mut Window, cx: &mut App) -> bool {
+        self.release_all(Some(window), cx)
     }
 
     fn over_limit(&self) -> bool {
         self.decoded_bytes > self.byte_budget || self.entries.len() > self.max_items
     }
 
-    fn schedule_eviction(
-        &mut self,
-        resource: &Resource,
-        capacity_changed: bool,
-        window: &mut Window,
-    ) {
+    fn schedule_eviction(&mut self, key: &DecodeKey, capacity_changed: bool, window: &mut Window) {
         if !self
             .eviction
-            .should_start(self.over_limit(), resource, capacity_changed)
+            .should_start(self.over_limit(), key, capacity_changed)
         {
             return;
         }
@@ -249,7 +361,7 @@ impl DecodedImageCache {
 
     fn evict_to_limits(
         &mut self,
-        protected: &HashSet<Resource>,
+        protected: &HashSet<DecodeKey>,
         window: &mut Window,
         cx: &mut App,
     ) -> bool {
@@ -258,9 +370,9 @@ impl DecodedImageCache {
             let oldest = self
                 .entries
                 .iter()
-                .filter(|(resource, _)| !protected.contains(*resource))
+                .filter(|(key, _)| !protected.contains(*key))
                 .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(resource, _)| resource.clone());
+                .map(|(key, _)| key.clone());
             let Some(oldest) = oldest else {
                 // A single image can be larger than the budget. Keep it because
                 // refusing to cache it would start a new decode on every frame.
@@ -272,34 +384,39 @@ impl DecodedImageCache {
         evicted
     }
 
-    fn release(&mut self, resource: &Resource, mut window: Option<&mut Window>, cx: &mut App) {
-        if let Some(blurred) = self.blurred.remove(resource) {
+    fn release(&mut self, key: &DecodeKey, mut window: Option<&mut Window>, cx: &mut App) {
+        if let Some(blurred) = self.blurred.remove(key) {
+            self.decoded_bytes = self
+                .decoded_bytes
+                .saturating_sub(decoded_image_bytes(&blurred));
             cx.drop_image(blurred, window.as_deref_mut());
         }
-        let Some(mut entry) = self.entries.remove(resource) else {
+        let Some(mut entry) = self.entries.remove(key) else {
             return;
         };
         self.decoded_bytes = self.decoded_bytes.saturating_sub(entry.decoded_bytes);
-        cx.remove_asset::<ImgResourceLoader>(resource);
+        cx.remove_asset::<CappedImageLoader>(key);
         if let Some(Ok(image)) = entry.image.get() {
             cx.drop_image(image, window);
         }
     }
 
-    fn release_all(&mut self, mut window: Option<&mut Window>, cx: &mut App) {
+    fn release_all(&mut self, mut window: Option<&mut Window>, cx: &mut App) -> bool {
         let entries = std::mem::take(&mut self.entries);
         let blurred = std::mem::take(&mut self.blurred);
+        let released = !entries.is_empty() || !blurred.is_empty();
         self.decoded_bytes = 0;
         self.eviction.cancel();
         for (_, image) in blurred {
             cx.drop_image(image, window.as_deref_mut());
         }
-        for (resource, mut entry) in entries {
-            cx.remove_asset::<ImgResourceLoader>(&resource);
+        for (key, mut entry) in entries {
+            cx.remove_asset::<CappedImageLoader>(&key);
             if let Some(Ok(image)) = entry.image.get() {
                 cx.drop_image(image, window.as_deref_mut());
             }
         }
+        released
     }
 }
 
@@ -309,8 +426,13 @@ impl DecodedImageCache {
 /// because every step works per channel.
 fn blur_render_image(image: &RenderImage) -> Option<RenderImage> {
     const SMALL_MAX_DIMENSION: u32 = 24;
-    const SMOOTH_UPSCALE: u32 = 4;
+    const SMOOTH_UPSCALE: u32 = 8;
     const BLUR_SIGMA: f32 = 2.5;
+    // Applied after upscaling: wide enough (relative to SMOOTH_UPSCALE) to
+    // erase the piecewise-linear facets interpolation leaves behind, which
+    // otherwise read as blocky squares once the GPU magnifies the stand-in
+    // to card size.
+    const SMOOTH_SIGMA: f32 = 12.0;
 
     let size = image.size(0);
     let (width, height) = (size.width.0 as u32, size.height.0 as u32);
@@ -322,13 +444,14 @@ fn blur_render_image(image: &RenderImage) -> Option<RenderImage> {
     let small_width = ((width as f32 * scale).round() as u32).max(1);
     let small_height = ((height as f32 * scale).round() as u32).max(1);
     let small = image::imageops::thumbnail(&buffer, small_width, small_height);
-    let blurred = image::imageops::blur(&small, BLUR_SIGMA);
-    let smooth = image::imageops::resize(
+    let blurred = image::imageops::fast_blur(&small, BLUR_SIGMA);
+    let upscaled = image::imageops::resize(
         &blurred,
         small_width * SMOOTH_UPSCALE,
         small_height * SMOOTH_UPSCALE,
         image::imageops::FilterType::Triangle,
     );
+    let smooth = image::imageops::fast_blur(&upscaled, SMOOTH_SIGMA);
     Some(RenderImage::new(vec![image::Frame::new(smooth)]))
 }
 
@@ -532,8 +655,30 @@ fn decoded_image_bytes(image: &RenderImage) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{EvictionCycle, decoded_image_bytes};
+    use super::{EvictionCycle, decoded_image_bytes, downscale_to_fit};
     use gpui::RenderImage;
+    use std::sync::Arc;
+
+    #[test]
+    fn oversized_decodes_shrink_to_the_cap_and_small_ones_pass_through() {
+        let large = Arc::new(RenderImage::new(vec![image::Frame::new(
+            image::RgbaImage::new(4000, 1000),
+        )]));
+        let capped = downscale_to_fit(large, 2048);
+        let size = capped.size(0);
+        assert_eq!((size.width.0, size.height.0), (2048, 512));
+
+        let small = Arc::new(RenderImage::new(vec![image::Frame::new(
+            image::RgbaImage::new(720, 480),
+        )]));
+        let untouched = downscale_to_fit(small.clone(), 2048);
+        assert_eq!(untouched.id, small.id);
+
+        let frame = image::Frame::new(image::RgbaImage::new(4000, 1000));
+        let animated = Arc::new(RenderImage::new(vec![frame.clone(), frame]));
+        let untouched = downscale_to_fit(animated.clone(), 2048);
+        assert_eq!(untouched.id, animated.id);
+    }
 
     #[test]
     fn decoded_size_includes_every_animation_frame() {

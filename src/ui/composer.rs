@@ -173,6 +173,7 @@ impl AppView {
             count: self.count,
             attachment_paths: self.attachments.clone(),
             attachment_urls: Vec::new(),
+            position: None,
         };
         match self.engine.add_and_start(&board_id, request) {
             Ok(_) => {

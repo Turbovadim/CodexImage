@@ -316,8 +316,8 @@ impl Repository {
                 status: NodeStatus::Running,
                 error: None,
                 stop_reason: None,
-                x: None,
-                y: None,
+                x: request.position.map(|(x, _)| x + 32.0 * index as f32),
+                y: request.position.map(|(_, y)| y + 32.0 * index as f32),
                 created_at: run_started_at + index as i64,
                 run_started_at: Some(run_started_at),
                 finished_at: None,
@@ -365,14 +365,23 @@ impl Repository {
         })
     }
 
-    pub fn move_node(&self, board_id: &str, node_id: &str, x: f32, y: f32) -> Result<BoardNode> {
-        if !x.is_finite() || !y.is_finite() {
+    pub fn move_nodes(&self, board_id: &str, positions: &[(String, f32, f32)]) -> Result<()> {
+        if positions
+            .iter()
+            .any(|(_, x, y)| !x.is_finite() || !y.is_finite())
+        {
             bail!("invalid node position");
         }
-        self.update_node(board_id, node_id, |node| {
-            node.x = Some(x);
-            node.y = Some(y);
-        })
+        let mut state = self.inner.write();
+        let board = board_mut(&mut state, board_id)?;
+        for (id, x, y) in positions {
+            if let Some(node) = board.nodes.iter_mut().find(|node| &node.id == id) {
+                node.x = Some(*x);
+                node.y = Some(*y);
+            }
+        }
+        drop(state);
+        self.persist_and_notify()
     }
 
     pub fn update_node(

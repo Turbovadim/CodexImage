@@ -6,6 +6,7 @@ use super::app::Overlay;
 use super::canvas_view::DragState;
 use super::composer::control_button;
 use super::format::image_format_for_path;
+use super::image_cache::DECODED_LONG_EDGE_CAP;
 use super::input::TextInputMode;
 use super::keymap::{Generate, LightboxDown, LightboxLeft, LightboxRight, LightboxUp};
 use super::theme;
@@ -497,6 +498,7 @@ impl AppView {
             count: 1,
             attachment_paths: Vec::new(),
             attachment_urls: Vec::new(),
+            position: None,
         };
         match self
             .board_id()
@@ -522,11 +524,35 @@ impl AppView {
         let path = self.display_image_path(&lightbox.image, true);
         let thumbnail_path = self.display_image_path(&lightbox.image, false);
         let resource = Resource::Path(Arc::from(path.clone()));
-        let display_image = match self
+        let viewport_width = f32::from(window.viewport_size().width);
+        let viewport_height = f32::from(window.viewport_size().height);
+        let image_ratio = normalized_image_ratio(
+            self.image_ratios
+                .get(&lightbox.image)
+                .copied()
+                .unwrap_or(1.),
+        );
+        let (fit_width, fit_height) =
+            fitted_image_size(viewport_width, viewport_height, image_ratio);
+        let image_width = fit_width * lightbox.zoom;
+        let image_height = fit_height * lightbox.zoom;
+        // Past this displayed size the capped decode would look soft, so ask
+        // for the native pixels. The capped decode (or the thumbnail) stays on
+        // screen until the sharper tier finishes loading.
+        let wants_native = image_width.max(image_height) * window.scale_factor()
+            > DECODED_LONG_EDGE_CAP as f32;
+        let native = wants_native
+            .then(|| {
+                self.image_cache
+                    .update(cx, |cache, cx| cache.load_full(&resource, window, cx))
+            })
+            .flatten();
+        let capped = self
             .image_cache
-            .update(cx, |cache, cx| cache.load(&resource, window, cx))
-        {
-            Some(Ok(image)) if image.frame_count() > 0 => img(image),
+            .update(cx, |cache, cx| cache.load(&resource, window, cx));
+        let display_image = match (native, capped) {
+            (Some(Ok(image)), _) if image.frame_count() > 0 => img(image),
+            (_, Some(Ok(image))) if image.frame_count() > 0 => img(image),
             _ => img(thumbnail_path),
         };
         let node = self.node(&lightbox.node_id);
@@ -545,18 +571,6 @@ impl AppView {
         let branch_node = lightbox.node_id.clone();
         let branch_image = lightbox.image.clone();
         let locate_node = lightbox.node_id.clone();
-        let viewport_width = f32::from(window.viewport_size().width);
-        let viewport_height = f32::from(window.viewport_size().height);
-        let image_ratio = normalized_image_ratio(
-            self.image_ratios
-                .get(&lightbox.image)
-                .copied()
-                .unwrap_or(1.),
-        );
-        let (fit_width, fit_height) =
-            fitted_image_size(viewport_width, viewport_height, image_ratio);
-        let image_width = fit_width * lightbox.zoom;
-        let image_height = fit_height * lightbox.zoom;
         let (pan_x, pan_y) = lightbox.clamped_pan(viewport_width, viewport_height, image_ratio);
         let image_left = (viewport_width - image_width) / 2. + pan_x;
         let image_top = (viewport_height - image_height) / 2. + pan_y;

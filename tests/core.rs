@@ -74,6 +74,7 @@ fn repository_persists_and_restores_deleted_subtrees() {
                 count: 1,
                 attachment_paths: vec![],
                 attachment_urls: vec![],
+                position: None,
             },
         )
         .unwrap()
@@ -89,6 +90,7 @@ fn repository_persists_and_restores_deleted_subtrees() {
                 count: 1,
                 attachment_paths: vec![],
                 attachment_urls: vec![],
+                position: None,
             },
         )
         .unwrap()

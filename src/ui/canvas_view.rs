@@ -903,19 +903,34 @@ impl AppView {
         if let Some(DragState::Node { id, .. }) = drag {
             if let Some(position) = self.transient_positions.remove(&id) {
                 self.on_board(cx, |this, board_id| {
-                    this.engine
-                        .repository()
-                        .move_node(board_id, &id, position.x, position.y)?;
-                    // The repository confirms the move through an async event a
-                    // few frames from now; apply it to the local copy too so the
-                    // card never falls back to its pre-drag layout slot.
-                    if let Some(node) = this
+                    // Pin every still-automatic card where it stands, not just
+                    // the dragged one. Otherwise the tree layout re-centres the
+                    // remaining cards and they flow into the space the user
+                    // just cleared.
+                    let mut positions: Vec<(String, f32, f32)> = this
                         .board
-                        .as_mut()
-                        .and_then(|board| board.nodes.iter_mut().find(|node| node.id == id))
-                    {
-                        node.x = Some(position.x);
-                        node.y = Some(position.y);
+                        .iter()
+                        .flat_map(|board| &board.nodes)
+                        .filter(|node| node.id != id && (node.x.is_none() || node.y.is_none()))
+                        .filter_map(|node| {
+                            let current = this.layout.get(&node.id)?;
+                            Some((node.id.clone(), current.x, current.y))
+                        })
+                        .collect();
+                    positions.push((id.clone(), position.x, position.y));
+                    this.engine.repository().move_nodes(board_id, &positions)?;
+                    // The repository confirms the move through an async event a
+                    // few frames from now; apply it to the local copy too so no
+                    // card falls back to its pre-drag layout slot.
+                    if let Some(board) = &mut this.board {
+                        for (id, x, y) in &positions {
+                            if let Some(node) =
+                                board.nodes.iter_mut().find(|node| &node.id == id)
+                            {
+                                node.x = Some(*x);
+                                node.y = Some(*y);
+                            }
+                        }
                     }
                     this.refresh_layout();
                     Ok(())

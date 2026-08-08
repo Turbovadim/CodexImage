@@ -170,6 +170,23 @@ impl AppView {
         let search_input = cx.new(|cx| TextInput::single_line("Search boards…", cx));
         let image_cache = cx.new(|cx| DecodedImageCache::new(DECODED_IMAGE_CACHE_BUDGET, cx));
         let sprite_cache = cx.new(|cx| CardSpriteCache::new(CARD_SPRITE_CACHE_BUDGET, cx));
+        // Drop every decoded image when the window deactivates. This is what
+        // actually defragments the Metal atlas: LRU eviction leaves survivors
+        // scattered across 4 MB textures, while a full clear lets the atlas
+        // free them all and repack densely when the visible set re-decodes on
+        // return. Card sprites stay cached, so the canvas repaints instantly.
+        cx.observe_window_activation(window, |view, window, cx| {
+            if window.is_window_active() {
+                return;
+            }
+            let released = view
+                .image_cache
+                .update(cx, |cache, cx| cache.clear(window, cx));
+            if released {
+                window.refresh();
+            }
+        })
+        .detach();
         cx.subscribe(&prompt, |this, _, event, cx| {
             this.handle_input_event(event, cx)
         })

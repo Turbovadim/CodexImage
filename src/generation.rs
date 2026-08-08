@@ -811,6 +811,7 @@ mod tests {
                     count: 1,
                     attachment_paths: Vec::new(),
                     attachment_urls: Vec::new(),
+                    position: None,
                 },
             )
             .unwrap()

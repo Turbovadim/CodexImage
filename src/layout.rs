@@ -64,6 +64,38 @@ pub fn compute_layout(
     tree.positions
 }
 
+/// Finds the nearest free column beside `anchor` for a card of `height`,
+/// stepping outwards one card slot at a time and preferring the side that
+/// needs the smaller move. `occupied` holds the position and height of every
+/// card already on the canvas.
+pub fn free_spot_near(anchor: Position, height: f32, occupied: &[(Position, f32)]) -> Position {
+    let rect = |position: Position, height: f32| Rect {
+        x: position.x,
+        y: position.y,
+        right: position.x + CARD_WIDTH,
+        bottom: position.y + height,
+    };
+    let free = |candidate: Position| {
+        let candidate = rect(candidate, height);
+        !occupied
+            .iter()
+            .any(|(position, height)| candidate.overlaps(rect(*position, *height)))
+    };
+    for step in 1..=64 {
+        let dx = (CARD_WIDTH + H_GAP) * step as f32;
+        for x in [anchor.x + dx, anchor.x - dx] {
+            let candidate = Position { x, y: anchor.y };
+            if free(candidate) {
+                return candidate;
+            }
+        }
+    }
+    Position {
+        x: anchor.x + CARD_WIDTH + H_GAP,
+        y: anchor.y + height + V_GAP,
+    }
+}
+
 struct Tree<'nodes> {
     children: HashMap<&'nodes str, Vec<&'nodes BoardNode>>,
     manual: HashMap<String, Position>,
@@ -203,13 +235,16 @@ impl<'nodes> Tree<'nodes> {
         self.visiting.remove(&node.id);
     }
 
-    /// Nudges automatically placed subtrees to the right until they no longer
-    /// collide with anything already laid down.
+    /// Nudges automatically placed subtrees sideways until they no longer
+    /// collide with anything already laid down. The first hit picks whichever
+    /// direction moves the subtree less; later hits keep that direction so the
+    /// subtree cannot oscillate between two neighbours forever.
     fn separate(&mut self, node: &'nodes BoardNode, occupied: &mut Vec<Rect>) {
         if !self.visiting.insert(node.id.clone()) {
             return;
         }
         if !self.manual.contains_key(&node.id) {
+            let mut direction = 0.0f32;
             for _ in 0..MAX_OVERLAP_PASSES {
                 let rect = self.rect(&node.id);
                 let Some(hit) = occupied
@@ -219,7 +254,19 @@ impl<'nodes> Tree<'nodes> {
                 else {
                     break;
                 };
-                self.shift_subtree(node, hit.right + H_GAP - rect.x);
+                let rightwards = hit.right + H_GAP - rect.x;
+                let leftwards = hit.x - H_GAP - rect.right;
+                let dx = if direction > 0. {
+                    rightwards
+                } else if direction < 0. {
+                    leftwards
+                } else if rightwards <= -leftwards {
+                    rightwards
+                } else {
+                    leftwards
+                };
+                direction = dx.signum();
+                self.shift_subtree(node, dx);
             }
             occupied.push(self.rect(&node.id));
         }

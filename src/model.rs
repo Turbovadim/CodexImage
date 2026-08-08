@@ -112,4 +112,7 @@ pub struct NewNodesRequest {
     pub count: usize,
     pub attachment_paths: Vec<std::path::PathBuf>,
     pub attachment_urls: Vec<String>,
+    /// Pins the new nodes at an explicit canvas position instead of letting
+    /// the tree layout place them.
+    pub position: Option<(f32, f32)>,
 }
