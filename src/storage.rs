@@ -14,7 +14,15 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const TRASH_TTL: Duration = Duration::from_secs(5 * 60);
-pub const THUMBNAIL_MAX_DIMENSION: u32 = 720;
+// Sized so a portrait card at zoom 1 on a retina display (~1020 physical px)
+// is served entirely by its thumbnail; full originals only decode when the
+// user actually zooms in past that.
+pub const THUMBNAIL_MAX_DIMENSION: u32 = 1080;
+// A second, tiny thumbnail (`s_`) embedded by the small card-sprite tiers and
+// painted at far-out zoom, where the media area is at most ~320 physical px.
+// Rasterizing hundreds of cards during a zoom-out then decodes ~40 KB files
+// instead of the full-size thumbnails.
+pub const SPRITE_THUMBNAIL_MAX_DIMENSION: u32 = 320;
 
 #[derive(Clone, Debug)]
 pub enum RepositoryEvent {
@@ -498,6 +506,68 @@ impl Repository {
         thumbnail_path_for(&path)
     }
 
+    pub fn sprite_thumbnail_path(&self, board_id: &str, url: &str) -> Option<PathBuf> {
+        let path = self.image_path(board_id, url)?;
+        sprite_thumbnail_path_for(&path)
+    }
+
+    /// Re-creates every stored thumbnail that is smaller than the current
+    /// `THUMBNAIL_MAX_DIMENSION` allows, then announces a change so open
+    /// views pick the sharper files up. A one-time sweep after upgrades that
+    /// raise the thumbnail size; run it on a background thread, it decodes
+    /// every affected original.
+    pub fn refresh_undersized_thumbnails(&self) {
+        let Ok(boards) = fs::read_dir(&self.paths.images) else {
+            return;
+        };
+        let mut regenerated = false;
+        for board in boards.flatten() {
+            let Ok(entries) = fs::read_dir(board.path()) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let is_thumbnail = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_none_or(|name| name.starts_with("t_") || name.starts_with("s_"));
+                if is_thumbnail || !path.is_file() {
+                    continue;
+                }
+                let (Some(thumbnail), Some(sprite)) =
+                    (thumbnail_path_for(&path), sprite_thumbnail_path_for(&path))
+                else {
+                    continue;
+                };
+                let source_dimensions = image::image_dimensions(&path);
+                // A missing or unreadable thumbnail beside a readable original
+                // counts as undersized and is rebuilt.
+                let undersized = |candidate: &Path, target: u32| match (
+                    image::image_dimensions(candidate),
+                    source_dimensions.as_ref().ok().copied(),
+                ) {
+                    (Ok((thumb_w, thumb_h)), Some((width, height))) => {
+                        thumb_w.max(thumb_h) < width.max(height).min(target)
+                    }
+                    (Err(_), Some(_)) => true,
+                    _ => false,
+                };
+                if undersized(&thumbnail, THUMBNAIL_MAX_DIMENSION) {
+                    if create_thumbnail(&path).is_ok() {
+                        regenerated = true;
+                    }
+                } else if undersized(&sprite, SPRITE_THUMBNAIL_MAX_DIMENSION)
+                    && create_sprite_thumbnail(&path).is_ok()
+                {
+                    regenerated = true;
+                }
+            }
+        }
+        if regenerated {
+            let _ = self.events.try_send(RepositoryEvent::Changed);
+        }
+    }
+
     pub fn emit_activity(&self, node_id: impl Into<String>, text: impl Into<String>) {
         let _ = self.events.try_send(RepositoryEvent::Activity {
             node_id: node_id.into(),
@@ -652,17 +722,47 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
     atomic_write(path, bytes)
 }
 
+/// Builds both display thumbnails beside `source`: `t_` at
+/// `THUMBNAIL_MAX_DIMENSION` and `s_` at `SPRITE_THUMBNAIL_MAX_DIMENSION`.
 pub fn create_thumbnail(source: &Path) -> Result<()> {
     let image = image::ImageReader::open(source)?
         .with_guessed_format()?
         .decode()
         .with_context(|| format!("failed to decode {}", source.display()))?;
     let thumbnail = image.thumbnail(THUMBNAIL_MAX_DIMENSION, THUMBNAIL_MAX_DIMENSION);
-    let destination = thumbnail_path_for(source).context("image had no file name")?;
+    save_thumbnail(&thumbnail, source, thumbnail_path_for(source))?;
+    let sprite = thumbnail.thumbnail(
+        SPRITE_THUMBNAIL_MAX_DIMENSION,
+        SPRITE_THUMBNAIL_MAX_DIMENSION,
+    );
+    save_thumbnail(&sprite, source, sprite_thumbnail_path_for(source))
+}
+
+/// Builds only the `s_` sprite thumbnail, downscaling the existing `t_` file
+/// so a sweep never has to decode the full original twice.
+fn create_sprite_thumbnail(source: &Path) -> Result<()> {
+    let thumbnail = thumbnail_path_for(source).context("image had no file name")?;
+    let image = image::ImageReader::open(&thumbnail)?
+        .with_guessed_format()?
+        .decode()
+        .with_context(|| format!("failed to decode {}", thumbnail.display()))?;
+    let sprite = image.thumbnail(
+        SPRITE_THUMBNAIL_MAX_DIMENSION,
+        SPRITE_THUMBNAIL_MAX_DIMENSION,
+    );
+    save_thumbnail(&sprite, source, sprite_thumbnail_path_for(source))
+}
+
+fn save_thumbnail(
+    image: &image::DynamicImage,
+    source: &Path,
+    destination: Option<PathBuf>,
+) -> Result<()> {
+    let destination = destination.context("image had no file name")?;
     let result = if is_svg_embeddable_raster(source) {
-        thumbnail.save(&destination)
+        image.save(&destination)
     } else {
-        thumbnail.save_with_format(&destination, image::ImageFormat::Png)
+        image.save_with_format(&destination, image::ImageFormat::Png)
     };
     result.with_context(|| format!("failed to create thumbnail {}", destination.display()))
 }
@@ -670,19 +770,30 @@ pub fn create_thumbnail(source: &Path) -> Result<()> {
 fn remove_image_and_thumbnail(source: &Path) {
     let _ = fs::remove_file(source);
     if let Some(name) = source.file_name() {
-        let _ = fs::remove_file(source.with_file_name(format!("t_{}", name.to_string_lossy())));
-        let _ = fs::remove_file(source.with_file_name(format!("t_{}.png", name.to_string_lossy())));
+        for prefix in ["t_", "s_"] {
+            let name = name.to_string_lossy();
+            let _ = fs::remove_file(source.with_file_name(format!("{prefix}{name}")));
+            let _ = fs::remove_file(source.with_file_name(format!("{prefix}{name}.png")));
+        }
     }
 }
 
 pub fn thumbnail_path_for(source: &Path) -> Option<PathBuf> {
+    prefixed_thumbnail_path(source, "t_")
+}
+
+pub fn sprite_thumbnail_path_for(source: &Path) -> Option<PathBuf> {
+    prefixed_thumbnail_path(source, "s_")
+}
+
+fn prefixed_thumbnail_path(source: &Path, prefix: &str) -> Option<PathBuf> {
     let name = source.file_name()?.to_string_lossy();
     let suffix = if is_svg_embeddable_raster(source) {
         String::new()
     } else {
         ".png".to_owned()
     };
-    Some(source.with_file_name(format!("t_{name}{suffix}")))
+    Some(source.with_file_name(format!("{prefix}{name}{suffix}")))
 }
 
 fn is_svg_embeddable_raster(path: &Path) -> bool {

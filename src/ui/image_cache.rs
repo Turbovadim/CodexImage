@@ -13,14 +13,23 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::hash::Hash;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 // Each decoded buffer normally also has a BGRA copy in the Metal atlas. Keep
 // the CPU-side limits low enough that the combined unified-memory footprint
 // remains well below half a gigabyte.
 pub const DECODED_IMAGE_CACHE_BUDGET: usize = 96 * 1024 * 1024;
 const DECODED_IMAGE_CACHE_MAX_ITEMS: usize = 1_024;
-pub const CARD_SPRITE_CACHE_BUDGET: usize = 16 * 1024 * 1024;
-const CARD_SPRITE_CACHE_MAX_ITEMS: usize = 1_024;
+// Large enough that a whole board of small far-zoom sprites stays resident;
+// a full zoom-out otherwise evicts and re-rasterizes hundreds of cards.
+pub const CARD_SPRITE_CACHE_BUDGET: usize = 32 * 1024 * 1024;
+const CARD_SPRITE_CACHE_MAX_ITEMS: usize = 4_096;
+
+// Every eviction cycle forces two full-window redraws. When the visible set
+// alone exceeds the budget nothing can be evicted, so uncapped cycles become
+// a continuous redraw storm during zoom gestures; this spaces them out.
+const EVICTION_CYCLE_SPACING: Duration = Duration::from_millis(250);
+const SATURATED_EVICTION_SPACING: Duration = Duration::from_millis(1500);
 
 /// The default decode resolution. Sized for the most demanding capped
 /// consumer: a full-card image at the canvas's maximum zoom (2x) on a retina
@@ -51,7 +60,14 @@ impl Asset for CappedImageLoader {
     ) -> impl Future<Output = Self::Output> + Send + 'static {
         let load = ImgResourceLoader::load(source.resource.clone(), cx);
         async move {
-            match load.await {
+            // Decoded pixels are cached on disk as LZ4-compressed BGRA, which
+            // reads back about five times faster than re-decoding the PNG.
+            if let Resource::Path(path) = &source.resource
+                && let Some(image) = super::disk_cache::load(path, source.max_dimension)
+            {
+                return Ok(Arc::new(image));
+            }
+            let decoded = match load.await {
                 Ok(image) => Ok(match source.max_dimension {
                     Some(max_dimension) => downscale_to_fit(image, max_dimension),
                     None => image,
@@ -66,11 +82,18 @@ impl Asset for CappedImageLoader {
                         && let Some(image) =
                             super::imageio::decode_render_image(&bytes, source.max_dimension)
                     {
-                        return Ok(Arc::new(image));
+                        Ok(Arc::new(image))
+                    } else {
+                        Err(error)
                     }
+                    #[cfg(not(target_os = "macos"))]
                     Err(error)
                 }
+            };
+            if let (Ok(image), Resource::Path(path)) = (&decoded, &source.resource) {
+                super::disk_cache::store(path, source.max_dimension, image);
             }
+            decoded
         }
     }
 }
@@ -182,6 +205,7 @@ pub(super) struct DecodedImageCache {
     max_items: usize,
     clock: u64,
     eviction: EvictionCycle<DecodeKey>,
+    eviction_backoff: Option<Instant>,
     weak_self: WeakEntity<Self>,
 }
 
@@ -200,6 +224,7 @@ impl DecodedImageCache {
             max_items: DECODED_IMAGE_CACHE_MAX_ITEMS,
             clock: 0,
             eviction: EvictionCycle::default(),
+            eviction_backoff: None,
             weak_self: cx.weak_entity(),
         }
     }
@@ -338,6 +363,12 @@ impl DecodedImageCache {
     }
 
     fn schedule_eviction(&mut self, key: &DecodeKey, capacity_changed: bool, window: &mut Window) {
+        if self
+            .eviction_backoff
+            .is_some_and(|until| Instant::now() < until)
+        {
+            return;
+        }
         if !self
             .eviction
             .should_start(self.over_limit(), key, capacity_changed)
@@ -345,6 +376,7 @@ impl DecodedImageCache {
             return;
         }
 
+        self.eviction_backoff = Some(Instant::now() + EVICTION_CYCLE_SPACING);
         let generation = self.eviction.start();
         let cache = self.weak_self.clone();
         window.on_next_frame(move |window, cx| {
@@ -367,6 +399,12 @@ impl DecodedImageCache {
                             // Prevent GPUI from replaying a retained scene that
                             // still contains a removed Metal atlas tile.
                             window.refresh();
+                        }
+                        if cache.over_limit() {
+                            // Everything left is on screen; retrying sooner
+                            // would only repeat full redraws for nothing.
+                            cache.eviction_backoff =
+                                Some(Instant::now() + SATURATED_EVICTION_SPACING);
                         }
                     });
                 });
@@ -500,6 +538,7 @@ pub(super) struct CardSpriteCache {
     byte_budget: usize,
     clock: u64,
     eviction: EvictionCycle<u64>,
+    eviction_backoff: Option<Instant>,
     weak_self: WeakEntity<Self>,
 }
 
@@ -516,6 +555,7 @@ impl CardSpriteCache {
             byte_budget,
             clock: 0,
             eviction: EvictionCycle::default(),
+            eviction_backoff: None,
             weak_self: cx.weak_entity(),
         }
     }
@@ -582,6 +622,12 @@ impl CardSpriteCache {
     }
 
     fn schedule_eviction(&mut self, image_id: u64, capacity_changed: bool, window: &mut Window) {
+        if self
+            .eviction_backoff
+            .is_some_and(|until| Instant::now() < until)
+        {
+            return;
+        }
         if !self
             .eviction
             .should_start(self.over_limit(), &image_id, capacity_changed)
@@ -589,6 +635,7 @@ impl CardSpriteCache {
             return;
         }
 
+        self.eviction_backoff = Some(Instant::now() + EVICTION_CYCLE_SPACING);
         let generation = self.eviction.start();
         let cache = self.weak_self.clone();
         window.on_next_frame(move |window, cx| {
@@ -605,6 +652,10 @@ impl CardSpriteCache {
                         };
                         if cache.evict_to_limits(&visible, window, cx) {
                             window.refresh();
+                        }
+                        if cache.over_limit() {
+                            cache.eviction_backoff =
+                                Some(Instant::now() + SATURATED_EVICTION_SPACING);
                         }
                     });
                 });

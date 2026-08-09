@@ -34,6 +34,8 @@ const TOOLBAR_CARD_GAP: f32 = 6.;
 const TOOLBAR_RIGHT_MARGIN: f32 = 4.;
 const MIN_ZOOM: f32 = 0.08;
 const MAX_ZOOM: f32 = 2.;
+/// How long zoom must hold still before sprites re-render for the new tier.
+const ZOOM_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
 const MINIMAP_WIDTH: f32 = 142.;
 const MINIMAP_HEIGHT: f32 = 96.;
 const MINIMAP_RIGHT: f32 = 18.;
@@ -171,6 +173,7 @@ impl AppView {
         self.zoom = (width / (max_x - min_x).max(1.))
             .min(height / (max_y - min_y).max(1.))
             .clamp(MIN_ZOOM, 1.);
+        self.last_zoom_change = std::time::Instant::now();
         self.camera_x =
             (f32::from(viewport.width) - (max_x - min_x) * self.zoom) / 2. - min_x * self.zoom;
         self.camera_y =
@@ -224,6 +227,9 @@ impl AppView {
         let world_y = (f32::from(position.y) - self.camera_y) / old;
         self.camera_x = f32::from(position.x) - world_x * new;
         self.camera_y = f32::from(position.y) - world_y * new;
+        if self.zoom != new {
+            self.last_zoom_change = std::time::Instant::now();
+        }
         self.zoom = new;
         cx.notify();
     }
@@ -234,6 +240,7 @@ impl AppView {
         };
         self.overlay = Overlay::None;
         self.zoom = 1.;
+        self.last_zoom_change = std::time::Instant::now();
         self.camera_x =
             f32::from(window.viewport_size().width) / 2. - (position.x + CARD_WIDTH / 2.);
         self.camera_y = 100. - position.y;
@@ -317,11 +324,18 @@ impl AppView {
         let image_cache = self.image_cache.clone();
         let sprite_cache = self.sprite_cache.clone();
         let zoom = self.zoom;
+        let zoom_settled = self.last_zoom_change.elapsed() >= ZOOM_SETTLE_DELAY;
         let camera_x = self.camera_x;
         let camera_y = self.camera_y;
         let background = canvas(
             |_, _, _| (),
             move |bounds, _, window, cx| {
+                if !zoom_settled {
+                    // Keep repainting until the settle delay elapses so the
+                    // frozen sprite tiers upgrade right after the gesture.
+                    let entity = window.current_view();
+                    window.on_next_frame(move |_, cx| cx.notify(entity));
+                }
                 paint_dot_grid(bounds, camera_x, camera_y, zoom, window);
                 paint_connectors(&edge_points, zoom, window);
                 for frame in &visible_nodes {
@@ -330,6 +344,7 @@ impl AppView {
                             frame,
                             node,
                             zoom,
+                            zoom_settled,
                             &image_cache,
                             &sprite_cache,
                             window,

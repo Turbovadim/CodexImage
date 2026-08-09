@@ -352,7 +352,10 @@ fn paint_canvas_text(
     window: &mut Window,
     cx: &mut App,
 ) {
-    if text.is_empty() || style.font_size <= 0. {
+    // Below ~3 logical px, text is an illegible smear; skipping it spares the
+    // shaping pass, which dominates a full direct redraw of a large board at
+    // far-out zoom (hundreds of cards, thousands of runs per frame).
+    if text.is_empty() || style.font_size < 3. {
         return;
     }
     let run = TextRun {
@@ -413,10 +416,12 @@ fn paint_canvas_image(
     });
 }
 
+#[expect(clippy::too_many_arguments)]
 pub fn paint_canvas_node(
     frame: &CanvasNodeFrame,
     canvas_node: &CanvasNode,
     zoom: f32,
+    zoom_settled: bool,
     image_cache: &Entity<DecodedImageCache>,
     sprite_cache: &Entity<CardSpriteCache>,
     window: &mut Window,
@@ -437,16 +442,28 @@ pub fn paint_canvas_node(
     } else {
         3
     };
-    let mut sprite = canvas_node.sprite_images.get(tier).and_then(|image| {
-        sprite_cache.update(cx, |cache, cx| cache.load(image.clone(), window, cx))
-    });
-    if sprite.is_some() {
-        canvas_node
-            .last_ready_sprite_tier
-            .store(tier as u8, Ordering::Relaxed);
+    // While the zoom gesture is still moving, keep blitting whichever tier is
+    // already rendered instead of requesting the target tier: every tier
+    // crossing otherwise re-rasterizes each visible card's sprite, which is
+    // the gesture's dominant CPU and I/O cost. The correct tier is requested
+    // once zoom settles.
+    let previous_tier = canvas_node.last_ready_sprite_tier.load(Ordering::Relaxed) as usize;
+    let mut sprite = if !zoom_settled && previous_tier < canvas_node.sprite_images.len() {
+        sprite_cache.update(cx, |cache, _| {
+            cache.ready(&canvas_node.sprite_images[previous_tier], window)
+        })
     } else {
-        let previous_tier = canvas_node.last_ready_sprite_tier.load(Ordering::Relaxed) as usize;
-        if previous_tier < canvas_node.sprite_images.len() && previous_tier != tier {
+        None
+    };
+    if sprite.is_none() {
+        sprite = canvas_node.sprite_images.get(tier).and_then(|image| {
+            sprite_cache.update(cx, |cache, cx| cache.load(image.clone(), window, cx))
+        });
+        if sprite.is_some() {
+            canvas_node
+                .last_ready_sprite_tier
+                .store(tier as u8, Ordering::Relaxed);
+        } else if previous_tier < canvas_node.sprite_images.len() && previous_tier != tier {
             sprite = sprite_cache.update(cx, |cache, _| {
                 cache.ready(&canvas_node.sprite_images[previous_tier], window)
             });
@@ -646,7 +663,13 @@ fn paint_card_scene(
                         radius,
                         blurred,
                     } => paint_canvas_image(
-                        &asset.thumbnail,
+                        // Direct painting is a transient stand-in until the
+                        // tier's sprite lands, so it always uses the small
+                        // thumbnail. Loading the full-size one for those few
+                        // frames is what used to re-read hundreds of MB of
+                        // sidecars per zoom tier crossing; sharpness at rest
+                        // comes from sprites and the high-resolution overlay.
+                        &asset.sprite,
                         transform_card_rect(*bounds, frame, zoom),
                         CanvasImageStyle {
                             fit: match fit {
@@ -805,14 +828,15 @@ mod tests {
     #[test]
     fn node_images_promote_to_originals_only_when_thumbnails_are_undersized() {
         let full_card_image = CardRect::new(0., 0., CARD_WIDTH, CARD_WIDTH);
-        assert!(!image_needs_high_resolution(full_card_image, 1., 2.));
-        assert!(image_needs_high_resolution(full_card_image, 1.1, 2.));
+        assert!(!image_needs_high_resolution(full_card_image, 1.5, 2.));
+        assert!(image_needs_high_resolution(full_card_image, 1.6, 2.));
 
         let half_width_tile = CardRect::new(0., 0., 169., 169.);
         assert!(!image_needs_high_resolution(half_width_tile, 2., 2.));
 
         let portrait_hero = CardRect::new(0., 0., CARD_WIDTH, CARD_WIDTH * 2.);
-        assert!(image_needs_high_resolution(portrait_hero, 0.6, 2.));
+        assert!(!image_needs_high_resolution(portrait_hero, 0.6, 2.));
+        assert!(image_needs_high_resolution(portrait_hero, 0.8, 2.));
     }
 
     #[test]

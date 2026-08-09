@@ -29,6 +29,8 @@ pub const NO_SPRITE_TIER: u8 = u8::MAX;
 pub struct CanvasImageAsset {
     pub original: Arc<Path>,
     pub thumbnail: Arc<Path>,
+    /// The tiny `s_` thumbnail for small sprite tiers and far-out zoom.
+    pub sprite: Arc<Path>,
 }
 
 pub struct CanvasImage {

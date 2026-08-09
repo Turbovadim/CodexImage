@@ -20,7 +20,9 @@ use crate::APP_NAME;
 use crate::generation::GenerationEngine;
 use crate::layout::{Position, compute_layout};
 use crate::model::{Board, BoardNode};
-use crate::storage::{RepositoryEvent, create_thumbnail, thumbnail_path_for};
+use crate::storage::{
+    RepositoryEvent, create_thumbnail, sprite_thumbnail_path_for, thumbnail_path_for,
+};
 use anyhow::{Context as _, Result};
 use gpui::{
     App, AppContext, Bounds, Context, Entity, ExternalPaths, FocusHandle, Focusable, ListAlignment,
@@ -31,7 +33,7 @@ use gpui_platform::application;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub(super) enum Overlay {
     None,
@@ -47,6 +49,16 @@ pub(super) enum Overlay {
 pub(super) struct ImageAsset {
     pub(super) original: PathBuf,
     pub(super) thumbnail: PathBuf,
+    /// The tiny `s_` thumbnail, falling back to `thumbnail` until it exists.
+    pub(super) sprite: PathBuf,
+}
+
+/// What one background image job resolved, applied on the main thread.
+struct ResolvedImage {
+    url: String,
+    thumbnail: Option<PathBuf>,
+    sprite: Option<PathBuf>,
+    ratio: Option<f32>,
 }
 
 /// Thumbnail encoding and header reads for one image, performed off the render
@@ -96,12 +108,20 @@ pub(super) struct AppView {
     pub(super) camera_x: f32,
     pub(super) camera_y: f32,
     pub(super) zoom: f32,
+    /// When zoom last moved; sprite tiers only rebuild once it settles.
+    pub(super) last_zoom_change: Instant,
     pub(super) drag: Option<DragState>,
 }
 
 pub fn run() -> Result<()> {
     let (sender, receiver) = async_channel::bounded(1_024);
     let repository = crate::storage::Repository::open(sender)?;
+    super::disk_cache::init(repository.paths().root.join("decoded-cache"));
+    // One sequential background pass; it only decodes anything after an
+    // upgrade that raised THUMBNAIL_MAX_DIMENSION, and announces a refresh
+    // when it sharpened something.
+    let sweeper = repository.clone();
+    std::thread::spawn(move || sweeper.refresh_undersized_thumbnails());
     let engine = GenerationEngine::new(repository);
     let engine_for_quit = engine.clone();
     application().run(move |cx: &mut App| {
@@ -239,6 +259,7 @@ impl AppView {
             camera_x: 80.,
             camera_y: 90.,
             zoom: 1.,
+            last_zoom_change: Instant::now(),
             drag: None,
         };
         view.refresh_image_metadata(cx);
@@ -421,7 +442,16 @@ impl AppView {
             if !seen.insert(url.clone()) {
                 continue;
             }
-            if let Some(resolved) = self.image_assets.remove(url) {
+            if let Some(mut resolved) = self.image_assets.remove(url) {
+                // A sprite thumbnail that appeared since (the startup sweep
+                // creates them in the background) upgrades the cached asset.
+                if resolved.sprite == resolved.thumbnail
+                    && let Some(sprite) = repository
+                        .sprite_thumbnail_path(board_id, url)
+                        .filter(|path| path.exists())
+                {
+                    resolved.sprite = sprite;
+                }
                 assets.insert(url.clone(), resolved);
                 continue;
             }
@@ -433,6 +463,9 @@ impl AppView {
                 .as_ref()
                 .filter(|path| path.exists())
                 .cloned();
+            let ready_sprite = repository
+                .sprite_thumbnail_path(board_id, url)
+                .filter(|path| path.exists());
             let read_ratio = !self.image_ratios.contains_key(url);
             if (ready_thumbnail.is_none() || read_ratio) && !self.pending_image_jobs.contains(url) {
                 self.pending_image_jobs.insert(url.clone());
@@ -443,10 +476,12 @@ impl AppView {
                     read_ratio,
                 });
             }
+            let thumbnail = ready_thumbnail.unwrap_or_else(|| original.clone());
             assets.insert(
                 url.clone(),
                 ImageAsset {
-                    thumbnail: ready_thumbnail.unwrap_or_else(|| original.clone()),
+                    sprite: ready_sprite.unwrap_or_else(|| thumbnail.clone()),
+                    thumbnail,
                     original,
                 },
             );
@@ -476,13 +511,20 @@ impl AppView {
                                 thumbnail =
                                     thumbnail_path_for(&job.original).filter(|path| path.exists());
                             }
+                            let sprite = sprite_thumbnail_path_for(&job.original)
+                                .filter(|path| path.exists());
                             let ratio = job
                                 .read_ratio
                                 .then(|| {
                                     read_image_ratio(thumbnail.as_deref().unwrap_or(&job.original))
                                 })
                                 .flatten();
-                            (job.url, thumbnail, ratio)
+                            ResolvedImage {
+                                url: job.url,
+                                thumbnail,
+                                sprite,
+                                ratio,
+                            }
                         })
                         .collect::<Vec<_>>()
                 })
@@ -498,23 +540,25 @@ impl AppView {
         .detach();
     }
 
-    fn apply_image_metadata(
-        &mut self,
-        resolved: Vec<(String, Option<PathBuf>, Option<f32>)>,
-        cx: &mut Context<Self>,
-    ) {
+    fn apply_image_metadata(&mut self, resolved: Vec<ResolvedImage>, cx: &mut Context<Self>) {
         let mut changed = false;
-        for (url, thumbnail, ratio) in resolved {
-            self.pending_image_jobs.remove(&url);
-            if let Some(thumbnail) = thumbnail
-                && let Some(asset) = self.image_assets.get_mut(&url)
-                && asset.thumbnail != thumbnail
-            {
-                asset.thumbnail = thumbnail;
-                changed = true;
+        for image in resolved {
+            self.pending_image_jobs.remove(&image.url);
+            if let Some(asset) = self.image_assets.get_mut(&image.url) {
+                if let Some(thumbnail) = image.thumbnail
+                    && asset.thumbnail != thumbnail
+                {
+                    asset.thumbnail = thumbnail;
+                    changed = true;
+                }
+                let sprite = image.sprite.unwrap_or_else(|| asset.thumbnail.clone());
+                if asset.sprite != sprite {
+                    asset.sprite = sprite;
+                    changed = true;
+                }
             }
-            if let Some(ratio) = ratio
-                && self.image_ratios.insert(url, ratio) != Some(ratio)
+            if let Some(ratio) = image.ratio
+                && self.image_ratios.insert(image.url, ratio) != Some(ratio)
             {
                 changed = true;
             }
@@ -532,6 +576,7 @@ impl AppView {
             self.image_assets.get(url).is_none_or(|current| {
                 current.thumbnail.as_path() == used.thumbnail.as_ref()
                     && current.original.as_path() == used.original.as_ref()
+                    && current.sprite.as_path() == used.sprite.as_ref()
             })
         };
         canvas_node
@@ -665,9 +710,15 @@ impl AppView {
     }
 
     fn canvas_image_asset(&self, url: &str) -> CanvasImageAsset {
+        let sprite = self
+            .image_assets
+            .get(url)
+            .map(|asset| asset.sprite.clone())
+            .unwrap_or_else(|| self.display_image_path(url, false));
         CanvasImageAsset {
             original: Arc::from(self.display_image_path(url, true)),
             thumbnail: Arc::from(self.display_image_path(url, false)),
+            sprite: Arc::from(sprite),
         }
     }
 }

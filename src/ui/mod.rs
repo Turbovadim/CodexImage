@@ -7,6 +7,7 @@ mod card_scene;
 mod card_svg;
 mod composer;
 mod format;
+mod disk_cache;
 mod image_cache;
 #[cfg(target_os = "macos")]
 mod imageio;

@@ -1,6 +1,7 @@
 //! Encodes a card scene as an SVG sprite so the canvas can blit one image per
 //! card instead of replaying every primitive at low zoom.
 
+use super::card::CARD_SPRITE_WIDTHS;
 use super::card_scene::{CardImageFit, CardPrimitive, CardScene};
 use crate::layout::CARD_WIDTH;
 use gpui::TextAlign;
@@ -83,7 +84,16 @@ pub fn card_scene_svg(scene: &CardScene, rendered_width: f32) -> String {
                 radius,
                 blurred,
             } => {
-                if asset.thumbnail.as_os_str().is_empty() {
+                // Sprites rasterize at 2x their nominal width, so the two
+                // smallest tiers (85/170) show the media at ~320 px or less
+                // and can embed the tiny thumbnail; the larger tiers need the
+                // full-size one to stay sharp near zoom 1.
+                let href = if rendered_width <= CARD_SPRITE_WIDTHS[1] {
+                    &asset.sprite
+                } else {
+                    &asset.thumbnail
+                };
+                if href.as_os_str().is_empty() {
                     continue;
                 }
                 let mut filter = String::new();
@@ -114,7 +124,7 @@ pub fn card_scene_svg(scene: &CardScene, rendered_width: f32) -> String {
                     }
                 )
                 .expect("writing to a String cannot fail");
-                push_xml_escaped(&mut svg, &asset.thumbnail.to_string_lossy());
+                push_xml_escaped(&mut svg, &href.to_string_lossy());
                 svg.push_str("\"/>");
             }
         }
@@ -180,6 +190,7 @@ mod tests {
         let asset = || CanvasImageAsset {
             original: Arc::from(Path::new("/images/full.png")),
             thumbnail: Arc::from(Path::new("/images/thumb.png")),
+            sprite: Arc::from(Path::new("/images/small.png")),
         };
         let bounds = CardRect::new(0., 0., CARD_WIDTH, CARD_WIDTH);
         let mut scene = CardScene {
@@ -196,5 +207,16 @@ mod tests {
         let svg = card_scene_svg(&scene, CARD_WIDTH);
         assert!(svg.contains("feGaussianBlur"));
         assert!(svg.contains("filter=\"url(#blur-0)\""));
+
+        // Small tiers embed the tiny thumbnail, large tiers the full one.
+        for width in CARD_SPRITE_WIDTHS {
+            let svg = card_scene_svg(&scene, width);
+            let expected = if width <= CARD_SPRITE_WIDTHS[1] {
+                "/images/small.png"
+            } else {
+                "/images/thumb.png"
+            };
+            assert!(svg.contains(expected), "tier {width} should use {expected}");
+        }
     }
 }
