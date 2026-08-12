@@ -149,26 +149,27 @@ pub fn paint_dot_grid(
     let image = dot_grid_image();
     let metrics = dot_grid_metrics(camera_x, camera_y, zoom);
     let tile_size = px(metrics.tile_size);
-    window.with_content_mask(Some(ContentMask { bounds }), |window| {
-        let mut y = bounds.top() + px(metrics.origin_y);
-        while y < bounds.bottom() {
-            let mut x = bounds.left() + px(metrics.origin_x);
-            while x < bounds.right() {
-                let _ = window.paint_image(
-                    Bounds {
-                        origin: point(x, y),
-                        size: size(tile_size, tile_size),
-                    },
-                    px(0.).into(),
-                    image.clone(),
-                    0,
-                    false,
-                );
-                x += tile_size;
-            }
-            y += tile_size;
+    // paint_image clips each tile to `bounds` via its image_bounds intersection,
+    // replacing the content mask that used to wrap this loop.
+    let mut y = bounds.top() + px(metrics.origin_y);
+    while y < bounds.bottom() {
+        let mut x = bounds.left() + px(metrics.origin_x);
+        while x < bounds.right() {
+            let _ = window.paint_image(
+                bounds,
+                Bounds {
+                    origin: point(x, y),
+                    size: size(tile_size, tile_size),
+                },
+                px(0.).into(),
+                image.clone(),
+                0,
+                false,
+            );
+            x += tile_size;
         }
-    });
+        y += tile_size;
+    }
 }
 
 pub fn rect_is_visible(
@@ -411,9 +412,15 @@ fn paint_canvas_image(
         return;
     }
     let image_bounds = style.fit.get_bounds(bounds, data.size(0));
-    window.with_content_mask(Some(ContentMask { bounds }), |window| {
-        let _ = window.paint_image(image_bounds, px(style.corner_radius).into(), data, 0, false);
-    });
+    // paint_image now clips to bounds ∩ image_bounds itself, so no content mask needed.
+    let _ = window.paint_image(
+        bounds,
+        image_bounds,
+        px(style.corner_radius).into(),
+        data,
+        0,
+        false,
+    );
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -470,7 +477,7 @@ pub fn paint_canvas_node(
         }
     }
     if let Some(sprite) = sprite {
-        let _ = window.paint_image(bounds, px(20. * zoom).into(), sprite, 0, false);
+        let _ = window.paint_image(bounds, bounds, px(20. * zoom).into(), sprite, 0, false);
     } else {
         paint_card_scene(frame, &canvas_node.scene, zoom, image_cache, window, cx);
     }

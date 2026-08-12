@@ -10,8 +10,8 @@ anyhow = "1"
 async-channel = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 dirs = "6"
-gpui = { git = "https://github.com/zed-industries/zed", rev = "e3b73c6b30cdc09e820823fe44542b89850d4be1", package = "gpui" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "e3b73c6b30cdc09e820823fe44542b89850d4be1", package = "gpui_platform", features = ["font-kit"] }
+gpui = { git = "https://github.com/zed-industries/zed", rev = "ba0e2a94295c99f48f00cdaa2858a29adae6f09d", package = "gpui" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "ba0e2a94295c99f48f00cdaa2858a29adae6f09d", package = "gpui_platform", features = ["font-kit"] }
 image = { version = "0.25", default-features = false, features = ["avif", "bmp", "gif", "ico", "jpeg", "png", "pnm", "tiff", "webp"] }
 libc = "0.2"
 lz4_flex = "0.14.0"
