@@ -473,39 +473,74 @@ impl DecodedImageCache {
     }
 }
 
-/// Shrinks the decoded image far below recognizability, blurs it, and scales it
-/// back up so GPU bilinear sampling shows a smooth color wash instead of the
-/// actual picture. The pixel format (premultiplied BGRA) survives untouched
-/// because every step works per channel.
+/// Applies a true Gaussian convolution to the sprite thumbnail at its native
+/// resolution. Processing stays in premultiplied linear-light floats until the
+/// final BGRA8 conversion so translucent edges and dark gradients stay clean.
 fn blur_render_image(image: &RenderImage) -> Option<RenderImage> {
-    const SMALL_MAX_DIMENSION: u32 = 24;
-    const SMOOTH_UPSCALE: u32 = 8;
-    const BLUR_SIGMA: f32 = 2.5;
-    // Applied after upscaling: wide enough (relative to SMOOTH_UPSCALE) to
-    // erase the piecewise-linear facets interpolation leaves behind, which
-    // otherwise read as blocky squares once the GPU magnifies the stand-in
-    // to card size.
-    const SMOOTH_SIGMA: f32 = 12.0;
+    // Sprite thumbnails have a 320 px long edge. Scaling sigma with the input
+    // keeps the same apparent blur for genuinely smaller source images.
+    const BLUR_SIGMA_AT_320_PX: f32 = 14.0;
 
     let size = image.size(0);
     let (width, height) = (size.width.0 as u32, size.height.0 as u32);
     if width == 0 || height == 0 {
         return None;
     }
-    let buffer = image::RgbaImage::from_raw(width, height, image.as_bytes(0)?.to_vec())?;
-    let scale = SMALL_MAX_DIMENSION as f32 / width.max(height) as f32;
-    let small_width = ((width as f32 * scale).round() as u32).max(1);
-    let small_height = ((height as f32 * scale).round() as u32).max(1);
-    let small = image::imageops::thumbnail(&buffer, small_width, small_height);
-    let blurred = image::imageops::fast_blur(&small, BLUR_SIGMA);
-    let upscaled = image::imageops::resize(
-        &blurred,
-        small_width * SMOOTH_UPSCALE,
-        small_height * SMOOTH_UPSCALE,
-        image::imageops::FilterType::Triangle,
-    );
-    let smooth = image::imageops::fast_blur(&upscaled, SMOOTH_SIGMA);
-    Some(RenderImage::new(vec![image::Frame::new(smooth)]))
+    let pixels = image.as_bytes(0)?;
+    if pixels.len() != width as usize * height as usize * 4 {
+        return None;
+    }
+    // RenderImage stores straight-alpha BGRA. The image operations are
+    // channel-agnostic, so BGR order is harmless, but interpolation and blur
+    // require premultiplied alpha to avoid colored transparent pixels bleeding
+    // into their neighbors.
+    let buffer = image::Rgba32FImage::from_fn(width, height, |x, y| {
+        let index = (y as usize * width as usize + x as usize) * 4;
+        let alpha = pixels[index + 3] as f32 / 255.0;
+        image::Rgba([
+            srgb_to_linear(pixels[index]) * alpha,
+            srgb_to_linear(pixels[index + 1]) * alpha,
+            srgb_to_linear(pixels[index + 2]) * alpha,
+            alpha,
+        ])
+    });
+    let sigma = (width.max(height) as f32 * BLUR_SIGMA_AT_320_PX / 320.0).max(0.8);
+    let blurred = image::imageops::blur(&buffer, sigma);
+    let output = image::RgbaImage::from_fn(width, height, |x, y| {
+        let pixel = blurred.get_pixel(x, y).0;
+        let alpha = pixel[3].clamp(0.0, 1.0);
+        let inverse_alpha = if alpha > f32::EPSILON {
+            alpha.recip()
+        } else {
+            0.0
+        };
+        image::Rgba([
+            linear_to_srgb(pixel[0] * inverse_alpha),
+            linear_to_srgb(pixel[1] * inverse_alpha),
+            linear_to_srgb(pixel[2] * inverse_alpha),
+            (alpha * 255.0).round() as u8,
+        ])
+    });
+    Some(RenderImage::new(vec![image::Frame::new(output)]))
+}
+
+fn srgb_to_linear(channel: u8) -> f32 {
+    let channel = channel as f32 / 255.0;
+    if channel <= 0.04045 {
+        channel / 12.92
+    } else {
+        ((channel + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn linear_to_srgb(channel: f32) -> u8 {
+    let channel = channel.clamp(0.0, 1.0);
+    let encoded = if channel <= 0.003_130_8 {
+        channel * 12.92
+    } else {
+        1.055 * channel.powf(1.0 / 2.4) - 0.055
+    };
+    (encoded * 255.0).round() as u8
 }
 
 impl ImageCache for DecodedImageCache {
@@ -721,7 +756,7 @@ fn decoded_image_bytes(image: &RenderImage) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{EvictionCycle, decoded_image_bytes, downscale_to_fit};
+    use super::{EvictionCycle, blur_render_image, decoded_image_bytes, downscale_to_fit};
     use gpui::RenderImage;
     use std::sync::Arc;
 
@@ -752,6 +787,30 @@ mod tests {
         let image = RenderImage::new(vec![frame.clone(), frame]);
 
         assert_eq!(decoded_image_bytes(&image), 12 * 7 * 4 * 2);
+    }
+
+    #[test]
+    fn gaussian_blur_preserves_dimensions_and_ignores_color_under_transparency() {
+        let mut pixels = image::RgbaImage::new(48, 24);
+        for (x, _, pixel) in pixels.enumerate_pixels_mut() {
+            *pixel = if x < 24 {
+                image::Rgba([180, 180, 180, 255])
+            } else {
+                // Hidden red in BGRA order must not tint the blurred edge.
+                image::Rgba([0, 0, 255, 0])
+            };
+        }
+        let source = RenderImage::new(vec![image::Frame::new(pixels)]);
+        let blurred = blur_render_image(&source).expect("blurred stand-in");
+
+        let size = blurred.size(0);
+        assert_eq!((size.width.0, size.height.0), (48, 24));
+        for pixel in blurred.as_bytes(0).expect("frame").chunks_exact(4) {
+            if pixel[3] > 8 {
+                assert!((pixel[0] as i16 - pixel[1] as i16).abs() <= 1);
+                assert!((pixel[1] as i16 - pixel[2] as i16).abs() <= 1);
+            }
+        }
     }
 
     #[test]

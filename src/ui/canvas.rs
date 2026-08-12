@@ -449,20 +449,32 @@ pub fn paint_canvas_node(
     } else {
         3
     };
+    // resvg implements large feGaussianBlur filters with quantized box-blur
+    // passes, which become visible as contour bands over dark images. Running
+    // cards are few and short-lived, so paint their shared CPU-blurred image
+    // directly instead of rasterizing the blurred image into a card sprite.
+    let has_blurred_images = canvas_node
+        .scene
+        .primitives
+        .iter()
+        .any(|primitive| matches!(primitive, CardPrimitive::Image { blurred: true, .. }));
     // While the zoom gesture is still moving, keep blitting whichever tier is
     // already rendered instead of requesting the target tier: every tier
     // crossing otherwise re-rasterizes each visible card's sprite, which is
     // the gesture's dominant CPU and I/O cost. The correct tier is requested
     // once zoom settles.
     let previous_tier = canvas_node.last_ready_sprite_tier.load(Ordering::Relaxed) as usize;
-    let mut sprite = if !zoom_settled && previous_tier < canvas_node.sprite_images.len() {
+    let mut sprite = if !has_blurred_images
+        && !zoom_settled
+        && previous_tier < canvas_node.sprite_images.len()
+    {
         sprite_cache.update(cx, |cache, _| {
             cache.ready(&canvas_node.sprite_images[previous_tier], window)
         })
     } else {
         None
     };
-    if sprite.is_none() {
+    if !has_blurred_images && sprite.is_none() {
         sprite = canvas_node.sprite_images.get(tier).and_then(|image| {
             sprite_cache.update(cx, |cache, cx| cache.load(image.clone(), window, cx))
         });
