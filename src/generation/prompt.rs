@@ -28,6 +28,7 @@ pub fn build_node_prompt(
     repository: &Repository,
     board: &Board,
     node: &BoardNode,
+    source_paths: &[PathBuf],
     index: usize,
     count: usize,
 ) -> String {
@@ -69,16 +70,10 @@ pub fn build_node_prompt(
                 .join("\n")
         ));
     }
-    let source_paths: Vec<_> = node
-        .source_images
-        .iter()
-        .filter_map(|url| repository.image_path(&board.id, url))
-        .filter(|path| path.exists())
-        .collect();
     if !source_paths.is_empty() {
         sections.push(format!(
             "The current image to continue from is saved at:\n{}\nView it first. The request below applies to this image: keep everything it does not ask to change.",
-            bullet_paths(&source_paths)
+            bullet_paths(source_paths)
         ));
     }
     let attachments: Vec<_> = node

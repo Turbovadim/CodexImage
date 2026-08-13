@@ -1,4 +1,5 @@
 mod codex;
+mod conditioner;
 mod prompt;
 
 use crate::manifest::{OutputManifest, absolute_file_path, is_path_inside};
@@ -280,7 +281,30 @@ impl GenerationEngine {
         }
         let workspace = self.inner.repository.paths().workspaces.join(&board.id);
         fs::create_dir_all(&workspace)?;
-        let prompt = build_node_prompt(&self.inner.repository, board, node, index, count);
+        let source_paths: Vec<_> = node
+            .source_images
+            .iter()
+            .filter_map(|url| self.inner.repository.image_path(&board.id, url))
+            .filter(|path| path.exists())
+            .collect();
+        let source_paths = conditioner::prepare_source_images(
+            &source_paths,
+            &workspace
+                .join("reingest")
+                .join(&node.id)
+                .join(node.run_started_at.unwrap_or(node.created_at).to_string()),
+        );
+        if control.termination.lock().is_some() {
+            return self.finalize(board, node, control, &mut Runtime::new());
+        }
+        let prompt = build_node_prompt(
+            &self.inner.repository,
+            board,
+            node,
+            &source_paths,
+            index,
+            count,
+        );
         let mut child = self
             .codex_exec(Sandbox::WorkspaceWrite, &workspace, prompt)
             .spawn()
