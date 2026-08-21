@@ -496,13 +496,18 @@ pub fn paint_canvas_node(
 
     paint_high_resolution_card_images(frame, &canvas_node.scene, zoom, image_cache, window, cx);
 
-    if frame.status_line.is_some()
-        && let Some(media) = canvas_node.scene.generating_media
-    {
-        paint_generating_shimmer(transform_card_rect(media, frame, zoom), window);
-    }
-
     if let Some(status_line) = &frame.status_line {
+        // A visible running card is the only thing that keeps the canvas
+        // repainting: its elapsed-time counter and its shimmer both move every
+        // frame. Asking here — rather than from a timer that ran whether or
+        // not anything was animating — means an idle app never wakes up, and a
+        // card whose media area has not appeared yet still ticks.
+        let view = window.current_view();
+        window.on_next_frame(move |_, cx| cx.notify(view));
+
+        if let Some(media) = canvas_node.scene.generating_media {
+            paint_generating_shimmer(transform_card_rect(media, frame, zoom), window);
+        }
         paint_canvas_text(
             status_line.clone(),
             canvas_bounds(
@@ -530,8 +535,7 @@ pub fn paint_canvas_node(
 }
 
 /// One shimmer cycle across the media area, as in a skeleton placeholder. The
-/// phase comes from wall-clock time, so every running card sweeps in unison
-/// and the app timer only has to trigger repaints.
+/// phase comes from wall-clock time, so every running card sweeps in unison.
 fn paint_generating_shimmer(bounds: Bounds<Pixels>, window: &mut Window) {
     const SWEEP_PERIOD_SECONDS: f32 = 1.8;
     static SHIMMER_EPOCH: OnceLock<std::time::Instant> = OnceLock::new();

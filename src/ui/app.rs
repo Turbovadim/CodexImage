@@ -33,7 +33,7 @@ use gpui_platform::application;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 pub(super) enum Overlay {
     None,
@@ -288,30 +288,6 @@ impl AppView {
                 {
                     break;
                 }
-            }
-        })
-        .detach();
-        // While a generation runs the canvas animates (shimmer over the media
-        // area), so repaint at animation rate; otherwise idle at a slow poll
-        // that exists only to pick up newly started work.
-        cx.spawn(async move |weak, cx| {
-            let mut interval = Duration::from_millis(250);
-            loop {
-                cx.background_executor().timer(interval).await;
-                let Ok(active) = weak.update(cx, |view, cx| {
-                    let active = view.engine.active_count() > 0;
-                    if active {
-                        cx.notify();
-                    }
-                    active
-                }) else {
-                    break;
-                };
-                interval = if active {
-                    Duration::from_millis(33)
-                } else {
-                    Duration::from_millis(250)
-                };
             }
         })
         .detach();
