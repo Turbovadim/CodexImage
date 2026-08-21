@@ -57,8 +57,7 @@ const BITMAP_INFO_BGRA_PREMULTIPLIED: u32 = (2 << 12) | 2;
 pub fn decode_render_image(bytes: &[u8], max_dimension: Option<u32>) -> Option<RenderImage> {
     let data = CFData::from_buffer(bytes);
     let source = unsafe {
-        let source =
-            CGImageSourceCreateWithData(data.as_concrete_TypeRef(), std::ptr::null());
+        let source = CGImageSourceCreateWithData(data.as_concrete_TypeRef(), std::ptr::null());
         if source.is_null() {
             return None;
         }
@@ -73,13 +72,17 @@ pub fn decode_render_image(bytes: &[u8], max_dimension: Option<u32>) -> Option<R
             let truthy = CFBoolean::true_value();
             let options = CFDictionary::from_CFType_pairs(&[
                 (
-                    unsafe { CFString::wrap_under_get_rule(kCGImageSourceCreateThumbnailFromImageAlways) }
-                        .as_CFType(),
+                    unsafe {
+                        CFString::wrap_under_get_rule(kCGImageSourceCreateThumbnailFromImageAlways)
+                    }
+                    .as_CFType(),
                     truthy.as_CFType(),
                 ),
                 (
-                    unsafe { CFString::wrap_under_get_rule(kCGImageSourceCreateThumbnailWithTransform) }
-                        .as_CFType(),
+                    unsafe {
+                        CFString::wrap_under_get_rule(kCGImageSourceCreateThumbnailWithTransform)
+                    }
+                    .as_CFType(),
                     truthy.as_CFType(),
                 ),
                 (

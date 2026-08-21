@@ -539,8 +539,8 @@ impl AppView {
         // Past this displayed size the capped decode would look soft, so ask
         // for the native pixels. The capped decode (or the thumbnail) stays on
         // screen until the sharper tier finishes loading.
-        let wants_native = image_width.max(image_height) * window.scale_factor()
-            > DECODED_LONG_EDGE_CAP as f32;
+        let wants_native =
+            image_width.max(image_height) * window.scale_factor() > DECODED_LONG_EDGE_CAP as f32;
         let native = wants_native
             .then(|| {
                 self.image_cache

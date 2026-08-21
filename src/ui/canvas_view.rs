@@ -939,9 +939,7 @@ impl AppView {
                     // card falls back to its pre-drag layout slot.
                     if let Some(board) = &mut this.board {
                         for (id, x, y) in &positions {
-                            if let Some(node) =
-                                board.nodes.iter_mut().find(|node| &node.id == id)
-                            {
+                            if let Some(node) = board.nodes.iter_mut().find(|node| &node.id == id) {
                                 node.x = Some(*x);
                                 node.y = Some(*y);
                             }
