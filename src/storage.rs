@@ -1,3 +1,5 @@
+mod writer;
+
 use crate::model::{
     Board, BoardNode, BoardSummary, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_TOTAL_BYTES,
     MAX_ATTACHMENTS, NewNodesRequest, NodeStatus, StopReason,
@@ -27,7 +29,14 @@ pub const SPRITE_THUMBNAIL_MAX_DIMENSION: u32 = 320;
 #[derive(Clone, Debug)]
 pub enum RepositoryEvent {
     Changed,
-    Activity { node_id: String, text: String },
+    ImagesRewritten,
+    Activity {
+        node_id: String,
+        text: String,
+    },
+    /// Saving the board list failed. Emitted by the background writer, which
+    /// has no caller left to return an error to.
+    PersistFailed(String),
 }
 
 #[derive(Clone)]
@@ -35,6 +44,7 @@ pub struct Repository {
     inner: Arc<RwLock<RepositoryState>>,
     paths: Arc<DataPaths>,
     events: async_channel::Sender<RepositoryEvent>,
+    writer: Arc<writer::BoardWriter>,
 }
 
 #[derive(Debug)]
@@ -55,6 +65,7 @@ pub struct DataPaths {
     pub root: PathBuf,
     pub boards_file: PathBuf,
     pub images: PathBuf,
+    pub generated_originals: PathBuf,
     pub workspaces: PathBuf,
     pub logs: PathBuf,
     pub output_schema: PathBuf,
@@ -94,6 +105,7 @@ impl DataPaths {
         Self {
             boards_file: root.join("boards.json"),
             images: root.join("images"),
+            generated_originals: root.join("generated-originals"),
             workspaces: root.join("workspaces"),
             logs: root.join("logs"),
             output_schema: root.join("output-manifest.schema.json"),
@@ -112,7 +124,13 @@ impl Repository {
         paths: DataPaths,
         events: async_channel::Sender<RepositoryEvent>,
     ) -> Result<Self> {
-        for directory in [&paths.root, &paths.images, &paths.workspaces, &paths.logs] {
+        for directory in [
+            &paths.root,
+            &paths.images,
+            &paths.generated_originals,
+            &paths.workspaces,
+            &paths.logs,
+        ] {
             fs::create_dir_all(directory)
                 .with_context(|| format!("failed to create {}", directory.display()))?;
         }
@@ -148,18 +166,27 @@ impl Repository {
                 }
             }
         }
-        let repository = Self {
-            inner: Arc::new(RwLock::new(RepositoryState {
-                boards,
-                trash: HashMap::new(),
-            })),
-            paths: Arc::new(paths),
-            events,
-        };
+        let state = Arc::new(RwLock::new(RepositoryState {
+            boards,
+            trash: HashMap::new(),
+        }));
+        let paths = Arc::new(paths);
+        // The startup migration runs before the app can observe anything, so
+        // it writes inline; every later save goes through the writer thread.
         if changed {
-            repository.persist()?;
+            write_boards(&paths.boards_file, &state.read().boards)?;
         }
-        Ok(repository)
+        let writer = Arc::new(writer::BoardWriter::spawn(
+            Arc::clone(&state),
+            paths.boards_file.clone(),
+            events.clone(),
+        ));
+        Ok(Self {
+            inner: state,
+            paths,
+            events,
+            writer,
+        })
     }
 
     pub fn paths(&self) -> &DataPaths {
@@ -231,7 +258,7 @@ impl Repository {
             nodes: Vec::new(),
         };
         self.inner.write().boards.push(board.clone());
-        self.persist_and_notify()?;
+        self.persist_and_notify();
         Ok(board)
     }
 
@@ -243,7 +270,8 @@ impl Repository {
         let mut state = self.inner.write();
         board_mut(&mut state, board_id)?.title = title;
         drop(state);
-        self.persist_and_notify()
+        self.persist_and_notify();
+        Ok(())
     }
 
     pub fn delete_board(&self, board_id: &str) -> Result<()> {
@@ -255,9 +283,10 @@ impl Repository {
         }
         state.trash.retain(|_, entry| entry.board_id != board_id);
         drop(state);
-        self.persist_and_notify()?;
+        self.persist_and_notify();
         for path in [
             self.paths.images.join(board_id),
+            self.paths.generated_originals.join(board_id),
             self.paths.workspaces.join(board_id),
         ] {
             let _ = fs::remove_dir_all(path);
@@ -339,7 +368,7 @@ impl Repository {
         }
         board.nodes.extend(nodes.clone());
         drop(state);
-        self.persist_and_notify()?;
+        self.persist_and_notify();
         Ok(nodes)
     }
 
@@ -389,7 +418,8 @@ impl Repository {
             }
         }
         drop(state);
-        self.persist_and_notify()
+        self.persist_and_notify();
+        Ok(())
     }
 
     pub fn update_node(
@@ -407,7 +437,7 @@ impl Repository {
         update(node);
         let node = node.clone();
         drop(state);
-        self.persist_and_notify()?;
+        self.persist_and_notify();
         Ok(node)
     }
 
@@ -456,7 +486,7 @@ impl Repository {
             },
         );
         drop(state);
-        self.persist_and_notify()?;
+        self.persist_and_notify();
         Ok((deleted_ids, undo_id))
     }
 
@@ -477,7 +507,7 @@ impl Repository {
         let ids = restored.iter().map(|node| node.id.clone()).collect();
         board.nodes.extend(restored);
         drop(state);
-        self.persist_and_notify()?;
+        self.persist_and_notify();
         Ok(ids)
     }
 
@@ -509,6 +539,76 @@ impl Repository {
     pub fn sprite_thumbnail_path(&self, board_id: &str, url: &str) -> Option<PathBuf> {
         let path = self.image_path(board_id, url)?;
         sprite_thumbnail_path_for(&path)
+    }
+
+    /// Conditions generated images saved by older app versions. Raw pixels are
+    /// archived first, and a per-image marker makes the sweep a one-time cost.
+    pub fn condition_existing_generated_images(&self) {
+        if !crate::generation::conditioner::enabled() {
+            return;
+        }
+        let candidates = {
+            let state = self.inner.read();
+            let mut seen = HashSet::new();
+            state
+                .boards
+                .iter()
+                .flat_map(|board| {
+                    board.nodes.iter().flat_map(|node| {
+                        node.attempts
+                            .iter()
+                            .map(|url| (board.id.clone(), url.clone()))
+                    })
+                })
+                .filter(|candidate| seen.insert(candidate.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        let mut rewritten = false;
+        for (board_id, url) in candidates {
+            rewritten |= self
+                .condition_existing_generated_image(&board_id, &url)
+                .unwrap_or(false);
+        }
+        if rewritten {
+            let _ = self.events.try_send(RepositoryEvent::ImagesRewritten);
+        }
+    }
+
+    fn condition_existing_generated_image(&self, board_id: &str, url: &str) -> Result<bool> {
+        let source = self
+            .image_path(board_id, url)
+            .filter(|path| path.is_file())
+            .context("stored generated image was missing")?;
+        let (original, marker) = self.generated_original_paths(board_id, &source)?;
+        if marker.exists() {
+            return Ok(false);
+        }
+
+        let recovering_interrupted_migration = original.exists();
+        if !recovering_interrupted_migration {
+            atomic_copy(&source, &original)?;
+        }
+        let temporary = source.with_file_name(format!(
+            ".conditioned-{}-{}",
+            Uuid::new_v4(),
+            source.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        let result = (|| -> Result<bool> {
+            let applied =
+                crate::generation::conditioner::condition_generated_image(&source, &temporary)?;
+            if applied {
+                fs::rename(&temporary, &source)?;
+            }
+            if applied || recovering_interrupted_migration {
+                remove_thumbnails(&source);
+                create_thumbnail(&source)?;
+            }
+            atomic_write(&marker, b"conditioned-v1\n")?;
+            Ok(applied || recovering_interrupted_migration)
+        })();
+        let _ = fs::remove_file(&temporary);
+        result.with_context(|| format!("failed to condition {}", source.display()))
     }
 
     /// Re-creates every stored thumbnail that is smaller than the current
@@ -626,7 +726,42 @@ impl Repository {
         if !metadata.is_file() || metadata.len() == 0 {
             bail!("generated image was empty");
         }
-        Ok(self.copy_into_board(board_id, source)?.1)
+        let directory = self.paths.images.join(board_id);
+        fs::create_dir_all(&directory)?;
+        let name = fresh_image_name(source);
+        let destination = directory.join(&name);
+        let (original, marker) = self.generated_original_paths(board_id, &destination)?;
+        let result = (|| -> Result<String> {
+            atomic_copy(source, &original)?;
+            let applied =
+                crate::generation::conditioner::condition_generated_image(source, &destination)?;
+            if !applied {
+                fs::copy(source, &destination)?;
+            }
+            create_thumbnail(&destination)?;
+            if crate::generation::conditioner::enabled() {
+                atomic_write(&marker, b"conditioned-v1\n")?;
+            }
+            Ok(format!("/images/{board_id}/{name}"))
+        })();
+        if result.is_err() {
+            remove_image_and_thumbnail(&destination);
+            let _ = fs::remove_file(&original);
+            let _ = fs::remove_file(&marker);
+        }
+        result
+    }
+
+    fn generated_original_paths(
+        &self,
+        board_id: &str,
+        stored_image: &Path,
+    ) -> Result<(PathBuf, PathBuf)> {
+        let name = stored_image.file_name().context("image had no file name")?;
+        let directory = self.paths.generated_originals.join(board_id);
+        let original = directory.join(name);
+        let marker = directory.join(format!("{}.conditioned-v1", name.to_string_lossy()));
+        Ok((original, marker))
     }
 
     /// Copies `source` into the board's image directory under a fresh name and
@@ -634,12 +769,7 @@ impl Repository {
     fn copy_into_board(&self, board_id: &str, source: &Path) -> Result<(PathBuf, String)> {
         let directory = self.paths.images.join(board_id);
         fs::create_dir_all(&directory)?;
-        let name = format!(
-            "{}-{}-{}",
-            now_ms(),
-            &Uuid::new_v4().to_string()[..8],
-            sanitize_filename(&source.file_name().unwrap_or_default().to_string_lossy())
-        );
+        let name = fresh_image_name(source);
         let destination = directory.join(&name);
         fs::copy(source, &destination)?;
         if let Err(error) = create_thumbnail(&destination) {
@@ -649,16 +779,22 @@ impl Repository {
         Ok((destination, format!("/images/{board_id}/{name}")))
     }
 
-    fn persist_and_notify(&self) -> Result<()> {
-        self.persist()?;
+    /// Queues the mutated state for saving and tells open views to re-read it.
+    /// Saving is deliberately not awaited: it happens on the writer thread so
+    /// no caller — least of all the render thread — blocks on `fsync`.
+    fn persist_and_notify(&self) {
+        self.writer.request();
         let _ = self.events.try_send(RepositoryEvent::Changed);
-        Ok(())
     }
 
-    pub fn persist(&self) -> Result<()> {
-        let bytes = serde_json::to_vec_pretty(&self.inner.read().boards)?;
-        atomic_write(&self.paths.boards_file, &bytes)
+    /// Blocks until every mutation so far is on disk. Call before quitting.
+    pub fn flush(&self) {
+        self.writer.flush();
     }
+}
+
+fn write_boards(path: &Path, boards: &[Board]) -> Result<()> {
+    atomic_write(path, &serde_json::to_vec_pretty(boards)?)
 }
 
 fn load_boards(path: &Path) -> Result<Vec<Board>> {
@@ -715,6 +851,30 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     result.with_context(|| format!("failed to save {}", path.display()))
 }
 
+fn atomic_copy(source: &Path, destination: &Path) -> Result<()> {
+    let parent = destination
+        .parent()
+        .context("destination has no parent directory")?;
+    fs::create_dir_all(parent)?;
+    let temporary = destination.with_extension(format!("tmp-{}", Uuid::new_v4()));
+    let result = (|| -> Result<()> {
+        fs::copy(source, &temporary)?;
+        File::open(&temporary)?.sync_all()?;
+        fs::rename(&temporary, destination)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.with_context(|| {
+        format!(
+            "failed to preserve generated original {}",
+            destination.display()
+        )
+    })
+}
+
 fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
     if fs::read(path).is_ok_and(|current| current == bytes) {
         return Ok(());
@@ -769,6 +929,10 @@ fn save_thumbnail(
 
 fn remove_image_and_thumbnail(source: &Path) {
     let _ = fs::remove_file(source);
+    remove_thumbnails(source);
+}
+
+fn remove_thumbnails(source: &Path) {
     if let Some(name) = source.file_name() {
         for prefix in ["t_", "s_"] {
             let name = name.to_string_lossy();
@@ -776,6 +940,15 @@ fn remove_image_and_thumbnail(source: &Path) {
             let _ = fs::remove_file(source.with_file_name(format!("{prefix}{name}.png")));
         }
     }
+}
+
+fn fresh_image_name(source: &Path) -> String {
+    format!(
+        "{}-{}-{}",
+        now_ms(),
+        &Uuid::new_v4().to_string()[..8],
+        sanitize_filename(&source.file_name().unwrap_or_default().to_string_lossy())
+    )
 }
 
 pub fn thumbnail_path_for(source: &Path) -> Option<PathBuf> {
@@ -831,10 +1004,44 @@ pub fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{create_thumbnail, thumbnail_path_for};
-    use image::{ImageFormat, Rgba, RgbaImage};
+    use super::{DataPaths, Repository, RepositoryEvent, create_thumbnail, thumbnail_path_for};
+    use crate::model::NewNodesRequest;
+    use async_channel::{Receiver, unbounded};
+    use image::{ColorType, DynamicImage, ImageFormat, Rgba, RgbaImage};
+    use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
+
+    fn repository(directory: &TempDir) -> (Repository, Receiver<RepositoryEvent>) {
+        let generated = directory.path().join("generated");
+        fs::create_dir_all(&generated).unwrap();
+        let (sender, receiver) = unbounded();
+        (
+            Repository::open_at(
+                DataPaths::at(directory.path().join("data"), generated),
+                sender,
+            )
+            .unwrap(),
+            receiver,
+        )
+    }
+
+    fn save_patterned_image(path: &Path) {
+        let image = RgbaImage::from_fn(64, 64, |x, y| {
+            let offset = match (y % 2, x % 2) {
+                (0, 0) => 1,
+                (1, 1) => -1,
+                _ => 0,
+            };
+            Rgba([
+                (128_i16 + offset) as u8,
+                (96_i16 + offset) as u8,
+                (64_i16 + offset) as u8,
+                255,
+            ])
+        });
+        DynamicImage::ImageRgba8(image).save(path).unwrap();
+    }
 
     #[test]
     fn thumbnail_paths_preserve_svg_embeddable_formats() {
@@ -868,5 +1075,107 @@ mod tests {
                 .format(),
             Some(ImageFormat::Png)
         );
+    }
+
+    /// Board mutations arrive from the main thread and from every generation
+    /// worker at once, and they no longer write the file themselves. Closing
+    /// the repository must still leave every one of them on disk.
+    #[test]
+    fn concurrent_mutations_all_survive_a_reopen() {
+        let directory = TempDir::new().unwrap();
+        let (open, _receiver) = repository(&directory);
+        let boards: Vec<_> = (0..8).map(|_| open.create_board().unwrap().id).collect();
+
+        std::thread::scope(|scope| {
+            for (index, board_id) in boards.iter().enumerate() {
+                let open = open.clone();
+                scope.spawn(move || {
+                    for revision in 0..20 {
+                        open.rename_board(board_id, &format!("board {index} rev {revision}"))
+                            .unwrap();
+                    }
+                });
+            }
+        });
+        drop(open);
+
+        let (reopened, _) = repository(&directory);
+        for (index, board_id) in boards.iter().enumerate() {
+            assert_eq!(
+                reopened.board(board_id).unwrap().title,
+                format!("board {index} rev 19")
+            );
+        }
+    }
+
+    #[test]
+    fn generated_import_archives_raw_bytes_and_stores_the_conditioned_copy() {
+        let directory = TempDir::new().unwrap();
+        let (repository, _) = repository(&directory);
+        let board = repository.create_board().unwrap();
+        let source = directory.path().join("generated/source.png");
+        save_patterned_image(&source);
+        let raw_bytes = fs::read(&source).unwrap();
+
+        let url = repository.import_generated(&board.id, &source).unwrap();
+        let stored = repository.image_path(&board.id, &url).unwrap();
+        let (original, marker) = repository
+            .generated_original_paths(&board.id, &stored)
+            .unwrap();
+
+        assert_eq!(fs::read(original).unwrap(), raw_bytes);
+        assert!(marker.exists());
+        assert_eq!(image::open(stored).unwrap().color(), ColorType::Rgba16);
+    }
+
+    #[test]
+    fn legacy_generated_images_are_conditioned_once_and_emit_a_cache_refresh() {
+        let directory = TempDir::new().unwrap();
+        let (repository, receiver) = repository(&directory);
+        let board = repository.create_board().unwrap();
+        let source = directory.path().join("legacy.png");
+        save_patterned_image(&source);
+        let raw_bytes = fs::read(&source).unwrap();
+        let (_, url) = repository.copy_into_board(&board.id, &source).unwrap();
+        let node = repository
+            .add_nodes(
+                &board.id,
+                NewNodesRequest {
+                    prompt: "legacy".into(),
+                    parent_id: None,
+                    source_images: None,
+                    aspect: "auto".into(),
+                    count: 1,
+                    attachment_paths: Vec::new(),
+                    attachment_urls: Vec::new(),
+                    position: None,
+                },
+            )
+            .unwrap()
+            .remove(0);
+        repository
+            .update_node(&board.id, &node.id, |node| {
+                node.attempts = vec![url.clone()];
+                node.images = vec![url.clone()];
+            })
+            .unwrap();
+        while receiver.try_recv().is_ok() {}
+
+        repository.condition_existing_generated_images();
+
+        let stored = repository.image_path(&board.id, &url).unwrap();
+        let (original, marker) = repository
+            .generated_original_paths(&board.id, &stored)
+            .unwrap();
+        assert_eq!(fs::read(original).unwrap(), raw_bytes);
+        assert!(marker.exists());
+        assert_eq!(image::open(stored).unwrap().color(), ColorType::Rgba16);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(RepositoryEvent::ImagesRewritten)
+        ));
+
+        repository.condition_existing_generated_images();
+        assert!(receiver.try_recv().is_err());
     }
 }

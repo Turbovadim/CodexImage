@@ -117,11 +117,13 @@ pub fn run() -> Result<()> {
     let (sender, receiver) = async_channel::bounded(1_024);
     let repository = crate::storage::Repository::open(sender)?;
     super::disk_cache::init(repository.paths().root.join("decoded-cache"));
-    // One sequential background pass; it only decodes anything after an
-    // upgrade that raised THUMBNAIL_MAX_DIMENSION, and announces a refresh
-    // when it sharpened something.
+    // One sequential background pass archives and conditions legacy generated
+    // images once, then catches up thumbnails created by older versions.
     let sweeper = repository.clone();
-    std::thread::spawn(move || sweeper.refresh_undersized_thumbnails());
+    std::thread::spawn(move || {
+        sweeper.condition_existing_generated_images();
+        sweeper.refresh_undersized_thumbnails();
+    });
     let engine = GenerationEngine::new(repository);
     let engine_for_quit = engine.clone();
     application().run(move |cx: &mut App| {
@@ -265,10 +267,16 @@ impl AppView {
         view.refresh_image_metadata(cx);
         view.refresh_layout();
         let receiver = view.receiver.clone();
+        let window_handle = window.window_handle();
         cx.spawn(async move |weak, cx| {
             while let Ok(event) = receiver.recv().await {
-                if weak
-                    .update(cx, |view, cx| view.handle_repository_event(event, cx))
+                if window_handle
+                    .update(cx, |_, window, cx| {
+                        weak.update(cx, |view, cx| {
+                            view.handle_repository_event(event, window, cx)
+                        })
+                    })
+                    .and_then(|result| result)
                     .is_err()
                 {
                     break;
@@ -304,7 +312,12 @@ impl AppView {
         view
     }
 
-    fn handle_repository_event(&mut self, event: RepositoryEvent, cx: &mut Context<Self>) {
+    fn handle_repository_event(
+        &mut self,
+        event: RepositoryEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match event {
             RepositoryEvent::Changed => {
                 if let Some(id) = self.board_id.as_deref() {
@@ -313,8 +326,27 @@ impl AppView {
                 self.refresh_image_metadata(cx);
                 self.refresh_layout();
             }
+            RepositoryEvent::ImagesRewritten => {
+                self.clear_render_caches(window, cx);
+                self.image_assets.clear();
+                self.image_ratios.clear();
+                self.pending_image_jobs.clear();
+                if let Some(id) = self.board_id.as_deref() {
+                    self.board = self.engine.repository().board(id);
+                }
+                self.refresh_image_metadata(cx);
+                self.refresh_layout();
+            }
             RepositoryEvent::Activity { node_id, text } => {
                 self.activity.insert(node_id, text);
+            }
+            RepositoryEvent::PersistFailed(message) => {
+                self.show_toast(
+                    format!("Could not save this board: {message}"),
+                    true,
+                    None,
+                    cx,
+                );
             }
         }
         cx.notify();

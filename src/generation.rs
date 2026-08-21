@@ -1,6 +1,8 @@
 mod codex;
-mod conditioner;
+pub(crate) mod conditioner;
 mod prompt;
+
+pub use conditioner::condition_image_for_reingestion;
 
 use crate::manifest::{OutputManifest, absolute_file_path, is_path_inside};
 use crate::model::{
@@ -206,7 +208,7 @@ impl GenerationEngine {
         for id in ids {
             self.stop(&id, Termination::AppQuit, libc::SIGKILL);
         }
-        let _ = self.inner.repository.persist();
+        self.inner.repository.flush();
     }
 
     fn start_job(&self, board_id: &str, node_id: &str, index: usize, count: usize) -> Result<()> {
@@ -287,13 +289,21 @@ impl GenerationEngine {
             .filter_map(|url| self.inner.repository.image_path(&board.id, url))
             .filter(|path| path.exists())
             .collect();
-        let source_paths = conditioner::prepare_source_images(
-            &source_paths,
-            &workspace
-                .join("reingest")
-                .join(&node.id)
-                .join(node.run_started_at.unwrap_or(node.created_at).to_string()),
-        );
+        let reingest_directory = workspace
+            .join("reingest")
+            .join(&node.id)
+            .join(node.run_started_at.unwrap_or(node.created_at).to_string());
+        let source_paths = conditioner::prepare_source_images(&source_paths, &reingest_directory);
+        let same_run_conditioner = if conditioner::enabled() {
+            std::env::current_exe().ok().and_then(|executable| {
+                let directory = reingest_directory.join("same-run");
+                fs::create_dir_all(&directory)
+                    .ok()
+                    .map(|()| (executable, directory))
+            })
+        } else {
+            None
+        };
         if control.termination.lock().is_some() {
             return self.finalize(board, node, control, &mut Runtime::new());
         }
@@ -302,6 +312,9 @@ impl GenerationEngine {
             board,
             node,
             &source_paths,
+            same_run_conditioner
+                .as_ref()
+                .map(|(executable, directory)| (executable.as_path(), directory.as_path())),
             index,
             count,
         );
