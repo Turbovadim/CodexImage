@@ -7,9 +7,9 @@
 
 use gpui::{Hsla, rgb};
 
-pub const BACKGROUND: u32 = 0x0d0e12;
-pub const RAISED: u32 = 0x14161c;
-pub const HOVER: u32 = 0x1b1e26;
+pub const BACKGROUND: u32 = 0x000000;
+pub const RAISED: u32 = 0x101116;
+pub const HOVER: u32 = 0x1a1c23;
 pub const LINE: u32 = 0x262a35;
 pub const INK: u32 = 0xe8eaf0;
 pub const DIM: u32 = 0x8b90a0;

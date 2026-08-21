@@ -26,7 +26,7 @@ use crate::storage::{
 use anyhow::{Context as _, Result};
 use gpui::{
     App, AppContext, Bounds, Context, Entity, ExternalPaths, FocusHandle, Focusable, ListAlignment,
-    ListState, MouseButton, Render, SharedString, TitlebarOptions, Window, WindowBounds,
+    ListState, MouseButton, Render, Role, SharedString, TitlebarOptions, Window, WindowBounds,
     WindowOptions, div, point, prelude::*, px, size,
 };
 use gpui_platform::application;
@@ -468,9 +468,10 @@ impl AppView {
             return;
         };
         let repository = self.engine.repository();
-        let mut assets = HashMap::new();
         let mut jobs = Vec::new();
-        let mut seen = HashSet::new();
+        // Borrow the board's URLs while reconciling instead of cloning every
+        // string into a temporary set on each repository update.
+        let mut seen: HashSet<&str> = HashSet::new();
         for url in board.nodes.iter().flat_map(|node| {
             node.images
                 .iter()
@@ -478,20 +479,13 @@ impl AppView {
                 .chain(&node.attachments)
                 .chain(&node.source_images)
         }) {
-            if !seen.insert(url.clone()) {
+            if !seen.insert(url.as_str()) {
                 continue;
             }
-            if let Some(mut resolved) = self.image_assets.remove(url) {
-                // A sprite thumbnail that appeared since (the startup sweep
-                // creates them in the background) upgrades the cached asset.
-                if resolved.sprite == resolved.thumbnail
-                    && let Some(sprite) = repository
-                        .sprite_thumbnail_path(board_id, url)
-                        .filter(|path| path.exists())
-                {
-                    resolved.sprite = sprite;
-                }
-                assets.insert(url.clone(), resolved);
+            // Existing assets were already resolved by a background image job.
+            // Keeping them in place avoids rebuilding the PathBuf-heavy map and
+            // rechecking missing sprite files on every repository update.
+            if self.image_assets.contains_key(url) {
                 continue;
             }
             let Some(original) = repository.image_path(board_id, url) else {
@@ -516,7 +510,7 @@ impl AppView {
                 });
             }
             let thumbnail = ready_thumbnail.unwrap_or_else(|| original.clone());
-            assets.insert(
+            self.image_assets.insert(
                 url.clone(),
                 ImageAsset {
                     sprite: ready_sprite.unwrap_or_else(|| thumbnail.clone()),
@@ -525,9 +519,13 @@ impl AppView {
                 },
             );
         }
-        self.image_ratios.retain(|url, _| seen.contains(url));
-        self.pending_image_jobs.retain(|url| seen.contains(url));
-        self.image_assets = assets;
+        self.image_assets
+            .retain(|url, _| seen.contains(url.as_str()));
+        self.image_ratios
+            .retain(|url, _| seen.contains(url.as_str()));
+        self.pending_image_jobs
+            .retain(|url| seen.contains(url.as_str()));
+        drop(seen);
         self.spawn_image_jobs(jobs, cx);
     }
 
@@ -777,8 +775,12 @@ impl Render for AppView {
             .is_none_or(|board| board.nodes.is_empty());
         let overlay_covers_canvas = matches!(self.overlay, Overlay::Gallery | Overlay::Lightbox(_));
         let mut root = div()
-            .key_context("CodexImage")
             .image_cache(self.image_cache.clone())
+            .id("codex-image-app")
+            .accessibility_id("codex-image.application")
+            .key_context("CodexImage")
+            .role(Role::Application)
+            .aria_label(APP_NAME)
             .track_focus(&self.focus)
             .size_full()
             .overflow_hidden()

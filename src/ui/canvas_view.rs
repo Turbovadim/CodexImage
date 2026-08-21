@@ -21,8 +21,8 @@ use crate::model::{BoardNode, NodeStatus};
 use crate::storage::now_ms;
 use gpui::{
     AnyElement, Bounds, ClipboardItem, Context, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PinchEvent, Pixels, Point, ScrollWheelEvent, SharedString, Window, canvas, div,
-    fill, point, prelude::*, px, size,
+    MouseUpEvent, PinchEvent, Pixels, Point, Role, ScrollWheelEvent, SharedString, Window, canvas,
+    div, fill, point, prelude::*, px, size,
 };
 
 pub(super) const NODE_TOOLBAR_HEIGHT: f32 = 36.;
@@ -427,6 +427,7 @@ impl AppView {
         let button = |id: &'static str, label: &'static str| {
             div()
                 .id(id)
+                .role(Role::Button)
                 .flex()
                 .items_center()
                 .justify_center()
@@ -454,6 +455,7 @@ impl AppView {
             .block_mouse_except_scroll()
             .child(
                 button("zoom-out", "−")
+                    .aria_label("Zoom out")
                     .tooltip(tip_with_shortcut("Zoom out", Some("⌘−")))
                     .on_click(
                         cx.listener(|this, _, window, cx| this.zoom_out(&ZoomOut, window, cx)),
@@ -462,6 +464,8 @@ impl AppView {
             .child(
                 div()
                     .id("zoom-level")
+                    .role(Role::Button)
+                    .aria_label("Reset zoom to actual size")
                     .px_1()
                     .min_w(px(42.))
                     .text_center()
@@ -477,11 +481,13 @@ impl AppView {
             )
             .child(
                 button("zoom-in", "+")
+                    .aria_label("Zoom in")
                     .tooltip(tip_with_shortcut("Zoom in", Some("⌘+")))
                     .on_click(cx.listener(|this, _, window, cx| this.zoom_in(&ZoomIn, window, cx))),
             )
             .child(
                 button("zoom-fit", "⤢")
+                    .aria_label("Fit board to view")
                     .tooltip(tip_with_shortcut("Fit board to view", Some("F")))
                     .on_click(
                         cx.listener(|this, _, window, cx| this.fit_action(&FitCanvas, window, cx)),
@@ -642,6 +648,9 @@ impl AppView {
         Some(
             div()
                 .id("minimap")
+                .accessibility_id("codex-image.minimap")
+                .role(Role::Button)
+                .aria_label("Canvas minimap. Click to move the camera")
                 .absolute()
                 .right(px(RIGHT))
                 .bottom(px(BOTTOM))

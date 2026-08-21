@@ -84,9 +84,13 @@ impl GalleryRow {
     }
 }
 
-fn render_gallery_row(row: &GalleryRow, view: WeakEntity<AppView>) -> AnyElement {
+fn render_gallery_row(
+    row: &GalleryRow,
+    view: WeakEntity<AppView>,
+    available_width: f32,
+) -> AnyElement {
     let node = &row.node;
-    let mut strip = div().flex_1().flex().flex_wrap().gap_2();
+    let mut strip = div().min_w_0().flex_1().flex().flex_wrap().gap_2();
     if node.images.is_empty() {
         strip = strip.child(
             div()
@@ -158,6 +162,8 @@ fn render_gallery_row(row: &GalleryRow, view: WeakEntity<AppView>) -> AnyElement
     let locate_id = node.id.clone();
     let locate_view = view;
     div()
+        .w(px(available_width.max(0.)))
+        .min_w_0()
         .border_b_1()
         .border_color(theme::line().opacity(0.7))
         .py_4()
@@ -188,6 +194,8 @@ fn render_gallery_row(row: &GalleryRow, view: WeakEntity<AppView>) -> AnyElement
                 .child(
                     div()
                         .id(SharedString::from(format!("locate-{}", node.id)))
+                        .role(Role::Button)
+                        .aria_label("Show this generation on the canvas")
                         .mt_2()
                         .text_xs()
                         .text_color(theme::accent())
@@ -388,6 +396,8 @@ impl AppView {
             list = list.child(
                 div()
                     .id(SharedString::from(format!("board-{}", summary.id)))
+                    .role(Role::Button)
+                    .aria_label(format!("Open board {}", summary.title))
                     .flex()
                     .items_center()
                     .gap_2()
@@ -425,6 +435,8 @@ impl AppView {
                     .child(
                         div()
                             .id(SharedString::from(format!("rename-{}", rename_id)))
+                            .role(Role::Button)
+                            .aria_label(format!("Rename board {}", summary.title))
                             .px_2()
                             .py_1()
                             .rounded_md()
@@ -454,6 +466,12 @@ impl AppView {
                     .child(
                         div()
                             .id(SharedString::from(format!("delete-board-{}", delete_id)))
+                            .role(Role::Button)
+                            .aria_label(if armed {
+                                format!("Confirm deleting board {}", summary.title)
+                            } else {
+                                format!("Delete board {}", summary.title)
+                            })
                             .px_2()
                             .py_1()
                             .rounded_md()
@@ -525,6 +543,8 @@ impl AppView {
             .child(
                 div()
                     .id("new-board")
+                    .role(Role::Button)
+                    .aria_label("Create a new board")
                     .border_t_1()
                     .border_color(theme::line())
                     .px_4()
@@ -553,15 +573,23 @@ impl AppView {
         let node_count = board.map(|board| board.nodes.len()).unwrap_or(0);
         let rows = self.gallery_rows.clone();
         let view = cx.weak_entity();
-        let content = div().flex_1().min_h_0().px_6().pb_8().child(
+        let content = div().w_full().flex_1().min_h_0().px_6().pb_8().child(
             list(
                 self.gallery_list_state.clone(),
-                move |index, _window, _cx| render_gallery_row(&rows[index], view.clone()),
+                move |index, window, _cx| {
+                    render_gallery_row(
+                        &rows[index],
+                        view.clone(),
+                        f32::from(window.viewport_size().width) - 48.,
+                    )
+                },
             )
-            .size_full(),
+            .w_full()
+            .h_full(),
         );
         div()
             .id("gallery")
+            .accessibility_id("codex-image.gallery")
             .role(Role::Dialog)
             .aria_label("Image gallery")
             .absolute()
@@ -611,6 +639,9 @@ impl AppView {
                     .child(
                         div()
                             .id("close-gallery")
+                            .accessibility_id("codex-image.gallery.close")
+                            .role(Role::Button)
+                            .aria_label("Close image gallery")
                             .size(px(32.))
                             .rounded_lg()
                             .border_1()
@@ -642,6 +673,8 @@ impl AppView {
     ) -> AnyElement {
         div()
             .id("modal-overlay")
+            .role(Role::Dialog)
+            .aria_label(title.to_owned())
             .absolute()
             .inset_0()
             .bg(gpui::black().opacity(0.72))
@@ -698,6 +731,8 @@ impl AppView {
                             .child(
                                 div()
                                     .id("modal-submit")
+                                    .role(Role::Button)
+                                    .aria_label(action.to_owned())
                                     .rounded_lg()
                                     .bg(theme::accent_strong())
                                     .px_4()
@@ -784,6 +819,8 @@ impl AppView {
             .child(
                 div()
                     .id("node-text-panel")
+                    .role(Role::Dialog)
+                    .aria_label("Codex message")
                     .w(px(560.))
                     .rounded_xl()
                     .border_1()
@@ -817,7 +854,10 @@ impl AppView {
             .occlude()
             .child(
                 div()
+                    .id("quit-confirm-dialog")
                     .w(px(480.))
+                    .role(Role::Dialog)
+                    .aria_label("Generations are still running")
                     .rounded_xl()
                     .border_1()
                     .border_color(theme::line())
@@ -855,6 +895,8 @@ impl AppView {
                             .child(
                                 div()
                                     .id("terminate-quit")
+                                    .role(Role::Button)
+                                    .aria_label("Terminate generations and quit")
                                     .rounded_lg()
                                     .bg(theme::danger().opacity(0.15))
                                     .px_4()
@@ -913,6 +955,8 @@ impl AppView {
             row = row.child(
                 div()
                     .id("undo")
+                    .role(Role::Button)
+                    .aria_label("Undo deletion")
                     .rounded_lg()
                     .border_1()
                     .border_color(theme::accent_strong())
@@ -934,6 +978,8 @@ impl AppView {
         row.child(
             div()
                 .id("dismiss-toast")
+                .role(Role::Button)
+                .aria_label("Dismiss notification")
                 .px_1()
                 .rounded_md()
                 .text_color(theme::faint())

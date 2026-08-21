@@ -709,6 +709,8 @@ impl AppView {
                     .child(
                         div()
                             .id("quick-continue")
+                            .role(Role::Button)
+                            .aria_label("Continue from this image")
                             .rounded_lg()
                             .bg(theme::accent_strong())
                             .px_4()
@@ -738,6 +740,8 @@ impl AppView {
             }
             let mut chevron = div()
                 .id(id)
+                .role(Role::Button)
+                .aria_label(hint)
                 .absolute()
                 .top(px(viewport_height / 2. - 26.))
                 .size(px(52.))

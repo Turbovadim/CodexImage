@@ -230,6 +230,8 @@ impl AppView {
                     .child(
                         div()
                             .id(SharedString::from(format!("cancel-target-{cancel_id}")))
+                            .role(Role::Button)
+                            .aria_label("Cancel branching target")
                             .cursor_pointer()
                             .text_color(theme::faint())
                             .child("×")
@@ -290,6 +292,8 @@ impl AppView {
         let pill = |id: &'static str, label: String| {
             div()
                 .id(id)
+                .role(Role::Button)
+                .aria_label(label.clone())
                 .px_2()
                 .py_1()
                 .rounded_md()
@@ -329,6 +333,7 @@ impl AppView {
                         .when(attachments_full, |pill| {
                             pill.text_color(theme::faint())
                                 .border_color(theme::line().opacity(0.5))
+                                .cursor_default()
                         })
                         .tooltip(tip_with_shortcut(
                             if attachments_full {
@@ -338,9 +343,11 @@ impl AppView {
                             },
                             Some("⌘O"),
                         ))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.add_attachment(&AddAttachment, window, cx)
-                        })),
+                        .when(!attachments_full, |pill| {
+                            pill.on_click(cx.listener(|this, _, window, cx| {
+                                this.add_attachment(&AddAttachment, window, cx)
+                            }))
+                        }),
                 )
                 .child(div().flex_1().child(self.prompt.clone()))
                 .child(
@@ -392,6 +399,8 @@ impl AppView {
             samples = samples.child(
                 div()
                     .id(SharedString::from(format!("sample-{index}")))
+                    .role(Role::Button)
+                    .aria_label(format!("Use sample prompt: {sample}"))
                     .rounded_full()
                     .border_1()
                     .border_color(theme::line())
@@ -431,9 +440,13 @@ impl AppView {
         let generating = self.engine.active_count() > 0;
         let mut header = div()
             .id("board-switcher")
+            .accessibility_id("codex-image.board-switcher")
+            .role(Role::Button)
+            .aria_label(format!("Switch board. Current board: {title}"))
+            .aria_keyshortcuts("Meta+K")
             .absolute()
             .top(px(14.))
-            .left(px(18.))
+            .left(px(if cfg!(target_os = "macos") { 78. } else { 18. }))
             .flex()
             .items_center()
             .gap_2()
@@ -474,6 +487,10 @@ impl AppView {
             .then(|| {
                 div()
                     .id("gallery-button")
+                    .accessibility_id("codex-image.gallery.open")
+                    .role(Role::Button)
+                    .aria_label("Open image gallery")
+                    .aria_keyshortcuts("G")
                     .absolute()
                     .top(px(14.))
                     .right(px(18.))

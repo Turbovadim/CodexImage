@@ -660,7 +660,9 @@ impl Repository {
             }
         }
         if regenerated {
-            let _ = self.events.try_send(RepositoryEvent::Changed);
+            // Thumbnail paths held by the view must be resolved again after a
+            // sweep replaces files in place.
+            let _ = self.events.try_send(RepositoryEvent::ImagesRewritten);
         }
     }
 
