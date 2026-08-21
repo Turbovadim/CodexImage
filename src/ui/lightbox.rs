@@ -809,16 +809,28 @@ impl AppView {
         root.into_any_element()
     }
 
+    /// Copies the full-resolution original. Originals run to several megabytes,
+    /// so the read happens off the main thread; only the clipboard write, which
+    /// is a platform call, comes back to it.
     fn copy_image(&mut self, path: &Path, cx: &mut Context<Self>) {
-        match fs::read(path).and_then(|bytes| {
-            let format = image_format_for_path(path)
-                .ok_or_else(|| std::io::Error::other("unsupported image format"))?;
-            cx.write_to_clipboard(ClipboardItem::new_image(&Image::from_bytes(format, bytes)));
-            Ok(())
-        }) {
-            Ok(()) => self.show_toast("Image copied".into(), false, None, cx),
-            Err(error) => self.show_error(error, cx),
-        }
+        let Some(format) = image_format_for_path(path) else {
+            self.show_error("Unsupported image format", cx);
+            return;
+        };
+        let path = path.to_owned();
+        cx.spawn(async move |weak, cx| {
+            let bytes = smol::unblock(move || fs::read(path)).await;
+            let _ = weak.update(cx, |view, cx| match bytes {
+                Ok(bytes) => {
+                    cx.write_to_clipboard(ClipboardItem::new_image(&Image::from_bytes(
+                        format, bytes,
+                    )));
+                    view.show_toast("Image copied".into(), false, None, cx);
+                }
+                Err(error) => view.show_error(error, cx),
+            });
+        })
+        .detach();
     }
 
     fn save_image(&mut self, source: PathBuf, cx: &mut Context<Self>) {

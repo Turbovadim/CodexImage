@@ -195,11 +195,20 @@ impl<K: Clone + Eq + Hash> EvictionCycle<K> {
     }
 }
 
+/// A blurred stand-in, or the work that is producing one.
+enum Blurred {
+    /// Dropping the task cancels the blur, so an evicted entry stops paying.
+    Pending {
+        _task: Task<()>,
+    },
+    Ready(Arc<RenderImage>),
+}
+
 pub(super) struct DecodedImageCache {
     entries: HashMap<DecodeKey, CacheEntry>,
     /// Tiny pre-blurred copies of decoded images, shown for in-progress
     /// generations. Each one lives and dies with its base entry.
-    blurred: HashMap<DecodeKey, Arc<RenderImage>>,
+    blurred: HashMap<DecodeKey, Blurred>,
     decoded_bytes: usize,
     byte_budget: usize,
     max_items: usize,
@@ -328,6 +337,11 @@ impl DecodedImageCache {
     /// Loads the heavily blurred stand-in for an image. The base image decode
     /// is started (and kept warm) through the normal `load` path; the blur is
     /// computed once from the decoded thumbnail and cached beside it.
+    ///
+    /// The convolution costs about 8 ms per image — half a frame, and a branch
+    /// off four source images would blur all four in the same one — so it runs
+    /// on the background executor. Until it lands this returns `None` and the
+    /// caller simply skips that image, which the shimmer already covers.
     pub fn load_blurred(
         &mut self,
         resource: &Resource,
@@ -339,15 +353,43 @@ impl DecodedImageCache {
             resource: resource.clone(),
             max_dimension: Some(DECODED_LONG_EDGE_CAP),
         };
-        if let Some(blurred) = self.blurred.get(&key) {
-            return Some(blurred.clone());
+        match self.blurred.get(&key) {
+            Some(Blurred::Ready(blurred)) => return Some(blurred.clone()),
+            Some(Blurred::Pending { .. }) => return None,
+            None => {}
         }
-        let blurred = Arc::new(blur_render_image(&base)?);
-        self.decoded_bytes = self
-            .decoded_bytes
-            .saturating_add(decoded_image_bytes(&blurred));
-        self.blurred.insert(key, blurred.clone());
-        Some(blurred)
+
+        let view = window.current_view();
+        let cache = self.weak_self.clone();
+        let pending = key.clone();
+        let task = window.spawn(cx, async move |cx| {
+            let blurred = cx
+                .background_executor()
+                .spawn(async move { blur_render_image(&base) })
+                .await;
+            let stored = cache
+                .update(cx, |cache, _| {
+                    // The base entry may have been evicted while this ran, in
+                    // which case the stand-in has nothing left to stand in for.
+                    let Some(blurred) = blurred.filter(|_| cache.entries.contains_key(&pending))
+                    else {
+                        cache.blurred.remove(&pending);
+                        return false;
+                    };
+                    let blurred = Arc::new(blurred);
+                    cache.decoded_bytes = cache
+                        .decoded_bytes
+                        .saturating_add(decoded_image_bytes(&blurred));
+                    cache.blurred.insert(pending, Blurred::Ready(blurred));
+                    true
+                })
+                .unwrap_or(false);
+            if stored {
+                cx.on_next_frame(move |_, cx| cx.notify(view));
+            }
+        });
+        self.blurred.insert(key, Blurred::Pending { _task: task });
+        None
     }
 
     /// Releases everything, returning whether anything was held. Freeing every
@@ -438,7 +480,7 @@ impl DecodedImageCache {
     }
 
     fn release(&mut self, key: &DecodeKey, mut window: Option<&mut Window>, cx: &mut App) {
-        if let Some(blurred) = self.blurred.remove(key) {
+        if let Some(Blurred::Ready(blurred)) = self.blurred.remove(key) {
             self.decoded_bytes = self
                 .decoded_bytes
                 .saturating_sub(decoded_image_bytes(&blurred));
@@ -460,8 +502,10 @@ impl DecodedImageCache {
         let released = !entries.is_empty() || !blurred.is_empty();
         self.decoded_bytes = 0;
         self.eviction.cancel();
-        for (_, image) in blurred {
-            cx.drop_image(image, window.as_deref_mut());
+        for (_, blurred) in blurred {
+            if let Blurred::Ready(image) = blurred {
+                cx.drop_image(image, window.as_deref_mut());
+            }
         }
         for (key, mut entry) in entries {
             cx.remove_asset::<CappedImageLoader>(&key);
