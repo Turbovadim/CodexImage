@@ -36,12 +36,19 @@ pub(super) struct BoardRow {
 
 impl BoardRow {
     pub(super) fn new(summary: BoardSummary, view: &AppView) -> Self {
+        // Resolved against the summary's own board. The switcher lists boards
+        // that are not open, and the view's image assets only cover the open
+        // one, so asking it would leave every other row's thumbnail blank.
+        let repository = view.engine.repository();
+        let thumbnail = summary.last_image.as_deref().and_then(|url| {
+            repository
+                .thumbnail_path(&summary.id, url)
+                .filter(|path| path.exists())
+                .or_else(|| repository.image_path(&summary.id, url))
+        });
         Self {
             search_key: summary.title.to_lowercase(),
-            thumbnail: summary
-                .last_image
-                .as_deref()
-                .map(|url| view.display_image_path(url, false)),
+            thumbnail,
             summary,
         }
     }
