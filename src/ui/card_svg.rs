@@ -33,7 +33,7 @@ pub fn card_scene_svg(scene: &CardScene, rendered_width: f32) -> String {
                 let (fill_color, fill_opacity) = fill.svg();
                 write!(
                     svg,
-                    "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"{radius}\" fill=\"{fill_color}\" fill-opacity=\"{fill_opacity}\"",
+                    "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"{radius}\" fill=\"#{fill_color:06x}\" fill-opacity=\"{fill_opacity}\"",
                     bounds.x, bounds.y, bounds.width, bounds.height
                 )
                 .expect("writing to a String cannot fail");
@@ -41,7 +41,7 @@ pub fn card_scene_svg(scene: &CardScene, rendered_width: f32) -> String {
                     let (stroke, opacity) = color.svg();
                     write!(
                         svg,
-                        " stroke=\"{stroke}\" stroke-opacity=\"{opacity}\" stroke-width=\"{width}\""
+                        " stroke=\"#{stroke:06x}\" stroke-opacity=\"{opacity}\" stroke-width=\"{width}\""
                     )
                     .expect("writing to a String cannot fail");
                 }
@@ -71,7 +71,7 @@ pub fn card_scene_svg(scene: &CardScene, rendered_width: f32) -> String {
                 let (fill, opacity) = color.svg();
                 write!(
                     svg,
-                    "<text x=\"{x}\" y=\"{baseline}\" clip-path=\"url(#{clip_id})\" font-family=\"system-ui,sans-serif\" font-size=\"{font_size}\" font-weight=\"400\" text-anchor=\"{anchor}\" fill=\"{fill}\" fill-opacity=\"{opacity}\">"
+                    "<text x=\"{x}\" y=\"{baseline}\" clip-path=\"url(#{clip_id})\" font-family=\"system-ui,sans-serif\" font-size=\"{font_size}\" font-weight=\"400\" text-anchor=\"{anchor}\" fill=\"#{fill:06x}\" fill-opacity=\"{opacity}\">"
                 )
                 .expect("writing to a String cannot fail");
                 push_xml_escaped(&mut svg, text);
@@ -183,6 +183,47 @@ mod tests {
             assert!(svg.contains("A &lt;stable&gt; &amp; exact card"));
             assert!(svg.contains(&format!("width=\"{width}\"")));
         }
+    }
+
+    /// The painted card and its SVG sprite have to agree on colour, and the
+    /// SVG side is the one that has to spell it out as text.
+    #[test]
+    fn the_sprite_encodes_the_same_palette_the_painter_uses() {
+        use crate::ui::theme;
+
+        let mut scene = CardScene {
+            height: 80.,
+            primitives: Vec::new(),
+            generating_media: None,
+        };
+        scene.quad(
+            CardRect::new(0., 0., CARD_WIDTH, 80.),
+            0.,
+            CardColor::Raised,
+            Some((1., CardColor::Line)),
+        );
+        scene.text(
+            "status",
+            CardRect::new(0., 0., CARD_WIDTH, 20.),
+            12.,
+            16.,
+            CardColor::Accent45,
+            gpui::TextAlign::Left,
+        );
+        let svg = card_scene_svg(&scene, CARD_WIDTH);
+
+        assert!(svg.contains(&format!(
+            "fill=\"#{:06x}\" fill-opacity=\"1\"",
+            theme::RAISED
+        )));
+        assert!(svg.contains(&format!("stroke=\"#{:06x}\"", theme::LINE)));
+        assert!(svg.contains(&format!(
+            "fill=\"#{:06x}\" fill-opacity=\"0.45\"",
+            theme::ACCENT
+        )));
+        assert_eq!(CardColor::Raised.hsla(), theme::raised());
+        assert_eq!(CardColor::Line.hsla(), theme::line());
+        assert_eq!(CardColor::Accent45.hsla(), theme::accent().opacity(0.45));
     }
 
     #[test]

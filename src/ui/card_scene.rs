@@ -47,38 +47,35 @@ pub enum CardColor {
 }
 
 impl CardColor {
-    pub fn hsla(self) -> gpui::Hsla {
+    /// The sRGB value and the alpha this colour is drawn at. Both renderers
+    /// go through here, so a palette change reaches the painted card and its
+    /// SVG sprite together.
+    const fn parts(self) -> (u32, f32) {
         match self {
-            Self::Transparent => gpui::transparent_black(),
-            Self::Background82 => theme::background().opacity(0.82),
-            Self::Raised => theme::raised(),
-            Self::Hover => theme::hover(),
-            Self::Line => theme::line(),
-            Self::Ink => theme::ink(),
-            Self::Ink90 => theme::ink().opacity(0.9),
-            Self::Dim => theme::dim(),
-            Self::Faint => theme::faint(),
-            Self::Accent => theme::accent(),
-            Self::Accent45 => theme::accent().opacity(0.45),
-            Self::Danger => theme::danger(),
+            Self::Transparent => (0x000000, 0.),
+            Self::Background82 => (theme::BACKGROUND, 0.82),
+            Self::Raised => (theme::RAISED, 1.),
+            Self::Hover => (theme::HOVER, 1.),
+            Self::Line => (theme::LINE, 1.),
+            Self::Ink => (theme::INK, 1.),
+            Self::Ink90 => (theme::INK, 0.9),
+            Self::Dim => (theme::DIM, 1.),
+            Self::Faint => (theme::FAINT, 1.),
+            Self::Accent => (theme::ACCENT, 1.),
+            Self::Accent45 => (theme::ACCENT, 0.45),
+            Self::Danger => (theme::DANGER, 1.),
         }
     }
 
-    pub fn svg(self) -> (&'static str, f32) {
-        match self {
-            Self::Transparent => ("#000000", 0.),
-            Self::Background82 => ("#0d0e12", 0.82),
-            Self::Raised => ("#14161c", 1.),
-            Self::Hover => ("#1b1e26", 1.),
-            Self::Line => ("#262a35", 1.),
-            Self::Ink => ("#e8eaf0", 1.),
-            Self::Ink90 => ("#e8eaf0", 0.9),
-            Self::Dim => ("#8b90a0", 1.),
-            Self::Faint => ("#5a5f6e", 1.),
-            Self::Accent => ("#7c8cff", 1.),
-            Self::Accent45 => ("#7c8cff", 0.45),
-            Self::Danger => ("#ff6b6b", 1.),
-        }
+    pub fn hsla(self) -> gpui::Hsla {
+        let (color, opacity) = self.parts();
+        gpui::Hsla::from(gpui::rgb(color)).opacity(opacity)
+    }
+
+    /// The sRGB value and fill opacity for the SVG sprite encoder, which needs
+    /// them as separate attributes.
+    pub fn svg(self) -> (u32, f32) {
+        self.parts()
     }
 }
 
