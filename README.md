@@ -35,10 +35,14 @@ boards. New native-only installs use
 `~/Library/Application Support/CodexImage/data`. Set `CODEXIMAGE_DATA` or
 `CODEX_BIN` to override either location.
 
-Generated images are adaptively conditioned before they are reused as edit
-inputs. This operates on temporary 16-bit copies and never changes stored
-originals. Set `CODEXIMAGE_REINGEST_CONDITIONING=0` to disable it, or use a
-value between `0` and `1` to reduce its strength.
+Generated images are adaptively conditioned before display, export, or reuse as
+edit inputs. The untouched generation is kept under `generated-originals`,
+while the board uses the corrected 16-bit copy. Existing generated board images
+are upgraded once in the background. Set
+`CODEXIMAGE_REINGEST_CONDITIONING=0` to disable conditioning, or use a value
+between `0` and `1` to reduce its strength. The generation agent also uses the
+same conditioner synchronously between dependent image calls made within one
+run, preventing the artifact from accumulating through a sequence.
 
 The renderer virtualizes offscreen graph cards, uses thumbnails until zoomed
 in, and performs persistence, image decoding, and Codex sessions away from the

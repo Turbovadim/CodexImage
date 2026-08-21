@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "build-gpui-apps": {
+      "source": "lassejlv/skills",
+      "sourceType": "github",
+      "skillPath": "skills/build-gpui-apps/SKILL.md",
+      "computedHash": "165a8b44c4cff463e160ed99ad090ce49c9a007415dadd60efe95c5966c34ad4"
+    }
+  }
+}
