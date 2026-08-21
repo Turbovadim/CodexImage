@@ -14,7 +14,7 @@ use super::image_cache::{
 use super::input::TextInput;
 use super::keymap::{Escape, Generate, Quit, bind_keys, configure_menus};
 use super::lightbox::Lightbox;
-use super::overlays::Toast;
+use super::overlays::{BoardRow, GalleryRow, Toast};
 use super::theme;
 use crate::APP_NAME;
 use crate::generation::GenerationEngine;
@@ -98,6 +98,11 @@ pub(super) struct AppView {
     pub(super) prompt_lines: HashMap<String, Vec<SharedString>>,
     pub(super) output_layouts: HashMap<String, OutputLayout>,
     pub(super) canvas_nodes: Arc<Vec<Arc<CanvasNode>>>,
+    /// Rows for whichever overlay is open. Building them walks every node of
+    /// every board, so they are derived when the data changes rather than on
+    /// every frame; a closed overlay's rows are stale and unread until it opens.
+    pub(super) board_rows: Arc<Vec<BoardRow>>,
+    pub(super) gallery_rows: Arc<Vec<GalleryRow>>,
     pub(super) image_cache: Entity<DecodedImageCache>,
     pub(super) sprite_cache: Entity<CardSpriteCache>,
     pub(super) gallery_list_state: ListState,
@@ -214,7 +219,7 @@ impl AppView {
         })
         .detach();
         cx.observe(&search_input, |_, _, cx| cx.notify()).detach();
-        let summaries = engine.repository().summaries(&engine.active_node_ids());
+        let summaries = engine.repository().summaries();
         let board_id = summaries.first().map(|summary| summary.id.clone());
         let board = board_id
             .as_deref()
@@ -251,6 +256,8 @@ impl AppView {
             prompt_lines: HashMap::new(),
             output_layouts: HashMap::new(),
             canvas_nodes: Arc::new(Vec::new()),
+            board_rows: Arc::new(Vec::new()),
+            gallery_rows: Arc::new(Vec::new()),
             image_cache,
             sprite_cache,
             gallery_list_state,
@@ -356,12 +363,6 @@ impl AppView {
     /// are all unchanged are carried over wholesale, so a single finished
     /// generation no longer re-wraps every prompt or re-encodes every sprite.
     pub(super) fn refresh_layout(&mut self) {
-        let node_count = self.board.as_ref().map_or(0, |board| board.nodes.len());
-        if self.gallery_list_state.item_count() == node_count {
-            self.gallery_list_state.remeasure();
-        } else {
-            self.gallery_list_state.reset(node_count);
-        }
         let previous = std::mem::take(&mut self.canvas_nodes);
         let cached: HashMap<&str, &Arc<CanvasNode>> = previous
             .iter()
@@ -448,6 +449,36 @@ impl AppView {
             self.prompt_lines.clear();
             self.output_layouts.clear();
             self.canvas_nodes = Arc::new(Vec::new());
+        }
+        self.refresh_overlay_data();
+    }
+
+    /// Rebuilds the rows the open overlay renders from. Called whenever the
+    /// derived board state changes and whenever an overlay opens, so the
+    /// render pass itself stays a read of already-built rows.
+    pub(super) fn refresh_overlay_data(&mut self) {
+        match self.overlay {
+            Overlay::Boards => {
+                self.board_rows = Arc::new(
+                    self.engine
+                        .repository()
+                        .summaries()
+                        .into_iter()
+                        .map(|summary| BoardRow::new(summary, self))
+                        .collect(),
+                );
+            }
+            Overlay::Gallery => {
+                self.gallery_rows = Arc::new(GalleryRow::rows_for(self));
+                // The list indexes straight into these rows, so its item count
+                // may only ever change together with them.
+                if self.gallery_list_state.item_count() == self.gallery_rows.len() {
+                    self.gallery_list_state.remeasure();
+                } else {
+                    self.gallery_list_state.reset(self.gallery_rows.len());
+                }
+            }
+            _ => {}
         }
     }
 

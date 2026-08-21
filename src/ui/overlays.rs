@@ -9,13 +9,12 @@ use super::input::TextInputMode;
 use super::keymap::{Generate, OpenBoards, ToggleGallery};
 use super::theme;
 use super::tooltip::{tip, tip_with_shortcut};
-use crate::model::BoardNode;
+use crate::model::{BoardNode, BoardSummary};
 use gpui::{
     AnyElement, ClipboardItem, Context, Focusable, FontWeight, ObjectFit, Role, SharedString,
     StyledImage, WeakEntity, Window, div, img, list, prelude::*, px,
 };
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 pub(super) struct Toast {
@@ -25,10 +24,57 @@ pub(super) struct Toast {
     pub(super) serial: u64,
 }
 
-struct GalleryRow {
+/// One board-switcher row, resolved when the switcher opens. Building these
+/// walks every node of every board and clones its title, which is far too much
+/// to repeat per frame while a generation drives 30 fps repaints.
+pub(super) struct BoardRow {
+    summary: BoardSummary,
+    /// The lower-cased title, so filtering never re-cases every title.
+    search_key: String,
+    thumbnail: Option<PathBuf>,
+}
+
+impl BoardRow {
+    pub(super) fn new(summary: BoardSummary, view: &AppView) -> Self {
+        Self {
+            search_key: summary.title.to_lowercase(),
+            thumbnail: summary
+                .last_image
+                .as_deref()
+                .map(|url| view.display_image_path(url, false)),
+            summary,
+        }
+    }
+}
+
+/// One gallery row. Same reasoning as `BoardRow`: this clones a whole node.
+pub(super) struct GalleryRow {
     node: BoardNode,
     depth: usize,
     thumbnails: Vec<PathBuf>,
+}
+
+impl GalleryRow {
+    pub(super) fn rows_for(view: &AppView) -> Vec<Self> {
+        let Some(board) = view.board.as_ref() else {
+            return Vec::new();
+        };
+        let depths = node_depths(board);
+        let mut nodes: Vec<_> = board.nodes.iter().collect();
+        nodes.sort_by_key(|node| (std::cmp::Reverse(node.created_at), &node.id));
+        nodes
+            .into_iter()
+            .map(|node| Self {
+                depth: depths.get(&node.id).copied().unwrap_or(0),
+                thumbnails: node
+                    .images
+                    .iter()
+                    .map(|url| view.display_image_path(url, false))
+                    .collect(),
+                node: node.clone(),
+            })
+            .collect()
+    }
 }
 
 fn render_gallery_row(row: &GalleryRow, view: WeakEntity<AppView>) -> AnyElement {
@@ -218,6 +264,7 @@ impl AppView {
         };
         self.armed_board_delete = None;
         self.search_input.update(cx, |input, cx| input.clear(cx));
+        self.refresh_overlay_data();
         if matches!(self.overlay, Overlay::Boards) {
             window.focus(&self.search_input.focus_handle(cx), cx);
         } else {
@@ -247,6 +294,7 @@ impl AppView {
         } else {
             Overlay::Gallery
         };
+        self.refresh_overlay_data();
         cx.notify();
     }
 
@@ -281,6 +329,7 @@ impl AppView {
         match self.engine.repository().rename_board(&board_id, &title) {
             Ok(()) => {
                 self.overlay = Overlay::Boards;
+                self.refresh_overlay_data();
                 window.focus(&self.search_input.focus_handle(cx), cx);
             }
             Err(error) => self.show_error(error, cx),
@@ -290,10 +339,6 @@ impl AppView {
 
     pub(super) fn render_boards(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let query = self.search_input.read(cx).content().to_lowercase();
-        let summaries = self
-            .engine
-            .repository()
-            .summaries(&self.engine.active_node_ids());
         let width = 360.;
         let mut list = div()
             .id("board-list")
@@ -303,10 +348,12 @@ impl AppView {
             .overflow_y_scroll()
             .px_2()
             .pb_2();
-        for summary in summaries
-            .into_iter()
-            .filter(|summary| summary.title.to_lowercase().contains(&query))
+        for row in self
+            .board_rows
+            .iter()
+            .filter(|row| row.search_key.contains(&query))
         {
+            let summary = &row.summary;
             let id = summary.id.clone();
             let rename_id = summary.id.clone();
             let delete_id = summary.id.clone();
@@ -324,8 +371,8 @@ impl AppView {
                 .text_color(theme::faint())
                 .child("❖")
                 .into_any_element();
-            if let Some(url) = &summary.last_image {
-                thumbnail = img(self.display_image_path(url, false))
+            if let Some(path) = &row.thumbnail {
+                thumbnail = img(path.clone())
                     .size(px(34.))
                     .rounded_md()
                     .object_fit(ObjectFit::Cover)
@@ -423,7 +470,7 @@ impl AppView {
                                             let next = this
                                                 .engine
                                                 .repository()
-                                                .summaries(&this.engine.active_node_ids())
+                                                .summaries()
                                                 .first()
                                                 .map(|summary| summary.id.clone());
                                             this.board_id = next.clone();
@@ -431,6 +478,7 @@ impl AppView {
                                                 .as_deref()
                                                 .and_then(|id| this.engine.repository().board(id));
                                             this.armed_board_delete = None;
+                                            this.refresh_layout();
                                         }
                                         Err(error) => this.show_error(error, cx),
                                     }
@@ -496,32 +544,12 @@ impl AppView {
             .map(|board| board.nodes.iter().map(|node| node.images.len()).sum())
             .unwrap_or(0);
         let node_count = board.map(|board| board.nodes.len()).unwrap_or(0);
-        let rows = if let Some(board) = board {
-            let depths = node_depths(board);
-            let mut nodes: Vec<_> = board.nodes.iter().collect();
-            nodes.sort_by_key(|node| (std::cmp::Reverse(node.created_at), &node.id));
-            nodes
-                .into_iter()
-                .map(|node| GalleryRow {
-                    depth: depths.get(&node.id).copied().unwrap_or(0),
-                    thumbnails: node
-                        .images
-                        .iter()
-                        .map(|url| self.display_image_path(url, false))
-                        .collect(),
-                    node: node.clone(),
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let rows = Arc::new(rows);
-        let rows_for_list = rows.clone();
+        let rows = self.gallery_rows.clone();
         let view = cx.weak_entity();
         let content = div().flex_1().min_h_0().px_6().pb_8().child(
             list(
                 self.gallery_list_state.clone(),
-                move |index, _window, _cx| render_gallery_row(&rows_for_list[index], view.clone()),
+                move |index, _window, _cx| render_gallery_row(&rows[index], view.clone()),
             )
             .size_full(),
         );

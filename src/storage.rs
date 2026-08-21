@@ -213,7 +213,7 @@ impl Repository {
             .find(|node| node.id == node_id)
     }
 
-    pub fn summaries(&self, active_nodes: &HashSet<String>) -> Vec<BoardSummary> {
+    pub fn summaries(&self) -> Vec<BoardSummary> {
         let mut summaries: Vec<_> = self
             .inner
             .read()
@@ -238,10 +238,6 @@ impl Repository {
                         .flat_map(|node| &node.images)
                         .last()
                         .cloned(),
-                    generating: board
-                        .nodes
-                        .iter()
-                        .any(|node| active_nodes.contains(&node.id)),
                     total_tokens: board.nodes.iter().map(BoardNode::token_count).sum(),
                 }
             })

@@ -91,28 +91,43 @@ impl ToolbarAction {
     }
 }
 
+const RUNNING_TOOLBAR_ACTIONS: [ToolbarAction; 4] = [
+    ToolbarAction::Stop,
+    ToolbarAction::Copy,
+    ToolbarAction::Duplicate,
+    ToolbarAction::Delete,
+];
+const IDLE_TOOLBAR_ACTIONS: [ToolbarAction; 6] = [
+    ToolbarAction::Branch,
+    ToolbarAction::Edit,
+    ToolbarAction::Retry,
+    ToolbarAction::Copy,
+    ToolbarAction::Duplicate,
+    ToolbarAction::Delete,
+];
+
+fn toolbar_button_width(action: ToolbarAction) -> f32 {
+    14. + action.label().chars().count() as f32 * 6.6
+}
+
 /// The card-local world-space rectangles of the hovered card's action buttons,
-/// right-aligned above the card (or below it near the viewport top).
-fn toolbar_layout(running: bool, below: bool, card_height: f32) -> Vec<(ToolbarAction, CardRect)> {
-    let actions: &[ToolbarAction] = if running {
-        &[
-            ToolbarAction::Stop,
-            ToolbarAction::Copy,
-            ToolbarAction::Duplicate,
-            ToolbarAction::Delete,
-        ]
+/// right-aligned above the card (or below it near the viewport top). Yields
+/// rather than collects: hit testing walks this on every mouse move.
+fn toolbar_layout(
+    running: bool,
+    below: bool,
+    card_height: f32,
+) -> impl Iterator<Item = (ToolbarAction, CardRect)> {
+    let actions: &'static [ToolbarAction] = if running {
+        &RUNNING_TOOLBAR_ACTIONS
     } else {
-        &[
-            ToolbarAction::Branch,
-            ToolbarAction::Edit,
-            ToolbarAction::Retry,
-            ToolbarAction::Copy,
-            ToolbarAction::Duplicate,
-            ToolbarAction::Delete,
-        ]
+        &IDLE_TOOLBAR_ACTIONS
     };
-    let width_of = |action: ToolbarAction| 14. + action.label().chars().count() as f32 * 6.6;
-    let total = actions.iter().map(|action| width_of(*action)).sum::<f32>()
+    let total = actions
+        .iter()
+        .copied()
+        .map(toolbar_button_width)
+        .sum::<f32>()
         + TOOLBAR_GAP * actions.len().saturating_sub(1) as f32;
     let y = if below {
         card_height + TOOLBAR_CARD_GAP
@@ -120,15 +135,12 @@ fn toolbar_layout(running: bool, below: bool, card_height: f32) -> Vec<(ToolbarA
         -(TOOLBAR_CARD_GAP + TOOLBAR_BUTTON_HEIGHT)
     };
     let mut x = CARD_WIDTH - TOOLBAR_RIGHT_MARGIN - total;
-    actions
-        .iter()
-        .map(|action| {
-            let width = width_of(*action);
-            let rect = CardRect::new(x, y, width, TOOLBAR_BUTTON_HEIGHT);
-            x += width + TOOLBAR_GAP;
-            (*action, rect)
-        })
-        .collect()
+    actions.iter().map(move |&action| {
+        let width = toolbar_button_width(action);
+        let rect = CardRect::new(x, y, width, TOOLBAR_BUTTON_HEIGHT);
+        x += width + TOOLBAR_GAP;
+        (action, rect)
+    })
 }
 
 pub(super) enum DragState {
@@ -494,7 +506,6 @@ impl AppView {
         let below = self.node_toolbar_is_below(frame.screen_y);
         let card_height = self.card_height(&canvas_node.node);
         toolbar_layout(running, below, card_height)
-            .into_iter()
             .enumerate()
             .map(|(index, (action, rect))| ToolbarButtonPaint {
                 bounds: Bounds::new(
@@ -525,7 +536,6 @@ impl AppView {
         let below = self.node_toolbar_is_below(screen_y);
         let card_height = self.card_height(&canvas_node.node);
         toolbar_layout(running, below, card_height)
-            .into_iter()
             .enumerate()
             .find_map(|(index, (action, rect))| {
                 (local_x >= rect.x
@@ -556,11 +566,16 @@ impl AppView {
         let mut max_x = f32::NEG_INFINITY;
         let mut max_y = f32::NEG_INFINITY;
         for node in &board.nodes {
-            let position = self.current_position(&node.id)?;
+            let Some(position) = self.current_position(&node.id) else {
+                continue;
+            };
             min_x = min_x.min(position.x);
             min_y = min_y.min(position.y);
             max_x = max_x.max(position.x + CARD_WIDTH);
             max_y = max_y.max(position.y + self.card_height(node));
+        }
+        if !min_x.is_finite() || !min_y.is_finite() {
+            return None;
         }
         let world_width = (max_x - min_x).max(1.);
         let world_height = (max_y - min_y).max(1.);

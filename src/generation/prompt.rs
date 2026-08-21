@@ -4,7 +4,7 @@
 use crate::model::{Board, BoardNode};
 use crate::storage::Repository;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const PREAMBLE: &str = r#"You are an expert image-generation assistant.
 
@@ -29,6 +29,7 @@ pub fn build_node_prompt(
     board: &Board,
     node: &BoardNode,
     source_paths: &[PathBuf],
+    same_run_conditioner: Option<(&Path, &Path)>,
     index: usize,
     count: usize,
 ) -> String {
@@ -88,6 +89,9 @@ pub fn build_node_prompt(
             bullet_paths(&attachments)
         ));
     }
+    if let Some((executable, directory)) = same_run_conditioner {
+        sections.push(same_run_conditioning_section(executable, directory));
+    }
     sections.push(format!("Request: {}", node.prompt));
     let mut extras = Vec::new();
     if node.aspect != "auto" {
@@ -103,6 +107,26 @@ pub fn build_node_prompt(
         sections.push(extras.join(" "));
     }
     sections.join("\n\n")
+}
+
+fn same_run_conditioning_section(executable: &Path, directory: &Path) -> String {
+    let command = format!(
+        "{} --condition-image '<RAW_GENERATED_PATH>' {}",
+        shell_quote(executable),
+        shell_quote(&directory.join("step-N.png")),
+    );
+    format!(
+        r#"Same-run generated-image dependencies:
+- When an image generated in this run will be supplied to any later image-generation call, condition it synchronously first. This is the sole permitted exception to the shell-file-operation prohibition above.
+- For every generated input, replace `<RAW_GENERATED_PATH>` and `N`, then run exactly: `{command}`
+- Pass only the resulting PNG path(s) to the later image-generation call through `referenced_image_paths`. Do not use `num_last_images_to_include` or conversation-carried raw images for a dependent call.
+- Do not condition independent outputs that will not be reused as image inputs.
+- Conditioned PNGs are intermediate inputs only. Never put them in the final `outputs`; final selections must still use the raw absolute paths returned by the image-generation tool."#
+    )
+}
+
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
 pub fn selection_recovery_prompt<'a>(
@@ -138,4 +162,25 @@ fn bullet_paths(paths: &[PathBuf]) -> String {
 pub fn tail_chars(value: &str, limit: usize) -> String {
     let count = value.chars().count();
     value.chars().skip(count.saturating_sub(limit)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_run_conditioning_section;
+    use std::path::Path;
+
+    #[test]
+    fn same_run_instructions_force_conditioned_file_handoffs() {
+        let instructions = same_run_conditioning_section(
+            Path::new("/Applications/Codex Image.app/codex-image"),
+            Path::new("/tmp/work space/same-run"),
+        );
+
+        assert!(instructions.contains("--condition-image"));
+        assert!(instructions.contains("referenced_image_paths"));
+        assert!(instructions.contains("Do not use `num_last_images_to_include`"));
+        assert!(instructions.contains("Never put them in the final `outputs`"));
+        assert!(instructions.contains("'/Applications/Codex Image.app/codex-image'"));
+        assert!(instructions.contains("'/tmp/work space/same-run/step-N.png'"));
+    }
 }

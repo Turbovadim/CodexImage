@@ -12,7 +12,7 @@
 
 use super::{RepositoryEvent, RepositoryState, atomic_write};
 use parking_lot::{Condvar, Mutex, RwLock};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -114,7 +114,7 @@ impl Drop for BoardWriter {
 fn run(
     shared: &Shared,
     state: &RwLock<RepositoryState>,
-    boards_file: &PathBuf,
+    boards_file: &Path,
     events: &async_channel::Sender<RepositoryEvent>,
 ) {
     let mut reported_failure = false;

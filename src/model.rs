@@ -99,7 +99,6 @@ pub struct BoardSummary {
     pub updated_at: i64,
     pub image_count: usize,
     pub last_image: Option<String>,
-    pub generating: bool,
     pub total_tokens: u64,
 }
 

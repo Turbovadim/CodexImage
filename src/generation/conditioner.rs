@@ -1,5 +1,5 @@
-//! Removes pixel-phase artifacts from generated images before they are fed
-//! back into an edit. Stored originals are never changed.
+//! Removes pixel-phase artifacts from generated images. Raw generations are
+//! always kept separately; conditioned copies are used for display and edits.
 
 use anyhow::{Context, Result};
 use image::{ColorType, DynamicImage, ImageBuffer, ImageFormat, Rgba, RgbaImage};
@@ -14,6 +14,10 @@ const MAX_PHASE_CORRECTION: f64 = 1.5;
 
 type PhasePattern = [[[f64; 3]; 2]; 2];
 type Rgba16Image = ImageBuffer<Rgba<u16>, Vec<u16>>;
+
+pub(crate) fn enabled() -> bool {
+    conditioning_strength(env::var(STRENGTH_ENV).ok().as_deref()) > 0.0
+}
 
 /// Returns paths suitable for a generation prompt. A source with a measurable
 /// 2x2 phase artifact is copied into `directory` as a corrected 16-bit PNG;
@@ -48,36 +52,76 @@ fn conditioning_strength(value: Option<&str>) -> f64 {
 }
 
 fn condition_source(source: &Path, destination: &Path, strength: f64) -> Result<bool> {
-    let decoded = image::ImageReader::open(source)
+    let decoded = decode_source(source)?;
+    let Some(conditioned) = conditioned_image(&decoded, strength) else {
+        return Ok(false);
+    };
+    save_png(&conditioned, destination)?;
+    Ok(true)
+}
+
+/// Writes a conditioned PNG only when the configured artifact detector fires.
+/// Storage uses the boolean to preserve clean files byte-for-byte.
+pub(crate) fn condition_generated_image(source: &Path, destination: &Path) -> Result<bool> {
+    condition_source(
+        source,
+        destination,
+        conditioning_strength(env::var(STRENGTH_ENV).ok().as_deref()),
+    )
+}
+
+/// Synchronously writes a PNG that is safe to use as a later image input in
+/// the same Codex run. A clean source is losslessly converted to PNG so the
+/// caller can always use `destination`; generated originals are never changed.
+pub fn condition_image_for_reingestion(source: &Path, destination: &Path) -> Result<bool> {
+    let decoded = decode_source(source)?;
+    let strength = conditioning_strength(env::var(STRENGTH_ENV).ok().as_deref());
+    let conditioned = conditioned_image(&decoded, strength);
+    let applied = conditioned.is_some();
+    save_png(conditioned.as_ref().unwrap_or(&decoded), destination)?;
+    Ok(applied)
+}
+
+fn decode_source(source: &Path) -> Result<DynamicImage> {
+    image::ImageReader::open(source)
         .with_context(|| format!("failed to open reingestion source {}", source.display()))?
         .with_guessed_format()?
         .decode()
-        .with_context(|| format!("failed to decode reingestion source {}", source.display()))?;
-    if !matches!(
-        decoded.color(),
-        ColorType::L8 | ColorType::La8 | ColorType::Rgb8 | ColorType::Rgba8
-    ) {
-        return Ok(false);
+        .with_context(|| format!("failed to decode reingestion source {}", source.display()))
+}
+
+fn conditioned_image(decoded: &DynamicImage, strength: f64) -> Option<DynamicImage> {
+    if strength == 0.0
+        || !matches!(
+            decoded.color(),
+            ColorType::L8 | ColorType::La8 | ColorType::Rgb8 | ColorType::Rgba8
+        )
+    {
+        return None;
     }
 
     let image = decoded.to_rgba8();
-    let Some((pattern, signal_rms)) = estimate_phase_pattern(&image) else {
-        return Ok(false);
-    };
+    let (pattern, signal_rms) = estimate_phase_pattern(&image)?;
     if !(MIN_SIGNAL_RMS..=MAX_SIGNAL_RMS).contains(&signal_rms) {
-        return Ok(false);
+        return None;
     }
+    Some(DynamicImage::ImageRgba16(subtract_phase_pattern(
+        &image, &pattern, strength,
+    )))
+}
 
-    let conditioned = subtract_phase_pattern(&image, &pattern, strength);
-    DynamicImage::ImageRgba16(conditioned)
+fn save_png(image: &DynamicImage, destination: &Path) -> Result<()> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    image
         .save_with_format(destination, ImageFormat::Png)
         .with_context(|| {
             format!(
                 "failed to write conditioned reingestion source {}",
                 destination.display()
             )
-        })?;
-    Ok(true)
+        })
 }
 
 /// Estimates the repeating component after a small Gaussian high-pass. Real
@@ -168,7 +212,10 @@ fn subtract_phase_pattern(image: &RgbaImage, pattern: &PhasePattern, strength: f
 
 #[cfg(test)]
 mod tests {
-    use super::{condition_source, conditioning_strength, estimate_phase_pattern};
+    use super::{
+        condition_image_for_reingestion, condition_source, conditioning_strength,
+        estimate_phase_pattern,
+    };
     use image::{DynamicImage, Rgba, RgbaImage};
     use tempfile::TempDir;
 
@@ -188,6 +235,24 @@ mod tests {
         let image = RgbaImage::from_pixel(32, 32, Rgba([80, 120, 160, 255]));
         let (_, signal) = estimate_phase_pattern(&image).expect("large enough image");
         assert!(signal < 1e-9);
+    }
+
+    #[test]
+    fn synchronous_helper_always_writes_a_valid_png() {
+        let directory = TempDir::new().unwrap();
+        let source = directory.path().join("clean.jpg");
+        let destination = directory.path().join("nested/conditioned.png");
+        let image = RgbaImage::from_pixel(32, 32, Rgba([80, 120, 160, 255]));
+        DynamicImage::ImageRgba8(image)
+            .save_with_format(&source, image::ImageFormat::Jpeg)
+            .unwrap();
+
+        assert!(!condition_image_for_reingestion(&source, &destination).unwrap());
+        assert_eq!(
+            image::ImageFormat::from_path(&destination).unwrap(),
+            image::ImageFormat::Png
+        );
+        assert_eq!(image::image_dimensions(destination).unwrap(), (32, 32));
     }
 
     #[test]
