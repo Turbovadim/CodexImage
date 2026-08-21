@@ -195,6 +195,143 @@ impl<K: Clone + Eq + Hash> EvictionCycle<K> {
     }
 }
 
+/// The accounting both caches keep: an LRU clock, a decoded-byte total against
+/// a budget, and the state of the deferred eviction cycle.
+struct Budget<K> {
+    decoded_bytes: usize,
+    byte_budget: usize,
+    max_items: usize,
+    clock: u64,
+    cycle: EvictionCycle<K>,
+    backoff: Option<Instant>,
+}
+
+impl<K> Budget<K> {
+    fn new(byte_budget: usize, max_items: usize) -> Self {
+        Self {
+            decoded_bytes: 0,
+            byte_budget,
+            max_items,
+            clock: 0,
+            cycle: EvictionCycle::default(),
+            backoff: None,
+        }
+    }
+
+    /// The next LRU stamp.
+    fn tick(&mut self) -> u64 {
+        self.clock = self.clock.wrapping_add(1);
+        self.clock
+    }
+
+    fn add_bytes(&mut self, bytes: usize) {
+        self.decoded_bytes = self.decoded_bytes.saturating_add(bytes);
+    }
+
+    fn remove_bytes(&mut self, bytes: usize) {
+        self.decoded_bytes = self.decoded_bytes.saturating_sub(bytes);
+    }
+}
+
+/// A cache that owns decoded images against a byte budget.
+///
+/// Eviction cannot just drop the least-recently-used entry, because GPUI can
+/// replay a retained scene without consulting the cache: what a normal frame
+/// happens to ask for is not the set of images that are really on screen. The
+/// cycle below forces a full draw, collects every key it touches, and only
+/// then evicts what that draw did not use. Both caches need that protocol, so
+/// it lives here once rather than in each of them.
+trait Weighted: 'static + Sized {
+    type Key: Clone + Eq + Hash;
+
+    fn budget(&mut self) -> &mut Budget<Self::Key>;
+    fn budget_ref(&self) -> &Budget<Self::Key>;
+    fn item_count(&self) -> usize;
+    /// The least-recently-used key that `protected` does not cover.
+    fn oldest_unprotected(&self, protected: &HashSet<Self::Key>) -> Option<Self::Key>;
+    fn release(&mut self, key: &Self::Key, window: Option<&mut Window>, cx: &mut App);
+    /// A handle the deferred eviction frames can come back through.
+    fn weak_self(&self) -> WeakEntity<Self>;
+
+    fn over_limit(&self) -> bool {
+        let budget = self.budget_ref();
+        budget.decoded_bytes > budget.byte_budget || self.item_count() > budget.max_items
+    }
+
+    fn record_use(&mut self, key: Self::Key) -> u64 {
+        let budget = self.budget();
+        budget.cycle.record(key);
+        budget.tick()
+    }
+
+    /// Starts a cycle if this cache is over budget and `key` was not part of
+    /// the last known visible set — that is, if something new pushed it over.
+    fn schedule_eviction(&mut self, key: &Self::Key, capacity_changed: bool, window: &mut Window) {
+        let over_limit = self.over_limit();
+        let budget = self.budget();
+        if budget.backoff.is_some_and(|until| Instant::now() < until) {
+            return;
+        }
+        if !budget.cycle.should_start(over_limit, key, capacity_changed) {
+            return;
+        }
+        budget.backoff = Some(Instant::now() + EVICTION_CYCLE_SPACING);
+        let generation = budget.cycle.start();
+
+        let cache = self.weak_self();
+        window.on_next_frame(move |window, cx| {
+            let collecting = cache.clone();
+            let _ = cache.update(cx, |cache, _| {
+                if !cache.budget().cycle.begin_collection(generation) {
+                    return;
+                }
+                // A full draw records every image in the current retained
+                // scene. A normal draw can reuse image sprites without calling
+                // this cache, so a partial draw is not safe for eviction.
+                window.refresh();
+                window.on_next_frame(move |window, cx| {
+                    let _ = collecting.update(cx, |cache, cx| {
+                        let Some(visible) = cache.budget().cycle.finish_collection(generation)
+                        else {
+                            return;
+                        };
+                        if cache.evict_to_limits(&visible, window, cx) {
+                            // Prevent GPUI from replaying a retained scene that
+                            // still contains a removed Metal atlas tile.
+                            window.refresh();
+                        }
+                        if cache.over_limit() {
+                            // Everything left is on screen; retrying sooner
+                            // would only repeat full redraws for nothing.
+                            cache.budget().backoff =
+                                Some(Instant::now() + SATURATED_EVICTION_SPACING);
+                        }
+                    });
+                });
+            });
+        });
+    }
+
+    fn evict_to_limits(
+        &mut self,
+        protected: &HashSet<Self::Key>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let mut evicted = false;
+        while self.over_limit() {
+            // A single image can be larger than the budget. Keep it, because
+            // refusing to cache it would start a new decode on every frame.
+            let Some(oldest) = self.oldest_unprotected(protected) else {
+                break;
+            };
+            self.release(&oldest, Some(window), cx);
+            evicted = true;
+        }
+        evicted
+    }
+}
+
 /// A blurred stand-in, or the work that is producing one.
 enum Blurred {
     /// Dropping the task cancels the blur, so an evicted entry stops paying.
@@ -209,13 +346,51 @@ pub(super) struct DecodedImageCache {
     /// Tiny pre-blurred copies of decoded images, shown for in-progress
     /// generations. Each one lives and dies with its base entry.
     blurred: HashMap<DecodeKey, Blurred>,
-    decoded_bytes: usize,
-    byte_budget: usize,
-    max_items: usize,
-    clock: u64,
-    eviction: EvictionCycle<DecodeKey>,
-    eviction_backoff: Option<Instant>,
+    budget: Budget<DecodeKey>,
     weak_self: WeakEntity<Self>,
+}
+
+impl Weighted for DecodedImageCache {
+    type Key = DecodeKey;
+
+    fn budget(&mut self) -> &mut Budget<DecodeKey> {
+        &mut self.budget
+    }
+
+    fn budget_ref(&self) -> &Budget<DecodeKey> {
+        &self.budget
+    }
+
+    fn item_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn oldest_unprotected(&self, protected: &HashSet<DecodeKey>) -> Option<DecodeKey> {
+        self.entries
+            .iter()
+            .filter(|(key, _)| !protected.contains(*key))
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(key, _)| key.clone())
+    }
+
+    fn weak_self(&self) -> WeakEntity<Self> {
+        self.weak_self.clone()
+    }
+
+    fn release(&mut self, key: &DecodeKey, mut window: Option<&mut Window>, cx: &mut App) {
+        if let Some(Blurred::Ready(blurred)) = self.blurred.remove(key) {
+            self.budget.remove_bytes(decoded_image_bytes(&blurred));
+            cx.drop_image(blurred, window.as_deref_mut());
+        }
+        let Some(mut entry) = self.entries.remove(key) else {
+            return;
+        };
+        self.budget.remove_bytes(entry.decoded_bytes);
+        cx.remove_asset::<CappedImageLoader>(key);
+        if let Some(Ok(image)) = entry.image.get() {
+            cx.drop_image(image, window);
+        }
+    }
 }
 
 impl DecodedImageCache {
@@ -228,12 +403,7 @@ impl DecodedImageCache {
         Self {
             entries: HashMap::new(),
             blurred: HashMap::new(),
-            decoded_bytes: 0,
-            byte_budget,
-            max_items: DECODED_IMAGE_CACHE_MAX_ITEMS,
-            clock: 0,
-            eviction: EvictionCycle::default(),
-            eviction_backoff: None,
+            budget: Budget::new(byte_budget, DECODED_IMAGE_CACHE_MAX_ITEMS),
             weak_self: cx.weak_entity(),
         }
     }
@@ -280,9 +450,7 @@ impl DecodedImageCache {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
-        self.eviction.record(key.clone());
-        self.clock = self.clock.wrapping_add(1);
-        let last_used = self.clock;
+        let last_used = self.record_use(key.clone());
 
         if self.entries.contains_key(&key) {
             let (result, added_bytes) = {
@@ -307,7 +475,7 @@ impl DecodedImageCache {
                 }
                 (result, added_bytes)
             };
-            self.decoded_bytes = self.decoded_bytes.saturating_add(added_bytes);
+            self.budget.add_bytes(added_bytes);
             self.schedule_eviction(&key, added_bytes > 0, window);
             return result;
         }
@@ -377,9 +545,7 @@ impl DecodedImageCache {
                         return false;
                     };
                     let blurred = Arc::new(blurred);
-                    cache.decoded_bytes = cache
-                        .decoded_bytes
-                        .saturating_add(decoded_image_bytes(&blurred));
+                    cache.budget.add_bytes(decoded_image_bytes(&blurred));
                     cache.blurred.insert(pending, Blurred::Ready(blurred));
                     true
                 })
@@ -400,108 +566,12 @@ impl DecodedImageCache {
         self.release_all(Some(window), cx)
     }
 
-    fn over_limit(&self) -> bool {
-        self.decoded_bytes > self.byte_budget || self.entries.len() > self.max_items
-    }
-
-    fn schedule_eviction(&mut self, key: &DecodeKey, capacity_changed: bool, window: &mut Window) {
-        if self
-            .eviction_backoff
-            .is_some_and(|until| Instant::now() < until)
-        {
-            return;
-        }
-        if !self
-            .eviction
-            .should_start(self.over_limit(), key, capacity_changed)
-        {
-            return;
-        }
-
-        self.eviction_backoff = Some(Instant::now() + EVICTION_CYCLE_SPACING);
-        let generation = self.eviction.start();
-        let cache = self.weak_self.clone();
-        window.on_next_frame(move |window, cx| {
-            let eviction_cache = cache.clone();
-            let _ = cache.update(cx, |cache, _| {
-                if !cache.eviction.begin_collection(generation) {
-                    return;
-                }
-
-                // A full draw records every image in the current retained
-                // scene. A normal draw can reuse image sprites without calling
-                // this cache, so a partial draw is not safe for eviction.
-                window.refresh();
-                window.on_next_frame(move |window, cx| {
-                    let _ = eviction_cache.update(cx, |cache, cx| {
-                        let Some(visible) = cache.eviction.finish_collection(generation) else {
-                            return;
-                        };
-                        if cache.evict_to_limits(&visible, window, cx) {
-                            // Prevent GPUI from replaying a retained scene that
-                            // still contains a removed Metal atlas tile.
-                            window.refresh();
-                        }
-                        if cache.over_limit() {
-                            // Everything left is on screen; retrying sooner
-                            // would only repeat full redraws for nothing.
-                            cache.eviction_backoff =
-                                Some(Instant::now() + SATURATED_EVICTION_SPACING);
-                        }
-                    });
-                });
-            });
-        });
-    }
-
-    fn evict_to_limits(
-        &mut self,
-        protected: &HashSet<DecodeKey>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> bool {
-        let mut evicted = false;
-        while self.decoded_bytes > self.byte_budget || self.entries.len() > self.max_items {
-            let oldest = self
-                .entries
-                .iter()
-                .filter(|(key, _)| !protected.contains(*key))
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(key, _)| key.clone());
-            let Some(oldest) = oldest else {
-                // A single image can be larger than the budget. Keep it because
-                // refusing to cache it would start a new decode on every frame.
-                break;
-            };
-            self.release(&oldest, Some(window), cx);
-            evicted = true;
-        }
-        evicted
-    }
-
-    fn release(&mut self, key: &DecodeKey, mut window: Option<&mut Window>, cx: &mut App) {
-        if let Some(Blurred::Ready(blurred)) = self.blurred.remove(key) {
-            self.decoded_bytes = self
-                .decoded_bytes
-                .saturating_sub(decoded_image_bytes(&blurred));
-            cx.drop_image(blurred, window.as_deref_mut());
-        }
-        let Some(mut entry) = self.entries.remove(key) else {
-            return;
-        };
-        self.decoded_bytes = self.decoded_bytes.saturating_sub(entry.decoded_bytes);
-        cx.remove_asset::<CappedImageLoader>(key);
-        if let Some(Ok(image)) = entry.image.get() {
-            cx.drop_image(image, window);
-        }
-    }
-
     fn release_all(&mut self, mut window: Option<&mut Window>, cx: &mut App) -> bool {
         let entries = std::mem::take(&mut self.entries);
         let blurred = std::mem::take(&mut self.blurred);
         let released = !entries.is_empty() || !blurred.is_empty();
-        self.decoded_bytes = 0;
-        self.eviction.cancel();
+        self.budget.decoded_bytes = 0;
+        self.budget.cycle.cancel();
         for (_, blurred) in blurred {
             if let Blurred::Ready(image) = blurred {
                 cx.drop_image(image, window.as_deref_mut());
@@ -613,12 +683,47 @@ struct SpriteEntry {
 /// identical card sprites share one decoded result safely.
 pub(super) struct CardSpriteCache {
     entries: HashMap<u64, SpriteEntry>,
-    decoded_bytes: usize,
-    byte_budget: usize,
-    clock: u64,
-    eviction: EvictionCycle<u64>,
-    eviction_backoff: Option<Instant>,
+    budget: Budget<u64>,
     weak_self: WeakEntity<Self>,
+}
+
+impl Weighted for CardSpriteCache {
+    type Key = u64;
+
+    fn budget(&mut self) -> &mut Budget<u64> {
+        &mut self.budget
+    }
+
+    fn budget_ref(&self) -> &Budget<u64> {
+        &self.budget
+    }
+
+    fn item_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn oldest_unprotected(&self, protected: &HashSet<u64>) -> Option<u64> {
+        self.entries
+            .iter()
+            .filter(|(image_id, _)| !protected.contains(*image_id))
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(image_id, _)| *image_id)
+    }
+
+    fn weak_self(&self) -> WeakEntity<Self> {
+        self.weak_self.clone()
+    }
+
+    fn release(&mut self, image_id: &u64, window: Option<&mut Window>, cx: &mut App) {
+        let Some(entry) = self.entries.remove(image_id) else {
+            return;
+        };
+        self.budget.remove_bytes(entry.decoded_bytes);
+        entry.source.remove_asset(cx);
+        if let Some(rendered) = entry.rendered {
+            cx.drop_image(rendered, window);
+        }
+    }
 }
 
 impl CardSpriteCache {
@@ -630,11 +735,7 @@ impl CardSpriteCache {
 
         Self {
             entries: HashMap::new(),
-            decoded_bytes: 0,
-            byte_budget,
-            clock: 0,
-            eviction: EvictionCycle::default(),
-            eviction_backoff: None,
+            budget: Budget::new(byte_budget, CARD_SPRITE_CACHE_MAX_ITEMS),
             weak_self: cx.weak_entity(),
         }
     }
@@ -645,16 +746,14 @@ impl CardSpriteCache {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<Arc<RenderImage>> {
-        self.clock = self.clock.wrapping_add(1);
-        let last_used = self.clock;
         let image_id = source.id();
-        self.eviction.record(image_id);
+        let last_used = self.record_use(image_id);
 
         if let Some(entry) = self.entries.get_mut(&image_id) {
             entry.last_used = last_used;
             if let Some(rendered) = &entry.rendered {
                 let rendered = rendered.clone();
-                self.schedule_eviction(image_id, false, window);
+                self.schedule_eviction(&image_id, false, window);
                 return Some(rendered);
             }
         } else {
@@ -674,21 +773,19 @@ impl CardSpriteCache {
         if let Some(entry) = self.entries.get_mut(&image_id) {
             entry.rendered = Some(rendered.clone());
             entry.decoded_bytes = decoded_bytes;
-            self.decoded_bytes = self.decoded_bytes.saturating_add(decoded_bytes);
+            self.budget.add_bytes(decoded_bytes);
         }
-        self.schedule_eviction(image_id, true, window);
+        self.schedule_eviction(&image_id, true, window);
         Some(rendered)
     }
 
     pub fn ready(&mut self, source: &Image, window: &mut Window) -> Option<Arc<RenderImage>> {
-        self.clock = self.clock.wrapping_add(1);
-        let last_used = self.clock;
         let image_id = source.id();
-        self.eviction.record(image_id);
-        let entry = self.entries.get_mut(&source.id())?;
+        let last_used = self.record_use(image_id);
+        let entry = self.entries.get_mut(&image_id)?;
         let rendered = entry.rendered.clone()?;
         entry.last_used = last_used;
-        self.schedule_eviction(image_id, false, window);
+        self.schedule_eviction(&image_id, false, window);
         Some(rendered)
     }
 
@@ -696,92 +793,10 @@ impl CardSpriteCache {
         self.release_all(Some(window), cx);
     }
 
-    fn over_limit(&self) -> bool {
-        self.decoded_bytes > self.byte_budget || self.entries.len() > CARD_SPRITE_CACHE_MAX_ITEMS
-    }
-
-    fn schedule_eviction(&mut self, image_id: u64, capacity_changed: bool, window: &mut Window) {
-        if self
-            .eviction_backoff
-            .is_some_and(|until| Instant::now() < until)
-        {
-            return;
-        }
-        if !self
-            .eviction
-            .should_start(self.over_limit(), &image_id, capacity_changed)
-        {
-            return;
-        }
-
-        self.eviction_backoff = Some(Instant::now() + EVICTION_CYCLE_SPACING);
-        let generation = self.eviction.start();
-        let cache = self.weak_self.clone();
-        window.on_next_frame(move |window, cx| {
-            let eviction_cache = cache.clone();
-            let _ = cache.update(cx, |cache, _| {
-                if !cache.eviction.begin_collection(generation) {
-                    return;
-                }
-                window.refresh();
-                window.on_next_frame(move |window, cx| {
-                    let _ = eviction_cache.update(cx, |cache, cx| {
-                        let Some(visible) = cache.eviction.finish_collection(generation) else {
-                            return;
-                        };
-                        if cache.evict_to_limits(&visible, window, cx) {
-                            window.refresh();
-                        }
-                        if cache.over_limit() {
-                            cache.eviction_backoff =
-                                Some(Instant::now() + SATURATED_EVICTION_SPACING);
-                        }
-                    });
-                });
-            });
-        });
-    }
-
-    fn evict_to_limits(
-        &mut self,
-        protected: &HashSet<u64>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> bool {
-        let mut evicted = false;
-        while self.decoded_bytes > self.byte_budget
-            || self.entries.len() > CARD_SPRITE_CACHE_MAX_ITEMS
-        {
-            let oldest = self
-                .entries
-                .iter()
-                .filter(|(image_id, _)| !protected.contains(*image_id))
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(image_id, _)| *image_id);
-            let Some(oldest) = oldest else {
-                break;
-            };
-            self.release(oldest, Some(window), cx);
-            evicted = true;
-        }
-        evicted
-    }
-
-    fn release(&mut self, image_id: u64, window: Option<&mut Window>, cx: &mut App) {
-        let Some(entry) = self.entries.remove(&image_id) else {
-            return;
-        };
-        self.decoded_bytes = self.decoded_bytes.saturating_sub(entry.decoded_bytes);
-        entry.source.remove_asset(cx);
-        if let Some(rendered) = entry.rendered {
-            cx.drop_image(rendered, window);
-        }
-    }
-
     fn release_all(&mut self, mut window: Option<&mut Window>, cx: &mut App) {
         let entries = std::mem::take(&mut self.entries);
-        self.decoded_bytes = 0;
-        self.eviction.cancel();
+        self.budget.decoded_bytes = 0;
+        self.budget.cycle.cancel();
         for (_, entry) in entries {
             entry.source.remove_asset(cx);
             if let Some(rendered) = entry.rendered {
