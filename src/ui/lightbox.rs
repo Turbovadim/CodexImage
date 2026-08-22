@@ -492,8 +492,10 @@ impl AppView {
             parent_id: Some(node_id.clone()),
             source_images: Some(vec![image]),
             aspect: self
-                .node(&node_id)
-                .map(|node| node.aspect)
+                .board
+                .as_ref()
+                .and_then(|board| board.nodes.iter().find(|node| node.id == node_id))
+                .map(|node| node.aspect.clone())
                 .unwrap_or_else(|| "auto".into()),
             count: 1,
             attachment_paths: Vec::new(),
@@ -555,16 +557,18 @@ impl AppView {
             (_, Some(Ok(image))) if image.frame_count() > 0 => img(image),
             _ => img(thumbnail_path),
         };
-        let node = self.node(&lightbox.node_id);
-        let image_index = node
+        let node = self
+            .board
             .as_ref()
+            .and_then(|board| board.nodes.iter().find(|node| node.id == lightbox.node_id));
+        let image_index = node
             .and_then(|node| {
                 node.images
                     .iter()
                     .position(|image| image == &lightbox.image)
             })
             .unwrap_or(0);
-        let total = node.as_ref().map(|node| node.images.len()).unwrap_or(1);
+        let total = node.map(|node| node.images.len()).unwrap_or(1);
         let copy_path = path.clone();
         let save_path = path.clone();
         let open_path = path.clone();

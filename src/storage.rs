@@ -280,14 +280,18 @@ impl Repository {
         state.trash.retain(|_, entry| entry.board_id != board_id);
         drop(state);
         self.persist_and_notify();
-        for path in [
+        let directories = [
             self.paths.images.join(board_id),
             self.paths.generated_originals.join(board_id),
             self.paths.workspaces.join(board_id),
-        ] {
-            let _ = fs::remove_dir_all(path);
-        }
-        let _ = fs::remove_file(self.paths.logs.join(format!("{board_id}.jsonl")));
+        ];
+        let log = self.paths.logs.join(format!("{board_id}.jsonl"));
+        std::thread::spawn(move || {
+            for path in directories {
+                let _ = fs::remove_dir_all(path);
+            }
+            let _ = fs::remove_file(log);
+        });
         Ok(())
     }
 

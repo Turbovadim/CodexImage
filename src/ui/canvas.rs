@@ -43,6 +43,34 @@ pub struct CanvasNodeFrame {
     pub status_line: Option<SharedString>,
 }
 
+#[derive(Clone, Copy)]
+pub struct CanvasConnector {
+    pub from_x: f32,
+    pub from_y: f32,
+    pub to_x: f32,
+    pub to_y: f32,
+}
+
+impl CanvasConnector {
+    fn screen_points(
+        self,
+        camera_x: f32,
+        camera_y: f32,
+        zoom: f32,
+    ) -> (Point<Pixels>, Point<Pixels>) {
+        (
+            point(
+                px(camera_x + self.from_x * zoom),
+                px(camera_y + self.from_y * zoom),
+            ),
+            point(
+                px(camera_x + self.to_x * zoom),
+                px(camera_y + self.to_y * zoom),
+            ),
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct DotGridMetrics {
     tile_size: f32,
@@ -233,17 +261,36 @@ impl ConnectorStyle {
     }
 }
 
-/// Strokes every parent → child connector in one dashed path.
-pub fn paint_connectors(edges: &[(Point<Pixels>, Point<Pixels>)], zoom: f32, window: &mut Window) {
+/// Transforms, culls, and strokes every visible parent-to-child connector.
+pub fn paint_connectors(
+    edges: &[CanvasConnector],
+    camera_x: f32,
+    camera_y: f32,
+    zoom: f32,
+    viewport_width: f32,
+    viewport_height: f32,
+    window: &mut Window,
+) {
     if edges.is_empty() {
         return;
     }
     let style = ConnectorStyle::for_zoom(zoom);
     let mut builder = PathBuilder::stroke(px(style.stroke_width));
-    for (from, to) in edges {
-        append_dashed_connector(&mut builder, *from, *to, style);
+    let mut visible = false;
+    for edge in edges {
+        let (from, to) = edge.screen_points(camera_x, camera_y, zoom);
+        if edge_is_visible(
+            from,
+            to,
+            viewport_width,
+            viewport_height,
+            VIEWPORT_CULL_MARGIN,
+        ) {
+            append_dashed_connector(&mut builder, from, to, style);
+            visible = true;
+        }
     }
-    if let Ok(path) = builder.build() {
+    if visible && let Ok(path) = builder.build() {
         window.paint_path(path, theme::line());
     }
 }
@@ -773,8 +820,8 @@ fn transform_card_rect(bounds: CardRect, frame: &CanvasNodeFrame, zoom: f32) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        CARD_WIDTH, CardRect, ConnectorStyle, DashCommand, GRID_COLOR_BGRA, GRID_GAP,
-        GRID_MIN_SCREEN_GAP, GRID_TEXTURE_SCALE, GRID_TILE_SIZE, dot_grid_metrics,
+        CARD_WIDTH, CanvasConnector, CardRect, ConnectorStyle, DashCommand, GRID_COLOR_BGRA,
+        GRID_GAP, GRID_MIN_SCREEN_GAP, GRID_TEXTURE_SCALE, GRID_TILE_SIZE, dot_grid_metrics,
         dot_grid_texture_pixels, edge_is_visible, image_needs_high_resolution, rect_is_visible,
         trace_dashed_polyline,
     };
@@ -804,6 +851,21 @@ mod tests {
             600.,
             16.,
         ));
+    }
+
+    #[test]
+    fn connector_geometry_is_transformed_from_cached_world_space() {
+        let connector = CanvasConnector {
+            from_x: 20.,
+            from_y: 40.,
+            to_x: 100.,
+            to_y: 140.,
+        };
+
+        assert_eq!(
+            connector.screen_points(10., -5., 0.5),
+            (point(px(20.), px(15.)), point(px(60.), px(65.)))
+        );
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! The application window: board state, overlays, input handling, and the
 //! element tree that hosts the painted canvas.
 
-use super::canvas_view::DragState;
+use super::canvas::CanvasConnector;
+use super::canvas_view::{DragState, MinimapScene};
 use super::card::{
     CanvasImageAsset, CanvasNode, OutputLayout, PROMPT_WRAP_COLUMNS, card_height,
     card_height_from_metadata, output_layout, wrap_prompt,
@@ -84,6 +85,8 @@ pub(super) struct AppView {
     pub(super) overlay: Overlay,
     pub(super) target: Option<ComposerTarget>,
     pub(super) attachments: Vec<PathBuf>,
+    pub(super) pending_attachment_writes: usize,
+    pub(super) composer_submission_pending: bool,
     pub(super) aspect_index: usize,
     pub(super) count: usize,
     pub(super) activity: HashMap<String, String>,
@@ -98,6 +101,8 @@ pub(super) struct AppView {
     pub(super) prompt_lines: HashMap<String, Vec<SharedString>>,
     pub(super) output_layouts: HashMap<String, OutputLayout>,
     pub(super) canvas_nodes: Arc<Vec<Arc<CanvasNode>>>,
+    pub(super) canvas_connectors: Arc<Vec<CanvasConnector>>,
+    pub(super) minimap_scene: Option<MinimapScene>,
     /// Rows for whichever overlay is open. Building them walks every node of
     /// every board, so they are derived when the data changes rather than on
     /// every frame; a closed overlay's rows are stale and unread until it opens.
@@ -116,6 +121,22 @@ pub(super) struct AppView {
     /// When zoom last moved; sprite tiers only rebuild once it settles.
     pub(super) last_zoom_change: Instant,
     pub(super) drag: Option<DragState>,
+}
+
+impl Drop for AppView {
+    fn drop(&mut self) {
+        let pending = self
+            .engine
+            .repository()
+            .paths()
+            .root
+            .join("pending-attachments");
+        for path in &self.attachments {
+            if path.starts_with(&pending) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
 }
 
 pub fn run() -> Result<()> {
@@ -242,6 +263,8 @@ impl AppView {
             overlay: Overlay::None,
             target: None,
             attachments: Vec::new(),
+            pending_attachment_writes: 0,
+            composer_submission_pending: false,
             aspect_index: 0,
             count: 1,
             activity: HashMap::new(),
@@ -256,6 +279,8 @@ impl AppView {
             prompt_lines: HashMap::new(),
             output_layouts: HashMap::new(),
             canvas_nodes: Arc::new(Vec::new()),
+            canvas_connectors: Arc::new(Vec::new()),
+            minimap_scene: None,
             board_rows: Arc::new(Vec::new()),
             gallery_rows: Arc::new(Vec::new()),
             image_cache,
@@ -426,6 +451,7 @@ impl AppView {
             self.output_layouts.clear();
             self.canvas_nodes = Arc::new(Vec::new());
         }
+        self.refresh_canvas_scene();
         self.refresh_overlay_data();
     }
 

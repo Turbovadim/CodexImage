@@ -122,7 +122,7 @@ pub struct TextInput {
 }
 
 pub enum TextInputEvent {
-    PastedImages(Vec<Image>),
+    PastedImages(Arc<[Image]>),
     PastedPaths(Vec<std::path::PathBuf>),
 }
 

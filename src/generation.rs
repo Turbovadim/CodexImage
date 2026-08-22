@@ -37,6 +37,7 @@ pub struct GenerationEngine {
 struct EngineInner {
     repository: Repository,
     jobs: Mutex<HashMap<String, Arc<JobControl>>>,
+    submission_lock: Mutex<()>,
     codex: OnceLock<CodexInvocation>,
 }
 
@@ -117,6 +118,7 @@ impl GenerationEngine {
             inner: Arc::new(EngineInner {
                 repository,
                 jobs: Mutex::new(HashMap::new()),
+                submission_lock: Mutex::new(()),
                 codex: OnceLock::new(),
             }),
         }
@@ -143,6 +145,7 @@ impl GenerationEngine {
         board_id: &str,
         request: NewNodesRequest,
     ) -> Result<Vec<BoardNode>> {
+        let _submission = self.inner.submission_lock.lock();
         let active_on_board = self
             .inner
             .jobs
@@ -169,6 +172,7 @@ impl GenerationEngine {
         prompt: Option<String>,
         aspect: Option<String>,
     ) -> Result<()> {
+        let _submission = self.inner.submission_lock.lock();
         self.stop(node_id, Termination::Replaced, libc::SIGKILL);
         self.inner
             .repository

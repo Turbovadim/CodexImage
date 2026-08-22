@@ -280,11 +280,13 @@ impl TextInput {
         let Some(item) = cx.read_from_clipboard() else {
             return;
         };
+        let text = item.text();
+        let was_empty = item.entries().is_empty();
         let mut images = Vec::new();
         let mut paths = Vec::new();
-        for entry in item.entries() {
+        for entry in item.into_entries() {
             match entry {
-                ClipboardEntry::Image(image) => images.push(image.clone()),
+                ClipboardEntry::Image(image) => images.push(image),
                 ClipboardEntry::ExternalPaths(external) => {
                     paths.extend(external.paths().iter().cloned());
                 }
@@ -292,15 +294,15 @@ impl TextInput {
             }
         }
         if !images.is_empty() {
-            cx.emit(TextInputEvent::PastedImages(images));
+            cx.emit(TextInputEvent::PastedImages(images.into()));
         }
         if !paths.is_empty() {
             cx.emit(TextInputEvent::PastedPaths(paths));
         }
-        if let Some(text) = item.text() {
+        if let Some(text) = text {
             let range = self.selected.clone();
             self.apply_edit(range, &text, EditKind::Replace, cx);
-        } else if item.entries().is_empty() {
+        } else if was_empty {
             window.play_system_bell();
         }
     }

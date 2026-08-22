@@ -4,7 +4,7 @@
 use super::app::AppView;
 use super::app::Overlay;
 use super::canvas::{
-    CanvasNodeFrame, ToolbarButtonPaint, VIEWPORT_CULL_MARGIN, edge_is_visible, paint_canvas_node,
+    CanvasConnector, CanvasNodeFrame, ToolbarButtonPaint, VIEWPORT_CULL_MARGIN, paint_canvas_node,
     paint_connectors, paint_dot_grid, paint_node_toolbar, rect_is_visible,
 };
 use super::card::{
@@ -24,6 +24,7 @@ use gpui::{
     MouseUpEvent, PinchEvent, Pixels, Point, Role, ScrollWheelEvent, SharedString, Window, canvas,
     div, fill, point, prelude::*, px, size,
 };
+use std::sync::Arc;
 
 pub(super) const NODE_TOOLBAR_HEIGHT: f32 = 36.;
 /// World-space toolbar metrics; everything scales with the canvas zoom so the
@@ -42,6 +43,24 @@ const MINIMAP_RIGHT: f32 = 18.;
 const MINIMAP_BOTTOM: f32 = 24.;
 /// Vertical band reserved for the board switcher and gallery button.
 const HEADER_CLEARANCE: f32 = 60.;
+
+#[derive(Clone, Copy)]
+struct MinimapNodeRect {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    status: NodeStatus,
+}
+
+pub(super) struct MinimapScene {
+    min_x: f32,
+    min_y: f32,
+    scale: f32,
+    offset_x: f32,
+    offset_y: f32,
+    node_rects: Arc<Vec<MinimapNodeRect>>,
+}
 
 #[derive(Clone)]
 pub(super) enum CanvasClickTarget {
@@ -161,6 +180,82 @@ pub(super) enum DragState {
 }
 
 impl AppView {
+    /// Rebuilds board-space paint data when layout changes. Camera movement
+    /// only transforms and culls this geometry during rendering.
+    pub(super) fn refresh_canvas_scene(&mut self) {
+        const PADDING: f32 = 6.;
+
+        self.canvas_connectors = Arc::new(self.build_canvas_connectors());
+        let Some(board) = self.board.as_ref().filter(|board| board.nodes.len() >= 2) else {
+            self.minimap_scene = None;
+            return;
+        };
+        let mut min_x = f32::INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        for node in &board.nodes {
+            let Some(position) = self.layout.get(&node.id) else {
+                continue;
+            };
+            min_x = min_x.min(position.x);
+            min_y = min_y.min(position.y);
+            max_x = max_x.max(position.x + CARD_WIDTH);
+            max_y = max_y.max(position.y + self.card_height(node));
+        }
+        if !min_x.is_finite() || !min_y.is_finite() {
+            self.minimap_scene = None;
+            return;
+        }
+        let world_width = (max_x - min_x).max(1.);
+        let world_height = (max_y - min_y).max(1.);
+        let scale = ((MINIMAP_WIDTH - PADDING * 2.) / world_width)
+            .min((MINIMAP_HEIGHT - PADDING * 2.) / world_height);
+        let offset_x = PADDING + (MINIMAP_WIDTH - PADDING * 2. - world_width * scale) / 2.;
+        let offset_y = PADDING + (MINIMAP_HEIGHT - PADDING * 2. - world_height * scale) / 2.;
+        let node_rects = board
+            .nodes
+            .iter()
+            .filter_map(|node| {
+                let position = self.layout.get(&node.id)?;
+                Some(MinimapNodeRect {
+                    x: offset_x + (position.x - min_x) * scale,
+                    y: offset_y + (position.y - min_y) * scale,
+                    width: (CARD_WIDTH * scale).max(2.),
+                    height: (self.card_height(node) * scale).max(2.),
+                    status: node.status,
+                })
+            })
+            .collect();
+        self.minimap_scene = Some(MinimapScene {
+            min_x,
+            min_y,
+            scale,
+            offset_x,
+            offset_y,
+            node_rects: Arc::new(node_rects),
+        });
+    }
+
+    fn build_canvas_connectors(&self) -> Vec<CanvasConnector> {
+        self.board
+            .iter()
+            .flat_map(|board| &board.nodes)
+            .filter_map(|node| {
+                let parent = node.parent_id.as_deref()?;
+                let parent_position = self.current_position(parent)?;
+                let node_position = self.current_position(&node.id)?;
+                let parent_height = self.heights.get(parent).copied()?;
+                Some(CanvasConnector {
+                    from_x: parent_position.x + CARD_WIDTH / 2.,
+                    from_y: parent_position.y + parent_height,
+                    to_x: node_position.x + CARD_WIDTH / 2.,
+                    to_y: node_position.y,
+                })
+            })
+            .collect()
+    }
+
     fn fit_canvas(&mut self, window: &Window, cx: &mut Context<Self>) {
         let Some(board) = &self.board else { return };
         if board.nodes.is_empty() {
@@ -306,32 +401,11 @@ impl AppView {
                 (node.node.id == hovered_id).then(|| self.toolbar_paint_buttons(node, frame))
             })
         });
-        let edge_points: Vec<_> = board
-            .into_iter()
-            .flat_map(|board| &board.nodes)
-            .filter_map(|node| {
-                let parent = node.parent_id.as_deref()?;
-                let parent_position = self.current_position(parent)?;
-                let node_position = self.current_position(&node.id)?;
-                let parent_height = self.heights.get(parent).copied()?;
-                let from = point(
-                    px(self.camera_x + (parent_position.x + CARD_WIDTH / 2.) * self.zoom),
-                    px(self.camera_y + (parent_position.y + parent_height) * self.zoom),
-                );
-                let to = point(
-                    px(self.camera_x + (node_position.x + CARD_WIDTH / 2.) * self.zoom),
-                    px(self.camera_y + node_position.y * self.zoom),
-                );
-                edge_is_visible(
-                    from,
-                    to,
-                    viewport_width,
-                    viewport_height,
-                    VIEWPORT_CULL_MARGIN,
-                )
-                .then_some((from, to))
-            })
-            .collect();
+        let canvas_connectors = if self.transient_positions.is_empty() {
+            Arc::clone(&self.canvas_connectors)
+        } else {
+            Arc::new(self.build_canvas_connectors())
+        };
         let canvas_nodes = self.canvas_nodes.clone();
         let image_cache = self.image_cache.clone();
         let sprite_cache = self.sprite_cache.clone();
@@ -349,7 +423,15 @@ impl AppView {
                     window.on_next_frame(move |_, cx| cx.notify(entity));
                 }
                 paint_dot_grid(bounds, camera_x, camera_y, zoom, window);
-                paint_connectors(&edge_points, zoom, window);
+                paint_connectors(
+                    &canvas_connectors,
+                    camera_x,
+                    camera_y,
+                    zoom,
+                    viewport_width,
+                    viewport_height,
+                    window,
+                );
                 for frame in &visible_nodes {
                     if let Some(node) = canvas_nodes.get(frame.node_index) {
                         paint_canvas_node(
@@ -559,50 +641,16 @@ impl AppView {
     ) -> Option<AnyElement> {
         const WIDTH: f32 = MINIMAP_WIDTH;
         const HEIGHT: f32 = MINIMAP_HEIGHT;
-        const PADDING: f32 = 6.;
         const RIGHT: f32 = MINIMAP_RIGHT;
         const BOTTOM: f32 = MINIMAP_BOTTOM;
 
-        let board = self.board.as_ref()?;
-        if board.nodes.len() < 2 {
-            return None;
-        }
-        let mut min_x = f32::INFINITY;
-        let mut min_y = f32::INFINITY;
-        let mut max_x = f32::NEG_INFINITY;
-        let mut max_y = f32::NEG_INFINITY;
-        for node in &board.nodes {
-            let Some(position) = self.current_position(&node.id) else {
-                continue;
-            };
-            min_x = min_x.min(position.x);
-            min_y = min_y.min(position.y);
-            max_x = max_x.max(position.x + CARD_WIDTH);
-            max_y = max_y.max(position.y + self.card_height(node));
-        }
-        if !min_x.is_finite() || !min_y.is_finite() {
-            return None;
-        }
-        let world_width = (max_x - min_x).max(1.);
-        let world_height = (max_y - min_y).max(1.);
-        let scale =
-            ((WIDTH - PADDING * 2.) / world_width).min((HEIGHT - PADDING * 2.) / world_height);
-        let offset_x = PADDING + (WIDTH - PADDING * 2. - world_width * scale) / 2.;
-        let offset_y = PADDING + (HEIGHT - PADDING * 2. - world_height * scale) / 2.;
-        let node_rects: Vec<_> = board
-            .nodes
-            .iter()
-            .filter_map(|node| {
-                let position = self.current_position(&node.id)?;
-                Some((
-                    offset_x + (position.x - min_x) * scale,
-                    offset_y + (position.y - min_y) * scale,
-                    (CARD_WIDTH * scale).max(2.),
-                    (self.card_height(node) * scale).max(2.),
-                    node.status,
-                ))
-            })
-            .collect();
+        let scene = self.minimap_scene.as_ref()?;
+        let min_x = scene.min_x;
+        let min_y = scene.min_y;
+        let scale = scene.scale;
+        let offset_x = scene.offset_x;
+        let offset_y = scene.offset_y;
+        let node_rects = Arc::clone(&scene.node_rects);
         let viewport_width = f32::from(viewport.width);
         let viewport_height = f32::from(viewport.height);
         let visible_world_x = -self.camera_x / self.zoom;
@@ -616,16 +664,16 @@ impl AppView {
         let map = canvas(
             |_, _, _| (),
             move |bounds, _, window, _| {
-                for (x, y, width, height, status) in node_rects {
-                    let color = match status {
+                for rect in node_rects.iter() {
+                    let color = match rect.status {
                         NodeStatus::Running => theme::accent(),
                         NodeStatus::Error => theme::danger(),
                         _ => theme::dim(),
                     };
                     window.paint_quad(fill(
                         Bounds::new(
-                            point(bounds.left() + px(x), bounds.top() + px(y)),
-                            size(px(width), px(height)),
+                            point(bounds.left() + px(rect.x), bounds.top() + px(rect.y)),
+                            size(px(rect.width), px(rect.height)),
                         ),
                         color.opacity(0.78),
                     ));

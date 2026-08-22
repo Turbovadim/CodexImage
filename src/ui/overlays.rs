@@ -9,7 +9,7 @@ use super::input::TextInputMode;
 use super::keymap::{Generate, OpenBoards, ToggleGallery};
 use super::theme;
 use super::tooltip::{tip, tip_with_shortcut};
-use crate::model::{BoardNode, BoardSummary};
+use crate::model::BoardSummary;
 use gpui::{
     AnyElement, ClipboardItem, Context, Focusable, FontWeight, ObjectFit, Role, SharedString,
     StyledImage, WeakEntity, Window, div, img, list, prelude::*, px,
@@ -54,11 +54,20 @@ impl BoardRow {
     }
 }
 
-/// One gallery row. Same reasoning as `BoardRow`: this clones a whole node.
+struct GalleryImage {
+    url: String,
+    thumbnail: PathBuf,
+}
+
+/// Immutable gallery presentation data. Keeping only what the row paints
+/// avoids duplicating node attempts, logs, labels, and source images.
 pub(super) struct GalleryRow {
-    node: BoardNode,
-    depth: usize,
-    thumbnails: Vec<PathBuf>,
+    node_id: String,
+    prompt: SharedString,
+    status: SharedString,
+    metadata: SharedString,
+    indent: f32,
+    images: Vec<GalleryImage>,
 }
 
 impl GalleryRow {
@@ -71,14 +80,30 @@ impl GalleryRow {
         nodes.sort_by_key(|node| (std::cmp::Reverse(node.created_at), &node.id));
         nodes
             .into_iter()
-            .map(|node| Self {
-                depth: depths.get(&node.id).copied().unwrap_or(0),
-                thumbnails: node
-                    .images
-                    .iter()
-                    .map(|url| view.display_image_path(url, false))
-                    .collect(),
-                node: node.clone(),
+            .map(|node| {
+                let depth = depths.get(&node.id).copied().unwrap_or(0);
+                let status = status_label(node);
+                Self {
+                    node_id: node.id.clone(),
+                    prompt: node.prompt.clone().into(),
+                    metadata: format!(
+                        "{} · {} · {} branch depth",
+                        status,
+                        format_date(node.created_at),
+                        depth
+                    )
+                    .into(),
+                    status: status.into(),
+                    indent: depth as f32 * 18.,
+                    images: node
+                        .images
+                        .iter()
+                        .map(|url| GalleryImage {
+                            url: url.clone(),
+                            thumbnail: view.display_image_path(url, false),
+                        })
+                        .collect(),
+                }
             })
             .collect()
     }
@@ -89,9 +114,8 @@ fn render_gallery_row(
     view: WeakEntity<AppView>,
     available_width: f32,
 ) -> AnyElement {
-    let node = &row.node;
     let mut strip = div().min_w_0().flex_1().flex().flex_wrap().gap_2();
-    if node.images.is_empty() {
+    if row.images.is_empty() {
         strip = strip.child(
             div()
                 .h(px(96.))
@@ -104,28 +128,24 @@ fn render_gallery_row(
                 .justify_center()
                 .text_xs()
                 .text_color(theme::faint())
-                .child(status_label(node)),
+                .child(row.status.clone()),
         );
     } else {
-        for (index, (url, thumbnail)) in node.images.iter().zip(&row.thumbnails).enumerate() {
-            let node_id = node.id.clone();
-            let image_url = url.clone();
+        for (index, image) in row.images.iter().enumerate() {
+            let node_id = row.node_id.clone();
+            let image_url = image.url.clone();
             let image_view = view.clone();
             strip = strip.child(
                 div()
                     .relative()
                     .child(
-                        img(thumbnail.clone())
+                        img(image.thumbnail.clone())
                             .id(SharedString::from(format!(
                                 "gallery-image-{}-{index}",
-                                node.id
+                                row.node_id
                             )))
                             .role(Role::Button)
-                            .aria_label(format!(
-                                "Open image {} of {}",
-                                index + 1,
-                                node.images.len()
-                            ))
+                            .aria_label(format!("Open image {} of {}", index + 1, row.images.len()))
                             .size(px(148.))
                             .rounded_lg()
                             .object_fit(ObjectFit::Cover)
@@ -141,7 +161,7 @@ fn render_gallery_row(
                                 });
                             }),
                     )
-                    .when(node.images.len() > 1, |cell| {
+                    .when(row.images.len() > 1, |cell| {
                         cell.child(
                             div()
                                 .absolute()
@@ -152,14 +172,14 @@ fn render_gallery_row(
                                 .px_1()
                                 .text_xs()
                                 .text_color(theme::ink())
-                                .child(format!("{}/{}", index + 1, node.images.len())),
+                                .child(format!("{}/{}", index + 1, row.images.len())),
                         )
                     }),
             );
         }
     }
 
-    let locate_id = node.id.clone();
+    let locate_id = row.node_id.clone();
     let locate_view = view;
     div()
         .w(px(available_width.max(0.)))
@@ -172,28 +192,23 @@ fn render_gallery_row(
         .child(
             div()
                 .w(px(330.))
-                .pl(px(row.depth as f32 * 18.))
+                .pl(px(row.indent))
                 .child(
                     div()
                         .text_sm()
                         .text_color(theme::ink())
-                        .child(node.prompt.clone()),
+                        .child(row.prompt.clone()),
                 )
                 .child(
                     div()
                         .mt_1()
                         .text_xs()
                         .text_color(theme::faint())
-                        .child(format!(
-                            "{} · {} · {} branch depth",
-                            status_label(node),
-                            format_date(node.created_at),
-                            row.depth
-                        )),
+                        .child(row.metadata.clone()),
                 )
                 .child(
                     div()
-                        .id(SharedString::from(format!("locate-{}", node.id)))
+                        .id(SharedString::from(format!("locate-{}", row.node_id)))
                         .role(Role::Button)
                         .aria_label("Show this generation on the canvas")
                         .mt_2()

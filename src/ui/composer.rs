@@ -9,13 +9,14 @@ use super::theme;
 use super::tooltip::{tip, tip_with_shortcut};
 use crate::APP_NAME;
 use crate::model::NewNodesRequest;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use gpui::{
     AnyElement, App, Context, Focusable, FontWeight, Image, ImageFormat, ObjectFit,
     PathPromptOptions, Role, SharedString, StyledImage, Window, div, img, prelude::*, px,
 };
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use uuid::Uuid;
 
 pub(super) const ASPECTS: &[&str] = &["auto", "1:1", "16:9", "9:16", "4:3", "3:4"];
@@ -27,7 +28,41 @@ pub(super) const SAMPLES: &[&str] = &[
     "Studio photo of a perfume bottle on black marble, dramatic lighting",
 ];
 
-#[derive(Clone)]
+/// Persists clipboard image bytes without blocking GPUI's application thread.
+/// On a partial failure, removes every temporary file from this paste batch.
+fn save_pending_clipboard_images(
+    directory: PathBuf,
+    images: Arc<[Image]>,
+    save_count: usize,
+) -> Result<Vec<PathBuf>> {
+    fs::create_dir_all(&directory).context("creating the pending attachment directory")?;
+    let mut paths = Vec::with_capacity(save_count);
+    for image in images.iter().take(save_count) {
+        let extension = match image.format {
+            ImageFormat::Png => "png",
+            ImageFormat::Jpeg => "jpg",
+            ImageFormat::Webp => "webp",
+            ImageFormat::Gif => "gif",
+            ImageFormat::Svg => "svg",
+            ImageFormat::Bmp => "bmp",
+            ImageFormat::Tiff => "tiff",
+            ImageFormat::Ico => "ico",
+            ImageFormat::Pnm => "pnm",
+        };
+        let path = directory.join(format!("clipboard-{}.{}", Uuid::new_v4(), extension));
+        if let Err(error) = fs::write(&path, &image.bytes) {
+            let _ = fs::remove_file(&path);
+            for saved in paths {
+                let _ = fs::remove_file(saved);
+            }
+            return Err(error).context("saving a pasted image");
+        }
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+#[derive(Clone, Eq, PartialEq)]
 pub(super) struct ComposerTarget {
     pub(super) node_id: String,
     pub(super) prompt: String,
@@ -62,44 +97,69 @@ impl AppView {
     pub(super) fn handle_input_event(&mut self, event: &TextInputEvent, cx: &mut Context<Self>) {
         match event {
             TextInputEvent::PastedImages(images) => {
-                for image in images {
-                    if let Ok(path) = self.save_pending_clipboard_image(image) {
-                        self.attachments.push(path);
-                    }
+                let available = crate::model::MAX_ATTACHMENTS
+                    .saturating_sub(self.attachments.len() + self.pending_attachment_writes);
+                let save_count = available.min(images.len());
+                if save_count == 0 {
+                    self.show_toast(
+                        format!(
+                            "Attachment limit reached ({})",
+                            crate::model::MAX_ATTACHMENTS
+                        ),
+                        false,
+                        None,
+                        cx,
+                    );
+                    return;
                 }
+                if save_count < images.len() {
+                    self.show_toast(
+                        format!(
+                            "Saving {save_count} images; attachment limit is {}",
+                            crate::model::MAX_ATTACHMENTS
+                        ),
+                        false,
+                        None,
+                        cx,
+                    );
+                }
+                self.pending_attachment_writes += save_count;
+                let directory = self
+                    .engine
+                    .repository()
+                    .paths()
+                    .root
+                    .join("pending-attachments");
+                let images = Arc::clone(images);
+                cx.spawn(async move |weak, cx| {
+                    let result = smol::unblock(move || {
+                        save_pending_clipboard_images(directory, images, save_count)
+                    })
+                    .await;
+                    let _ = weak.update(cx, |view, cx| {
+                        view.pending_attachment_writes =
+                            view.pending_attachment_writes.saturating_sub(save_count);
+                        match result {
+                            // These paths already own reserved slots and came
+                            // from GPUI-decoded clipboard images.
+                            Ok(paths) => view.attachments.extend(paths),
+                            Err(error) => view.show_error(error, cx),
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
             }
             TextInputEvent::PastedPaths(paths) => self.queue_attachments(paths.clone()),
         }
         cx.notify();
     }
 
-    fn save_pending_clipboard_image(&self, image: &Image) -> Result<PathBuf> {
-        let extension = match image.format {
-            ImageFormat::Png => "png",
-            ImageFormat::Jpeg => "jpg",
-            ImageFormat::Webp => "webp",
-            ImageFormat::Gif => "gif",
-            ImageFormat::Svg => "svg",
-            ImageFormat::Bmp => "bmp",
-            ImageFormat::Tiff => "tiff",
-            ImageFormat::Ico => "ico",
-            ImageFormat::Pnm => "pnm",
-        };
-        let directory = self
-            .engine
-            .repository()
-            .paths()
-            .root
-            .join("pending-attachments");
-        fs::create_dir_all(&directory)?;
-        let path = directory.join(format!("clipboard-{}.{}", Uuid::new_v4(), extension));
-        fs::write(&path, &image.bytes)?;
-        Ok(path)
-    }
-
     pub(super) fn queue_attachments(&mut self, paths: Vec<PathBuf>) {
         for path in paths {
-            if self.attachments.len() >= crate::model::MAX_ATTACHMENTS {
+            if self.attachments.len() + self.pending_attachment_writes
+                >= crate::model::MAX_ATTACHMENTS
+            {
                 break;
             }
             if path.is_file()
@@ -117,6 +177,19 @@ impl AppView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.attachments.len() + self.pending_attachment_writes >= crate::model::MAX_ATTACHMENTS
+        {
+            self.show_toast(
+                format!(
+                    "Attachment limit reached ({})",
+                    crate::model::MAX_ATTACHMENTS
+                ),
+                false,
+                None,
+                cx,
+            );
+            return;
+        }
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -135,22 +208,69 @@ impl AppView {
         .detach();
     }
 
-    /// Drops the attachment list, deleting the copies made for pasted images.
-    fn discard_pending_attachments(&mut self) {
+    fn remove_attachment(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.attachments.len() {
+            return;
+        }
+        let path = self.attachments.remove(index);
         let pending = self
             .engine
             .repository()
             .paths()
             .root
             .join("pending-attachments");
-        for path in self.attachments.drain(..) {
-            if path.starts_with(&pending) {
+        if path.starts_with(pending) {
+            cx.background_spawn(async move {
                 let _ = fs::remove_file(path);
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
+    /// Removes the attachments consumed by one successful submission while
+    /// preserving any references the user added as it was starting.
+    fn discard_submitted_attachments(&mut self, submitted: &[PathBuf], cx: &mut Context<Self>) {
+        let pending = self
+            .engine
+            .repository()
+            .paths()
+            .root
+            .join("pending-attachments");
+        let mut paths = Vec::new();
+        self.attachments.retain(|path| {
+            if !submitted.contains(path) {
+                return true;
             }
+            if path.starts_with(&pending) {
+                paths.push(path.clone());
+            }
+            false
+        });
+        if !paths.is_empty() {
+            cx.background_spawn(async move {
+                for path in paths {
+                    let _ = fs::remove_file(path);
+                }
+            })
+            .detach();
         }
     }
 
     pub(super) fn generate_from_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.composer_submission_pending {
+            self.show_toast("A generation is already starting".into(), false, None, cx);
+            return;
+        }
+        if self.pending_attachment_writes > 0 {
+            self.show_toast(
+                "Wait for pasted attachments to finish saving".into(),
+                false,
+                None,
+                cx,
+            );
+            return;
+        }
         let prompt = self.prompt.read(cx).content().trim().to_owned();
         if prompt.is_empty() {
             return;
@@ -162,7 +282,9 @@ impl AppView {
                 return;
             }
         };
-        let target = self.target.take();
+        let target = self.target.clone();
+        let submitted_prompt = prompt.clone();
+        let submitted_attachments = self.attachments.clone();
         let request = NewNodesRequest {
             prompt,
             parent_id: target.as_ref().map(|target| target.node_id.clone()),
@@ -171,22 +293,36 @@ impl AppView {
                 .and_then(|target| target.source_image.clone().map(|image| vec![image])),
             aspect: ASPECTS[self.aspect_index].to_owned(),
             count: self.count,
-            attachment_paths: self.attachments.clone(),
+            attachment_paths: submitted_attachments.clone(),
             attachment_urls: Vec::new(),
             position: None,
         };
-        match self.engine.add_and_start(&board_id, request) {
-            Ok(_) => {
-                self.discard_pending_attachments();
-                self.prompt.update(cx, |input, cx| input.clear(cx));
-                window.focus(&self.prompt.focus_handle(cx), cx);
-            }
-            Err(error) => {
-                self.target = target;
-                self.show_error(error, cx);
-            }
-        }
+        self.composer_submission_pending = true;
         cx.notify();
+        let engine = self.engine.clone();
+        let submission = cx
+            .background_spawn(async move { engine.add_and_start(&board_id, request).map(|_| ()) });
+        cx.spawn_in(window, async move |weak, cx| {
+            let result = submission.await;
+            let _ = weak.update_in(cx, |view, window, cx| {
+                view.composer_submission_pending = false;
+                match result {
+                    Ok(()) => {
+                        view.discard_submitted_attachments(&submitted_attachments, cx);
+                        if view.prompt.read(cx).content().trim() == submitted_prompt {
+                            view.prompt.update(cx, |input, cx| input.clear(cx));
+                        }
+                        if view.target == target {
+                            view.target = None;
+                        }
+                        window.focus(&view.prompt.focus_handle(cx), cx);
+                    }
+                    Err(error) => view.show_error(error, cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(super) fn focus_prompt(
@@ -201,6 +337,7 @@ impl AppView {
     }
 
     pub(super) fn render_composer(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let submission_pending = self.composer_submission_pending;
         let width = 660_f32.min(f32::from(window.viewport_size().width) - 40.);
         let left = (f32::from(window.viewport_size().width) - width) / 2.;
         let mut composer = div()
@@ -278,12 +415,14 @@ impl AppView {
                                 })
                                 .tooltip(tip("Remove attachment"))
                                 .child("×")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if index < this.attachments.len() {
-                                        this.attachments.remove(index);
-                                    }
-                                    cx.notify();
-                                })),
+                                .when(submission_pending, |remove| {
+                                    remove.text_color(theme::faint()).cursor_default()
+                                })
+                                .when(!submission_pending, |remove| {
+                                    remove.on_click(cx.listener(move |this, _, _, cx| {
+                                        this.remove_attachment(index, cx);
+                                    }))
+                                }),
                         ),
                 );
             }
@@ -305,8 +444,16 @@ impl AppView {
                 .hover(|style| style.border_color(theme::faint()).text_color(theme::ink()))
                 .child(label)
         };
-        let ready = !self.prompt.read(cx).content().trim().is_empty();
-        let attachments_full = self.attachments.len() >= crate::model::MAX_ATTACHMENTS;
+        let ready = !submission_pending
+            && self.pending_attachment_writes == 0
+            && !self.prompt.read(cx).content().trim().is_empty();
+        let attachments_full = self.attachments.len() + self.pending_attachment_writes
+            >= crate::model::MAX_ATTACHMENTS;
+        let attach_label = if self.pending_attachment_writes == 0 {
+            "Attach".into()
+        } else {
+            format!("Attach ({} saving)", self.pending_attachment_writes)
+        };
         composer = composer.child(
             div()
                 .flex()
@@ -329,7 +476,7 @@ impl AppView {
                         })),
                 )
                 .child(
-                    pill("attach", "Attach".into())
+                    pill("attach", attach_label)
                         .when(attachments_full, |pill| {
                             pill.text_color(theme::faint())
                                 .border_color(theme::line().opacity(0.5))
@@ -354,7 +501,11 @@ impl AppView {
                     div()
                         .id("send")
                         .role(Role::Button)
-                        .aria_label("Generate")
+                        .aria_label(if submission_pending {
+                            "Starting generation"
+                        } else {
+                            "Generate"
+                        })
                         .size(px(28.))
                         .rounded_lg()
                         .flex()
@@ -372,15 +523,19 @@ impl AppView {
                         .tooltip(tip_with_shortcut(
                             if ready {
                                 "Generate · ⇧↵ for a new line"
+                            } else if submission_pending {
+                                "Starting generation"
                             } else {
                                 "Describe an image first"
                             },
                             Some("↵"),
                         ))
                         .child("↑")
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.generate(&Generate, window, cx)),
-                        ),
+                        .when(ready, |send| {
+                            send.on_click(cx.listener(|this, _, window, cx| {
+                                this.generate(&Generate, window, cx)
+                            }))
+                        }),
                 ),
         );
         composer.into_any_element()
@@ -520,5 +675,39 @@ impl AppView {
                     }))
                     .into_any_element()
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clipboard_save_honors_reserved_attachment_slots() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let images: Arc<[Image]> = vec![
+            Image {
+                format: ImageFormat::Png,
+                bytes: vec![1, 2, 3],
+                id: 1,
+            },
+            Image {
+                format: ImageFormat::Jpeg,
+                bytes: vec![4, 5, 6],
+                id: 2,
+            },
+        ]
+        .into();
+
+        let paths =
+            save_pending_clipboard_images(directory.path().to_owned(), Arc::clone(&images), 1)
+                .expect("save clipboard image");
+
+        assert_eq!(paths.len(), 1);
+        assert_eq!(
+            paths[0].extension().and_then(|value| value.to_str()),
+            Some("png")
+        );
+        assert_eq!(fs::read(&paths[0]).expect("saved bytes"), images[0].bytes);
     }
 }
