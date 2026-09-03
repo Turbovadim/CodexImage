@@ -30,6 +30,9 @@ if (Test-Path $Stage) {
 }
 New-Item -ItemType Directory -Force $Stage | Out-Null
 Copy-Item (Join-Path $Root "target/release/codex-image.exe") (Join-Path $Stage "CodexImage.exe")
+# Same-run conditioning shells out to this console companion; the app disables
+# that step when the companion is missing beside CodexImage.exe.
+Copy-Item (Join-Path $Root "target/release/codex-image-condition.exe") $Stage
 Copy-Item (Join-Path $Root "README.md") $Stage
 
 $Executable = Join-Path $Stage "CodexImage.exe"
@@ -40,6 +43,7 @@ if ($Install) {
     $InstallDirectory = Join-Path $env:LOCALAPPDATA "Programs/CodexImage"
     New-Item -ItemType Directory -Force $InstallDirectory | Out-Null
     Copy-Item $Executable (Join-Path $InstallDirectory "CodexImage.exe") -Force
+    Copy-Item (Join-Path $Stage "codex-image-condition.exe") $InstallDirectory -Force
 
     $StartMenu = Join-Path $env:APPDATA "Microsoft/Windows/Start Menu/Programs"
     $Shell = New-Object -ComObject WScript.Shell

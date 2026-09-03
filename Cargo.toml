@@ -49,7 +49,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
-[target.'cfg(target_os = "windows")'.build-dependencies]
+[build-dependencies]
 embed-resource = "3"
 
 [dev-dependencies]

@@ -167,23 +167,29 @@ pub fn find_executable_on_path(name: &OsStr, path: &OsStr) -> Option<PathBuf> {
     })
 }
 
+// Windows only launches files whose extension makes them executable, so an
+// extensionless match (npm installs a POSIX shell shim next to `codex.cmd`)
+// must never win over `codex.cmd`.
 fn executable_names(name: &OsStr) -> Vec<OsString> {
-    let names = vec![name.to_owned()];
+    #[cfg(not(target_os = "windows"))]
+    {
+        vec![name.to_owned()]
+    }
     #[cfg(target_os = "windows")]
-    let names = {
+    {
         if Path::new(name).extension().is_some() {
-            return names;
+            return vec![name.to_owned()];
         }
-        let mut names = names;
-        for extension in ["exe", "cmd", "bat"] {
-            let mut candidate = name.to_owned();
-            candidate.push(".");
-            candidate.push(extension);
-            names.push(candidate);
-        }
-        names
-    };
-    names
+        ["exe", "cmd", "bat"]
+            .into_iter()
+            .map(|extension| {
+                let mut candidate = name.to_owned();
+                candidate.push(".");
+                candidate.push(extension);
+                candidate
+            })
+            .collect()
+    }
 }
 
 fn default_codex_executable() -> PathBuf {
@@ -392,6 +398,8 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let executable = directory.path().join("codex.cmd");
         std::fs::write(&executable, "@echo off\r\n").unwrap();
+        // npm drops an extensionless POSIX shim beside the .cmd shim.
+        std::fs::write(directory.path().join("codex"), "#!/bin/sh\n").unwrap();
         let path = std::env::join_paths([directory.path()]).unwrap();
 
         assert_eq!(

@@ -31,7 +31,9 @@ codex login
 ```
 
 Download the latest `windows-x86_64.zip`, extract it to a permanent directory,
-and run `CodexImage.exe`. Release builds are currently unsigned, so Microsoft
+and run `CodexImage.exe`. Keep `codex-image-condition.exe` beside it; the app
+uses it to prepare a generated image before feeding it back into a later
+generation in the same run. Release builds are currently unsigned, so Microsoft
 Defender SmartScreen may require **More info > Run anyway** on first launch.
 
 ## What it does

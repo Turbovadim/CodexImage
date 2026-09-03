@@ -2,7 +2,7 @@ mod codex;
 pub(crate) mod conditioner;
 mod prompt;
 
-pub use conditioner::condition_image_for_reingestion;
+pub use conditioner::{condition_image_for_reingestion, run_condition_image_cli};
 
 use crate::manifest::{OutputManifest, absolute_file_path, is_canonical_path_inside};
 use crate::model::{
@@ -318,7 +318,7 @@ impl GenerationEngine {
             .join(node.run_started_at.unwrap_or(node.created_at).to_string());
         let source_paths = conditioner::prepare_source_images(&source_paths, &reingest_directory);
         let same_run_conditioner = if conditioner::enabled() {
-            std::env::current_exe().ok().and_then(|executable| {
+            same_run_conditioner_executable().and_then(|executable| {
                 let directory = reingest_directory.join("same-run");
                 fs::create_dir_all(&directory)
                     .ok()
@@ -882,6 +882,19 @@ impl GenerationEngine {
             });
         }
     }
+}
+
+/// Binary that Codex shells out to for same-run conditioning. Windows cannot
+/// use the app binary: neither cmd nor PowerShell waits for a GUI-subsystem
+/// process, so conditioning has to run through the console companion, and
+/// same-run conditioning stays off when that companion is not installed.
+fn same_run_conditioner_executable() -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    if !cfg!(target_os = "windows") {
+        return Some(executable);
+    }
+    let companion = executable.with_file_name("codex-image-condition.exe");
+    companion.is_file().then_some(companion)
 }
 
 #[cfg(test)]
