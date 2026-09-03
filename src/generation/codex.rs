@@ -4,14 +4,19 @@
 use std::collections::HashSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
+#[cfg(not(target_os = "windows"))]
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(unix)]
 use std::thread;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(4);
+#[cfg(unix)]
 const LOGIN_SHELL_PATH_MARKER: &[u8] = b"__CODEXIMAGE_PATH__=";
 
 pub struct CodexInvocation {
@@ -52,7 +57,7 @@ impl CodexInvocation {
             .map(PathBuf::from)
             .unwrap_or_else(|| {
                 find_executable_on_path(OsStr::new("codex"), &path)
-                    .unwrap_or_else(|| PathBuf::from("codex"))
+                    .unwrap_or_else(default_codex_executable)
             });
         Self { executable, path }
     }
@@ -77,6 +82,16 @@ pub fn build_command_path(
         entries.extend(env::split_paths(path));
     }
     if let Some(home) = home {
+        #[cfg(target_os = "windows")]
+        entries.extend([
+            home.join(".bun/bin"),
+            home.join(".cargo/bin"),
+            home.join(".volta/bin"),
+            home.join("AppData/Roaming/npm"),
+            home.join("AppData/Local/pnpm"),
+            home.join("AppData/Local/Microsoft/WinGet/Links"),
+        ]);
+        #[cfg(not(target_os = "windows"))]
         entries.extend([
             home.join(".bun/bin"),
             home.join(".local/bin"),
@@ -85,17 +100,50 @@ pub fn build_command_path(
             home.join(".npm-global/bin"),
             home.join("Library/pnpm"),
         ]);
-        let nvm_versions = home.join(".nvm/versions/node");
-        if let Ok(versions) = fs::read_dir(nvm_versions) {
-            let mut version_bins: Vec<_> = versions
-                .filter_map(Result::ok)
-                .map(|entry| entry.path().join("bin"))
-                .filter(|path| path.is_dir())
-                .collect();
-            version_bins.sort_by(|left, right| right.cmp(left));
-            entries.extend(version_bins);
+        #[cfg(not(target_os = "windows"))]
+        {
+            let nvm_versions = home.join(".nvm/versions/node");
+            if let Ok(versions) = fs::read_dir(nvm_versions) {
+                let mut version_bins: Vec<_> = versions
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path().join("bin"))
+                    .filter(|path| path.is_dir())
+                    .collect();
+                version_bins.sort_by(|left, right| right.cmp(left));
+                entries.extend(version_bins);
+            }
         }
     }
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(app_data) = env::var_os("APPDATA") {
+            entries.push(PathBuf::from(app_data).join("npm"));
+        }
+        if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+            let local_app_data = PathBuf::from(local_app_data);
+            entries.extend([
+                local_app_data.join("pnpm"),
+                local_app_data.join("Volta/bin"),
+                local_app_data.join("Microsoft/WinGet/Links"),
+            ]);
+        }
+        for variable in ["PNPM_HOME", "NVM_HOME", "NVM_SYMLINK"] {
+            if let Some(directory) = env::var_os(variable) {
+                entries.push(PathBuf::from(directory));
+            }
+        }
+        for variable in ["BUN_INSTALL", "VOLTA_HOME"] {
+            if let Some(directory) = env::var_os(variable) {
+                entries.push(PathBuf::from(directory).join("bin"));
+            }
+        }
+        for variable in ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"] {
+            if let Some(program_files) = env::var_os(variable) {
+                entries.push(PathBuf::from(program_files).join("nodejs"));
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
     entries.extend([
         PathBuf::from("/opt/homebrew/bin"),
         PathBuf::from("/usr/local/bin"),
@@ -107,15 +155,46 @@ pub fn build_command_path(
 
     let mut seen = HashSet::new();
     entries.retain(|entry| !entry.as_os_str().is_empty() && seen.insert(entry.clone()));
-    env::join_paths(entries).unwrap_or_else(|_| {
-        inherited.unwrap_or_else(|| OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"))
-    })
+    env::join_paths(entries).unwrap_or_else(|_| inherited.unwrap_or_default())
 }
 
 pub fn find_executable_on_path(name: &OsStr, path: &OsStr) -> Option<PathBuf> {
-    env::split_paths(path)
-        .map(|directory| directory.join(name))
-        .find(|candidate| is_executable(candidate))
+    env::split_paths(path).find_map(|directory| {
+        executable_names(name)
+            .into_iter()
+            .map(|name| directory.join(name))
+            .find(|candidate| is_executable(candidate))
+    })
+}
+
+fn executable_names(name: &OsStr) -> Vec<OsString> {
+    let names = vec![name.to_owned()];
+    #[cfg(target_os = "windows")]
+    let names = {
+        if Path::new(name).extension().is_some() {
+            return names;
+        }
+        let mut names = names;
+        for extension in ["exe", "cmd", "bat"] {
+            let mut candidate = name.to_owned();
+            candidate.push(".");
+            candidate.push(extension);
+            names.push(candidate);
+        }
+        names
+    };
+    names
+}
+
+fn default_codex_executable() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        PathBuf::from("codex.exe")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        PathBuf::from("codex")
+    }
 }
 
 #[cfg(unix)]
@@ -130,6 +209,7 @@ pub fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
+#[cfg(unix)]
 pub fn login_shell_path() -> Option<OsString> {
     let shell = env::var_os("SHELL")
         .filter(|value| !value.is_empty())
@@ -163,10 +243,15 @@ pub fn login_shell_path() -> Option<OsString> {
     succeeded.then(|| parse_login_shell_path(&bytes)).flatten()
 }
 
+#[cfg(not(unix))]
+pub fn login_shell_path() -> Option<OsString> {
+    None
+}
+
+#[cfg(unix)]
 pub fn terminate_process(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    kill_process_group(child.id() as i32, libc::SIGKILL);
-    #[cfg(not(unix))]
+    kill_process_group(child.id(), libc::SIGKILL);
+    // This is also a fallback when signalling the process group fails.
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -185,43 +270,67 @@ pub fn parse_login_shell_path(output: &[u8]) -> Option<OsString> {
     (end > start).then(|| OsString::from_vec(output[start..end].to_vec()))
 }
 
-#[cfg(not(unix))]
-pub fn parse_login_shell_path(output: &[u8]) -> Option<OsString> {
-    let output = String::from_utf8_lossy(output);
-    output
-        .lines()
-        .rev()
-        .find_map(|line| line.strip_prefix("__CODEXIMAGE_PATH__="))
-        .filter(|path| !path.is_empty())
-        .map(OsString::from)
-}
-
 #[cfg(unix)]
 pub fn configure_process_group(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     command.process_group(0);
 }
 
-#[cfg(not(unix))]
+#[cfg(target_os = "windows")]
+pub fn configure_process_group(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    // Prevent the Codex CLI and taskkill from flashing console windows when
+    // CodexImage itself is built as a GUI executable.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
 pub fn configure_process_group(_: &mut Command) {}
 
 #[cfg(unix)]
-pub fn kill_process_group(pid: i32, signal: i32) {
-    if pid > 0 {
+pub fn kill_process_group(pid: u32, signal: i32) {
+    if let Ok(pid) = i32::try_from(pid)
+        && pid > 0
+    {
         unsafe {
             libc::kill(-pid, signal);
         }
     }
 }
 
-#[cfg(not(unix))]
-pub fn kill_process_group(_: i32, _: i32) {}
+#[cfg(target_os = "windows")]
+pub fn kill_process_group(pid: u32, _: i32) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    if pid == 0 {
+        return;
+    }
+    let mut command = Command::new("taskkill.exe");
+    command
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW);
+    // Do not block the UI thread. The generation worker owns the Child handle
+    // and will observe its exit, while /T closes every descendant as well.
+    let _ = command.spawn();
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+pub fn kill_process_group(_: u32, _: i32) {}
 
 #[cfg(test)]
 mod tests {
-    use super::{build_command_path, find_executable_on_path, parse_login_shell_path, read_tail};
-    use std::ffi::{OsStr, OsString};
+    #[cfg(unix)]
+    use super::parse_login_shell_path;
+    use super::{build_command_path, find_executable_on_path, read_tail};
+    use std::ffi::OsStr;
+    #[cfg(unix)]
+    use std::ffi::OsString;
     use std::io::Cursor;
+    #[cfg(not(target_os = "windows"))]
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -237,23 +346,24 @@ mod tests {
     #[test]
     fn command_path_prefers_the_login_shell_and_deduplicates_entries() {
         let directory = TempDir::new().unwrap();
-        let login = OsString::from("/login/bin:/shared/bin");
-        let inherited = OsString::from("/shared/bin:/inherited/bin");
+        let login_bin = directory.path().join("login-bin");
+        let shared_bin = directory.path().join("shared-bin");
+        let inherited_bin = directory.path().join("inherited-bin");
+        let login = std::env::join_paths([&login_bin, &shared_bin]).unwrap();
+        let inherited = std::env::join_paths([&shared_bin, &inherited_bin]).unwrap();
 
         let path = build_command_path(Some(login), Some(inherited), Some(directory.path()));
         let entries: Vec<_> = std::env::split_paths(&path).collect();
 
-        assert_eq!(entries[0], PathBuf::from("/login/bin"));
-        assert_eq!(entries[1], PathBuf::from("/shared/bin"));
-        assert_eq!(entries[2], PathBuf::from("/inherited/bin"));
+        assert_eq!(entries[0], login_bin);
+        assert_eq!(entries[1], shared_bin);
+        assert_eq!(entries[2], inherited_bin);
         assert_eq!(
-            entries
-                .iter()
-                .filter(|entry| *entry == &PathBuf::from("/shared/bin"))
-                .count(),
+            entries.iter().filter(|entry| *entry == &shared_bin).count(),
             1
         );
         assert!(entries.contains(&directory.path().join(".bun/bin")));
+        #[cfg(not(target_os = "windows"))]
         assert!(entries.contains(&PathBuf::from("/opt/homebrew/bin")));
     }
 
@@ -268,6 +378,20 @@ mod tests {
         let mut permissions = executable.metadata().unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&executable, permissions).unwrap();
+        let path = std::env::join_paths([directory.path()]).unwrap();
+
+        assert_eq!(
+            find_executable_on_path(OsStr::new("codex"), &path),
+            Some(executable)
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn executable_resolution_finds_npm_command_shims() {
+        let directory = TempDir::new().unwrap();
+        let executable = directory.path().join("codex.cmd");
+        std::fs::write(&executable, "@echo off\r\n").unwrap();
         let path = std::env::join_paths([directory.path()]).unwrap();
 
         assert_eq!(

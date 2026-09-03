@@ -82,23 +82,7 @@ impl DataPaths {
     fn discover() -> Result<Self> {
         let root = std::env::var_os("CODEXIMAGE_DATA")
             .map(PathBuf::from)
-            .or_else(|| {
-                dirs::data_dir().map(|base| {
-                    if cfg!(target_os = "macos") {
-                        let native = base.join("CodexImage").join("data");
-                        let electron = base.join("codeximage").join("data");
-                        if !native.join("boards.json").exists()
-                            && electron.join("boards.json").exists()
-                        {
-                            electron
-                        } else {
-                            native
-                        }
-                    } else {
-                        base.join("codeximage")
-                    }
-                })
-            })
+            .or_else(crate::platform::data_root)
             .context("could not determine the CodexImage data directory")?;
         let generated_images = std::env::var_os("CODEXIMAGE_GENERATED_IMAGES")
             .map(PathBuf::from)
@@ -649,7 +633,7 @@ impl Repository {
             let applied =
                 crate::generation::conditioner::condition_generated_image(&source, &temporary)?;
             if applied {
-                fs::rename(&temporary, &source)?;
+                crate::platform::replace_file(&temporary, &source)?;
             }
             if applied || recovering_interrupted_migration {
                 remove_thumbnails(&source);
@@ -924,8 +908,8 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         let mut file = File::create(&temporary)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        fs::rename(&temporary, path)?;
-        File::open(parent)?.sync_all()?;
+        crate::platform::replace_file(&temporary, path)?;
+        crate::platform::sync_directory(parent)?;
         Ok(())
     })();
     if result.is_err() {
@@ -943,8 +927,8 @@ fn atomic_copy(source: &Path, destination: &Path) -> Result<()> {
     let result = (|| -> Result<()> {
         fs::copy(source, &temporary)?;
         File::open(&temporary)?.sync_all()?;
-        fs::rename(&temporary, destination)?;
-        File::open(parent)?.sync_all()?;
+        crate::platform::replace_file(&temporary, destination)?;
+        crate::platform::sync_directory(parent)?;
         Ok(())
     })();
     if result.is_err() {
@@ -1088,7 +1072,8 @@ pub fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DataPaths, Repository, RepositoryEvent, board_mut, create_thumbnail, thumbnail_path_for,
+        DataPaths, Repository, RepositoryEvent, atomic_write, board_mut, create_thumbnail,
+        thumbnail_path_for,
     };
     use crate::model::{BoardNode, NewNodesRequest, NodeStatus};
     use async_channel::{Receiver, unbounded};
@@ -1162,6 +1147,17 @@ mod tests {
             thumbnail_path_for(Path::new("/tmp/example.webp")).as_deref(),
             Some(Path::new("/tmp/t_example.webp"))
         );
+    }
+
+    #[test]
+    fn atomic_writes_replace_an_existing_file() {
+        let directory = TempDir::new().unwrap();
+        let destination = directory.path().join("boards.json");
+
+        atomic_write(&destination, b"first").unwrap();
+        atomic_write(&destination, b"second").unwrap();
+
+        assert_eq!(fs::read(destination).unwrap(), b"second");
     }
 
     #[test]

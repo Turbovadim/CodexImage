@@ -158,7 +158,7 @@ pub fn store(source: &Path, max_dimension: Option<u32>, image: &RenderImage) {
     let write_serial = WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let temporary = entry.with_extension(format!("tmp{write_serial}"));
     let stored = match fs::write(&temporary, &bytes) {
-        Ok(()) if fs::rename(&temporary, &entry).is_ok() => true,
+        Ok(()) if crate::platform::replace_file(&temporary, &entry).is_ok() => true,
         Ok(()) | Err(_) => {
             // Failed writes are regenerable, but a partial temporary file is
             // otherwise permanent because pruning deliberately ignores it.

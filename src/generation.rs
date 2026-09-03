@@ -19,7 +19,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
 use std::thread;
@@ -28,6 +28,14 @@ use std::time::{Duration, Instant};
 const POLL_INTERVAL: Duration = Duration::from_millis(1_200);
 const FINAL_SWEEP_DELAY: Duration = Duration::from_millis(800);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+#[cfg(unix)]
+const FORCE_KILL_SIGNAL: i32 = libc::SIGKILL;
+#[cfg(not(unix))]
+const FORCE_KILL_SIGNAL: i32 = 0;
+#[cfg(unix)]
+const GRACEFUL_TERMINATION_SIGNAL: i32 = libc::SIGTERM;
+#[cfg(not(unix))]
+const GRACEFUL_TERMINATION_SIGNAL: i32 = 0;
 
 #[derive(Clone)]
 pub struct GenerationEngine {
@@ -44,7 +52,7 @@ struct EngineInner {
 struct JobControl {
     board_id: String,
     node_id: String,
-    pid: AtomicI32,
+    pid: AtomicU32,
     termination: Mutex<Option<Termination>>,
 }
 
@@ -178,7 +186,7 @@ impl GenerationEngine {
         aspect: Option<String>,
     ) -> Result<()> {
         let _submission = self.inner.submission_lock.lock();
-        self.stop(node_id, Termination::Replaced, libc::SIGKILL);
+        self.stop(node_id, Termination::Replaced, FORCE_KILL_SIGNAL);
         let node = self
             .inner
             .repository
@@ -192,13 +200,13 @@ impl GenerationEngine {
     }
 
     pub fn stop_node(&self, node_id: &str) {
-        self.stop(node_id, Termination::User, libc::SIGTERM);
+        self.stop(node_id, Termination::User, GRACEFUL_TERMINATION_SIGNAL);
     }
 
     pub fn delete_subtree(&self, board_id: &str, node_id: &str) -> Result<(Vec<String>, String)> {
         let (ids, undo_id) = self.inner.repository.delete_subtree(board_id, node_id)?;
         for id in &ids {
-            self.stop(id, Termination::Deleted, libc::SIGKILL);
+            self.stop(id, Termination::Deleted, FORCE_KILL_SIGNAL);
         }
         Ok((ids, undo_id))
     }
@@ -213,7 +221,7 @@ impl GenerationEngine {
             .map(|job| job.node_id.clone())
             .collect();
         for id in ids {
-            self.stop(&id, Termination::Deleted, libc::SIGKILL);
+            self.stop(&id, Termination::Deleted, FORCE_KILL_SIGNAL);
         }
         self.inner.repository.delete_board(board_id)
     }
@@ -221,7 +229,7 @@ impl GenerationEngine {
     pub fn stop_all_for_quit(&self) {
         let ids: Vec<_> = self.inner.jobs.lock().keys().cloned().collect();
         for id in ids {
-            self.stop(&id, Termination::AppQuit, libc::SIGKILL);
+            self.stop(&id, Termination::AppQuit, FORCE_KILL_SIGNAL);
         }
         self.inner.repository.flush();
     }
@@ -237,7 +245,7 @@ impl GenerationEngine {
         let control = Arc::new(JobControl {
             board_id: board.id.clone(),
             node_id: node_id.clone(),
-            pid: AtomicI32::new(0),
+            pid: AtomicU32::new(0),
             termination: Mutex::new(None),
         });
         self.inner
@@ -342,9 +350,9 @@ impl GenerationEngine {
                     self.codex_invocation().executable.display()
                 )
             })?;
-        control.pid.store(child.id() as i32, Ordering::Release);
+        control.pid.store(child.id(), Ordering::Release);
         if control.termination.lock().is_some() {
-            kill_process_group(child.id() as i32, libc::SIGKILL);
+            kill_process_group(child.id(), FORCE_KILL_SIGNAL);
         }
         let stdout = child
             .stdout
@@ -419,7 +427,7 @@ impl GenerationEngine {
                 && runtime.last_activity.elapsed() >= IDLE_TIMEOUT
             {
                 *control.termination.lock() = Some(Termination::Timeout);
-                kill_process_group(control.pid.load(Ordering::Acquire), libc::SIGKILL);
+                kill_process_group(control.pid.load(Ordering::Acquire), FORCE_KILL_SIGNAL);
             }
             if let Some(status) = child.try_wait()? {
                 break status;
@@ -782,7 +790,7 @@ impl GenerationEngine {
         let child = self
             .codex_exec(Sandbox::ReadOnly, &workspace, prompt)
             .spawn()?;
-        control.pid.store(child.id() as i32, Ordering::Release);
+        control.pid.store(child.id(), Ordering::Release);
         let output = child.wait_with_output()?;
         if control.termination.lock().is_some() {
             return Ok(None);
@@ -864,11 +872,12 @@ impl GenerationEngine {
         *control.termination.lock() = Some(reason);
         let pid = control.pid.load(Ordering::Acquire);
         kill_process_group(pid, signal);
-        if signal == libc::SIGTERM {
+        #[cfg(unix)]
+        if signal == GRACEFUL_TERMINATION_SIGNAL {
             thread::spawn(move || {
                 thread::sleep(Duration::from_secs(3));
                 if control.pid.load(Ordering::Acquire) != 0 {
-                    kill_process_group(control.pid.load(Ordering::Acquire), libc::SIGKILL);
+                    kill_process_group(control.pid.load(Ordering::Acquire), FORCE_KILL_SIGNAL);
                 }
             });
         }
@@ -883,7 +892,7 @@ mod tests {
     use async_channel::unbounded;
     use parking_lot::Mutex;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicI32;
+    use std::sync::atomic::AtomicU32;
     use tempfile::TempDir;
 
     #[test]
@@ -919,7 +928,7 @@ mod tests {
         let control = Arc::new(JobControl {
             board_id: board.id.clone(),
             node_id: node.id.clone(),
-            pid: AtomicI32::new(0),
+            pid: AtomicU32::new(0),
             termination: Mutex::new(Some(Termination::User)),
         });
 

@@ -4,7 +4,9 @@
 use super::app::AppView;
 use super::app::Overlay;
 use super::input::TextInputEvent;
-use super::keymap::{AddAttachment, FocusPrompt, Generate, OpenBoards, ToggleGallery};
+use super::keymap::{
+    AddAttachment, FocusPrompt, Generate, OpenBoards, ToggleGallery, platform_shortcut,
+};
 use super::theme;
 use super::tooltip::{tip, tip_with_shortcut};
 use crate::APP_NAME;
@@ -501,7 +503,7 @@ impl AppView {
                             } else {
                                 "Attach reference images"
                             },
-                            Some("⌘O"),
+                            Some(platform_shortcut("⌘O", "Ctrl+O")),
                         ))
                         .when(!attachments_full, |pill| {
                             pill.on_click(cx.listener(|this, _, window, cx| {
@@ -595,7 +597,10 @@ impl AppView {
             .child(div().mt_2().text_size(px(26.)).font_weight(FontWeight::SEMIBOLD).text_color(theme::ink()).child("What should we create?"))
             .child(div().mt_2().w(px(600.)).text_center().text_sm().text_color(theme::dim()).child("Ask for one image or a complete ordered series. Use ×N for parallel takes, then branch, continue, and regenerate on an infinite canvas."))
             .child(samples)
-            .child(div().mt_5().text_xs().text_color(theme::faint()).child("/ prompt   ⌘K boards   G gallery   F fit view   ⌘0 actual size   Esc cancel"))
+            .child(div().mt_5().text_xs().text_color(theme::faint()).child(platform_shortcut(
+                "/ prompt   ⌘K boards   G gallery   F fit view   ⌘0 actual size   Esc cancel",
+                "/ prompt   Ctrl+K boards   G gallery   F fit view   Ctrl+0 actual size   Esc cancel",
+            )))
             .into_any_element()
     }
 
@@ -611,7 +616,7 @@ impl AppView {
             .accessibility_id("codex-image.board-switcher")
             .role(Role::Button)
             .aria_label(format!("Switch board. Current board: {title}"))
-            .aria_keyshortcuts("Meta+K")
+            .aria_keyshortcuts(platform_shortcut("Meta+K", "Control+K"))
             .absolute()
             .top(px(14.))
             .left(px(if cfg!(target_os = "macos") { 78. } else { 18. }))
@@ -627,7 +632,10 @@ impl AppView {
             .cursor_pointer()
             .occlude()
             .hover(|style| style.border_color(theme::faint()).bg(theme::hover()))
-            .tooltip(tip_with_shortcut("Switch board", Some("⌘K")))
+            .tooltip(tip_with_shortcut(
+                "Switch board",
+                Some(platform_shortcut("⌘K", "Ctrl+K")),
+            ))
             .on_click(cx.listener(|this, _, window, cx| this.open_boards(&OpenBoards, window, cx)))
             .child(div().text_color(theme::accent()).child("❖"))
             .child(

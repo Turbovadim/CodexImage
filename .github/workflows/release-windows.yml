@@ -1,0 +1,30 @@
+name: Windows release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      - name: Build archive
+        shell: pwsh
+        run: ./scripts/package-windows.ps1 -Archive
+      - name: Attach archive to release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          $Files = Get-ChildItem "dist/CodexImage-*-windows-x86_64.zip*"
+          gh release upload $env:RELEASE_TAG $Files.FullName --clobber

@@ -13,7 +13,7 @@ use super::card::{
     MEDIA_GAP, OutputLayout, PROMPT_LINE_HEIGHT, SHOW_MORE_HEIGHT, attached_text_height,
     status_area_height,
 };
-use super::keymap::{FitCanvas, ResetZoom, ZoomIn, ZoomOut};
+use super::keymap::{FitCanvas, ResetZoom, ZoomIn, ZoomOut, platform_shortcut};
 use super::theme;
 use super::tooltip::{tip, tip_with_shortcut};
 use crate::layout::CARD_WIDTH;
@@ -596,7 +596,10 @@ impl AppView {
             .child(
                 button("zoom-out", "−")
                     .aria_label("Zoom out")
-                    .tooltip(tip_with_shortcut("Zoom out", Some("⌘−")))
+                    .tooltip(tip_with_shortcut(
+                        "Zoom out",
+                        Some(platform_shortcut("⌘−", "Ctrl+−")),
+                    ))
                     .on_click(
                         cx.listener(|this, _, window, cx| this.zoom_out(&ZoomOut, window, cx)),
                     ),
@@ -613,7 +616,10 @@ impl AppView {
                     .text_color(theme::dim())
                     .cursor_pointer()
                     .hover(|style| style.text_color(theme::ink()))
-                    .tooltip(tip_with_shortcut("Actual size", Some("⌘0")))
+                    .tooltip(tip_with_shortcut(
+                        "Actual size",
+                        Some(platform_shortcut("⌘0", "Ctrl+0")),
+                    ))
                     .child(format!("{}%", (self.zoom * 100.).round() as i32))
                     .on_click(
                         cx.listener(|this, _, window, cx| this.reset_zoom(&ResetZoom, window, cx)),
@@ -622,7 +628,10 @@ impl AppView {
             .child(
                 button("zoom-in", "+")
                     .aria_label("Zoom in")
-                    .tooltip(tip_with_shortcut("Zoom in", Some("⌘+")))
+                    .tooltip(tip_with_shortcut(
+                        "Zoom in",
+                        Some(platform_shortcut("⌘+", "Ctrl++")),
+                    ))
                     .on_click(cx.listener(|this, _, window, cx| this.zoom_in(&ZoomIn, window, cx))),
             )
             .child(
