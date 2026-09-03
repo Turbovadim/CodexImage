@@ -179,6 +179,13 @@ pub fn run() -> Result<()> {
             async move { engine.stop_all_for_quit() }
         })
         .detach();
+        #[cfg(not(target_os = "macos"))]
+        cx.on_window_closed(|cx, _| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
 
         let bounds = Bounds::centered(None, size(px(1500.), px(950.)), cx);
         cx.open_window(

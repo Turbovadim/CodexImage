@@ -668,7 +668,7 @@ impl AppView {
                 cx.listener(move |_, _, _, cx| {
                     let path = open_path.clone();
                     cx.background_spawn(async move {
-                        let _ = std::process::Command::new("open").arg(path).spawn();
+                        let _ = crate::platform::open_path(&path);
                     })
                     .detach();
                 }),

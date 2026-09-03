@@ -908,6 +908,7 @@ dependencies = [
  "core-foundation 0.10.1",
  "core-graphics 0.25.0",
  "dirs",
+ "embed-resource",
  "foreign-types",
  "gpui",
  "gpui_platform",
@@ -923,6 +924,7 @@ dependencies = [
  "tempfile",
  "unicode-segmentation",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

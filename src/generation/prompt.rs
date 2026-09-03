@@ -110,11 +110,7 @@ pub fn build_node_prompt(
 }
 
 fn same_run_conditioning_section(executable: &Path, directory: &Path) -> String {
-    let command = format!(
-        "{} --condition-image '<RAW_GENERATED_PATH>' {}",
-        shell_quote(executable),
-        shell_quote(&directory.join("step-N.png")),
-    );
+    let command = conditioning_command(executable, &directory.join("step-N.png"));
     format!(
         r#"Same-run generated-image dependencies:
 - When an image generated in this run will be supplied to any later image-generation call, condition it synchronously first. This is the sole permitted exception to the shell-file-operation prohibition above.
@@ -125,8 +121,34 @@ fn same_run_conditioning_section(executable: &Path, directory: &Path) -> String 
     )
 }
 
+#[cfg(not(target_os = "windows"))]
+fn conditioning_command(executable: &Path, destination: &Path) -> String {
+    format!(
+        "{} --condition-image '<RAW_GENERATED_PATH>' {}",
+        shell_quote(executable),
+        shell_quote(destination),
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn conditioning_command(executable: &Path, destination: &Path) -> String {
+    // Codex uses PowerShell on native Windows. The call operator is required
+    // when a quoted executable path contains spaces.
+    format!(
+        "& {} --condition-image '<RAW_GENERATED_PATH>' {}",
+        powershell_quote(executable),
+        powershell_quote(destination),
+    )
+}
+
+#[cfg(not(target_os = "windows"))]
 fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+#[cfg(target_os = "windows")]
+fn powershell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "''"))
 }
 
 pub fn selection_recovery_prompt<'a>(
@@ -176,17 +198,31 @@ mod tests {
 
     #[test]
     fn same_run_instructions_force_conditioned_file_handoffs() {
+        #[cfg(not(target_os = "windows"))]
         let instructions = same_run_conditioning_section(
             Path::new("/Applications/CodexImage.app/codex-image"),
             Path::new("/tmp/work space/same-run"),
+        );
+        #[cfg(target_os = "windows")]
+        let instructions = same_run_conditioning_section(
+            Path::new(r"C:\Program Files\CodexImage\CodexImage.exe"),
+            Path::new(r"C:\Temp\work space\same-run"),
         );
 
         assert!(instructions.contains("--condition-image"));
         assert!(instructions.contains("referenced_image_paths"));
         assert!(instructions.contains("Do not use `num_last_images_to_include`"));
         assert!(instructions.contains("Never put them in the final `outputs`"));
-        assert!(instructions.contains("'/Applications/CodexImage.app/codex-image'"));
-        assert!(instructions.contains("'/tmp/work space/same-run/step-N.png'"));
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert!(instructions.contains("'/Applications/CodexImage.app/codex-image'"));
+            assert!(instructions.contains("'/tmp/work space/same-run/step-N.png'"));
+        }
+        #[cfg(target_os = "windows")]
+        {
+            assert!(instructions.contains("& 'C:\\Program Files\\CodexImage\\CodexImage.exe'"));
+            assert!(instructions.contains("'C:\\Temp\\work space\\same-run\\step-N.png'"));
+        }
     }
 
     #[test]

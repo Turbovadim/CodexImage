@@ -71,7 +71,7 @@ pub fn parse(text: &str) -> Result<OutputManifest> {
 
 pub fn absolute_file_path(value: &str) -> Result<PathBuf> {
     let path = if let Some(raw) = value.strip_prefix("file://") {
-        PathBuf::from(percent_decode(raw)?)
+        file_url_path(percent_decode(raw)?)
     } else {
         PathBuf::from(value)
     };
@@ -79,6 +79,23 @@ pub fn absolute_file_path(value: &str) -> Result<PathBuf> {
         bail!("a selected image path was not absolute");
     }
     Ok(normalize(&path))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn file_url_path(value: String) -> PathBuf {
+    PathBuf::from(value)
+}
+
+#[cfg(target_os = "windows")]
+fn file_url_path(mut value: String) -> PathBuf {
+    let bytes = value.as_bytes();
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
+        value.remove(0);
+    } else if !value.starts_with('/') && !matches!(bytes.get(1), Some(b':')) {
+        // A host in file://server/share denotes a UNC path.
+        value.insert_str(0, "//");
+    }
+    PathBuf::from(value)
 }
 
 pub fn is_path_inside(root: &Path, candidate: &Path) -> bool {
@@ -126,4 +143,25 @@ fn percent_decode(value: &str) -> Result<String> {
         }
     }
     String::from_utf8(output).context("file URL was not UTF-8")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::absolute_file_path;
+    use std::path::Path;
+
+    #[test]
+    fn percent_encoded_absolute_file_urls_are_accepted() {
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(
+            absolute_file_path("file:///tmp/work%20space/image.png").unwrap(),
+            Path::new("/tmp/work space/image.png")
+        );
+
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            absolute_file_path("file:///C:/work%20space/image.png").unwrap(),
+            Path::new(r"C:\work space\image.png")
+        );
+    }
 }

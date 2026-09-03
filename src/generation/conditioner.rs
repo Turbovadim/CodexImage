@@ -1,10 +1,11 @@
 //! Removes pixel-phase artifacts from generated images. Raw generations are
 //! always kept separately; conditioned copies are used for display and edits.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use image::{ColorType, DynamicImage, ImageBuffer, ImageFormat, Rgba, RgbaImage};
 use std::borrow::Cow;
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -81,6 +82,23 @@ pub fn condition_image_for_reingestion(source: &Path, destination: &Path) -> Res
     let applied = conditioned.is_some();
     save_png(conditioned.as_ref().unwrap_or(&decoded), destination)?;
     Ok(applied)
+}
+
+/// Runs the `--condition-image <source> <destination>` command line shared by
+/// the app binary and the Windows console helper. Returns `false` when the
+/// arguments are not a conditioning invocation.
+pub fn run_condition_image_cli(mut arguments: impl Iterator<Item = OsString>) -> Result<bool> {
+    if arguments.next().as_deref() != Some(OsStr::new("--condition-image")) {
+        return Ok(false);
+    }
+    let source = PathBuf::from(arguments.next().context("missing source image path")?);
+    let destination = PathBuf::from(arguments.next().context("missing output image path")?);
+    if arguments.next().is_some() {
+        bail!("--condition-image accepts exactly a source and output path");
+    }
+    let applied = condition_image_for_reingestion(&source, &destination)?;
+    println!("{}", if applied { "conditioned" } else { "unchanged" });
+    Ok(true)
 }
 
 fn decode_source(source: &Path) -> Result<DynamicImage> {

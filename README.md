@@ -4,11 +4,11 @@ CodexImage is an infinite canvas for image generation. Each prompt sits in a
 card. Branching a result adds a child card, so the parent prompt and every edit
 stay visible.
 
-It is a native macOS app built with
+It is a native macOS and Windows app built with
 [Zed's GPUI](https://github.com/zed-industries/zed). It calls the Codex CLI
 through your logged-in ChatGPT account. You do not need a separate API key.
 
-## Install
+## Install on macOS
 
 You need an Apple Silicon Mac running macOS 13 or newer. Install the Codex CLI
 and run `codex login` before opening CodexImage.
@@ -19,6 +19,22 @@ open it, then drag CodexImage into Applications.
 The current test build is ad hoc signed and not yet notarized. On first launch,
 right-click CodexImage and choose Open. If macOS still blocks it, open System
 Settings > Privacy & Security and choose Open Anyway.
+
+## Install on Windows
+
+You need 64-bit Windows 10 or Windows 11. Install the Codex CLI, sign in, and
+confirm that `codex` works in PowerShell before opening CodexImage:
+
+```powershell
+npm install -g @openai/codex
+codex login
+```
+
+Download the latest `windows-x86_64.zip`, extract it to a permanent directory,
+and run `CodexImage.exe`. Keep `codex-image-condition.exe` beside it; the app
+uses it to prepare a generated image before feeding it back into a later
+generation in the same run. Release builds are currently unsigned, so Microsoft
+Defender SmartScreen may require **More info > Run anyway** on first launch.
 
 ## What it does
 
@@ -36,7 +52,7 @@ its full process tree.
 
 ## Run from source
 
-Clone the repository, log in to the Codex CLI, then run:
+Clone the repository, log in to the Codex CLI, then run on either platform:
 
 ```bash
 cargo run --release
@@ -61,13 +77,29 @@ Create a versioned Apple Silicon DMG and checksum with:
 ./scripts/package-macos.sh --dmg
 ```
 
+On Windows, install the Rust MSVC toolchain and Visual Studio 2022 Build Tools
+with **Desktop development with C++**, then create a portable ZIP and checksum:
+
+```powershell
+.\scripts\package-windows.ps1 -Archive
+```
+
+Use `-Install` for a per-user install with a Start menu shortcut, and `-Open`
+to launch the packaged application:
+
+```powershell
+.\scripts\package-windows.ps1 -Install -Open
+```
+
 ## Data and generated images
 
 CodexImage keeps boards under
-`~/Library/Application Support/CodexImage/data`. If it finds data from the old
-Electron app under `~/Library/Application Support/codeximage/data`, it opens
+`~/Library/Application Support/CodexImage/data` on macOS and
+`%LOCALAPPDATA%\CodexImage\data` on Windows. If it finds data from the old
+Electron app in the platform's roaming application-data directory, it opens
 that instead. Set `CODEXIMAGE_DATA` to choose another data directory or
-`CODEX_BIN` to use a specific Codex executable.
+`CODEX_BIN` to use a specific Codex executable. Windows discovery includes the
+standard npm, pnpm, Bun, Volta, Cargo, and WinGet locations.
 
 The app keeps untouched generations under `generated-originals`. It creates
 conditioned 16-bit copies for the canvas, exports, and later image edits. This
@@ -84,11 +116,11 @@ between `0` and `1` to reduce its strength.
 | `/` | Focus the prompt |
 | `Enter` | Generate |
 | `Shift+Enter` | Insert a newline |
-| `⌘K` | Open the board switcher |
+| `⌘K` / `Ctrl+K` | Open the board switcher |
 | `F` | Fit the canvas |
-| `⌘=` | Zoom in |
-| `⌘-` | Zoom out |
-| `⌘0` | Reset zoom |
+| `⌘=` / `Ctrl+=` | Zoom in |
+| `⌘-` / `Ctrl+-` | Zoom out |
+| `⌘0` / `Ctrl+0` | Reset zoom |
 | `G` | Open the gallery |
 | `Esc` | Close or cancel |
 | `B` | Branch from the hovered node |
