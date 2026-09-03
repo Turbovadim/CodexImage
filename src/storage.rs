@@ -926,7 +926,12 @@ fn atomic_copy(source: &Path, destination: &Path) -> Result<()> {
     let temporary = destination.with_extension(format!("tmp-{}", Uuid::new_v4()));
     let result = (|| -> Result<()> {
         fs::copy(source, &temporary)?;
-        File::open(&temporary)?.sync_all()?;
+        // FlushFileBuffers needs write access, so a read-only handle here
+        // fails on Windows with ERROR_ACCESS_DENIED.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&temporary)?
+            .sync_all()?;
         crate::platform::replace_file(&temporary, destination)?;
         crate::platform::sync_directory(parent)?;
         Ok(())
