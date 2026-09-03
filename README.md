@@ -22,6 +22,16 @@ To create a self-contained macOS application bundle:
 open "dist/CodexImage.app"
 ```
 
+To create a versioned Apple Silicon disk image and checksum:
+
+```bash
+./scripts/package-macos.sh --dmg
+```
+
+Public test builds are currently ad hoc signed. On first launch, right-click
+CodexImage and choose Open. If macOS still blocks it, allow it from System
+Settings > Privacy & Security.
+
 Use `--install` to copy the bundle to `/Applications`, and `--open` to
 launch it after packaging:
 
