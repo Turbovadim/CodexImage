@@ -1,77 +1,98 @@
 # CodexImage
 
-A native, keyboard-first image-generation studio built directly on
-[Zed's GPUI](https://github.com/zed-industries/zed) and the Codex CLI.
+CodexImage is an infinite canvas for image generation. Each prompt sits in a
+card. Branching a result adds a child card, so the parent prompt and every edit
+stay visible.
 
-## Requirements
+It is a native macOS app built with
+[Zed's GPUI](https://github.com/zed-industries/zed). It calls the Codex CLI
+through your logged-in ChatGPT account. You do not need a separate API key.
 
-- macOS (the current product target)
-- Rust stable
-- A logged-in Codex CLI (`codex login`)
+## Install
 
-## Run
+You need an Apple Silicon Mac running macOS 13 or newer. Install the Codex CLI
+and run `codex login` before opening CodexImage.
+
+[Download the latest DMG](https://github.com/Turbovadim/CodexImage/releases/latest),
+open it, then drag CodexImage into Applications.
+
+The current test build is ad hoc signed and not yet notarized. On first launch,
+right-click CodexImage and choose Open. If macOS still blocks it, open System
+Settings > Privacy & Security and choose Open Anyway.
+
+## What it does
+
+- Generates parallel takes from one prompt.
+- Keeps branches visible as a graph instead of flattening them into chat history.
+- Lets you branch, regenerate, edit, duplicate, or delete any result.
+- Opens images in a lightbox and collects completed work in a gallery.
+- Saves boards locally and marks interrupted jobs after a restart instead of
+  leaving them stuck as running.
+
+Large boards only decode visible cards. CodexImage uses thumbnails while zoomed
+out and moves file writes, image decoding, and Codex sessions off the render
+thread. Each generation runs in its own process group, so stopping a job closes
+its full process tree.
+
+## Run from source
+
+Clone the repository, log in to the Codex CLI, then run:
 
 ```bash
 cargo run --release
 ```
 
-To create a self-contained macOS application bundle:
+Build the app bundle with:
 
 ```bash
 ./scripts/package-macos.sh
 open "dist/CodexImage.app"
 ```
 
-To create a versioned Apple Silicon disk image and checksum:
-
-```bash
-./scripts/package-macos.sh --dmg
-```
-
-Public test builds are currently ad hoc signed. On first launch, right-click
-CodexImage and choose Open. If macOS still blocks it, allow it from System
-Settings > Privacy & Security.
-
-Use `--install` to copy the bundle to `/Applications`, and `--open` to
-launch it after packaging:
+Use `--install` to copy the app into Applications and `--open` to launch it:
 
 ```bash
 ./scripts/package-macos.sh --install --open
 ```
 
-On first launch, the app opens the Electron data at
-`~/Library/Application Support/codeximage/data` when it contains existing
-boards. New native-only installs use
-`~/Library/Application Support/CodexImage/data`. Set `CODEXIMAGE_DATA` or
-`CODEX_BIN` to override either location.
+Create a versioned Apple Silicon DMG and checksum with:
 
-Generated images are adaptively conditioned before display, export, or reuse as
-edit inputs. The untouched generation is kept under `generated-originals`,
-while the board uses the corrected 16-bit copy. Existing generated board images
-are upgraded once in the background. Set
-`CODEXIMAGE_REINGEST_CONDITIONING=0` to disable conditioning, or use a value
-between `0` and `1` to reduce its strength. The generation agent also uses the
-same conditioner synchronously between dependent image calls made within one
-run, preventing the artifact from accumulating through a sequence.
+```bash
+./scripts/package-macos.sh --dmg
+```
 
-The renderer virtualizes offscreen graph cards, uses thumbnails until zoomed
-in, and performs persistence, image decoding, and Codex sessions away from the
-GPUI render path. Cards are cached across board updates and only rebuilt when
-their node, layout, or images actually change, so one finished generation does
-not re-encode the whole board. The dot grid coarsens by powers of two as you
-zoom out, keeping both its density and its tile count constant. Each generation
-runs in its own process group so stop, replacement, deletion, timeout, and app
-quit terminate the entire job tree.
+## Data and generated images
+
+CodexImage keeps boards under
+`~/Library/Application Support/CodexImage/data`. If it finds data from the old
+Electron app under `~/Library/Application Support/codeximage/data`, it opens
+that instead. Set `CODEXIMAGE_DATA` to choose another data directory or
+`CODEX_BIN` to use a specific Codex executable.
+
+The app keeps untouched generations under `generated-originals`. It creates
+conditioned 16-bit copies for the canvas, exports, and later image edits. This
+reduces repeating artifacts that can build up across a chain of edits. Existing
+board images are conditioned once in the background.
+
+Set `CODEXIMAGE_REINGEST_CONDITIONING=0` to turn conditioning off. Use a value
+between `0` and `1` to reduce its strength.
 
 ## Keyboard shortcuts
 
 | Key | Action |
 | --- | --- |
-| `/` | Focus prompt |
-| `Enter` / `Shift+Enter` | Generate / newline |
-| `⌘K` | Board switcher |
-| `F` | Fit canvas |
-| `⌘=` / `⌘-` / `⌘0` | Zoom in / out / actual size |
-| `G` | Gallery |
+| `/` | Focus the prompt |
+| `Enter` | Generate |
+| `Shift+Enter` | Insert a newline |
+| `⌘K` | Open the board switcher |
+| `F` | Fit the canvas |
+| `⌘=` | Zoom in |
+| `⌘-` | Zoom out |
+| `⌘0` | Reset zoom |
+| `G` | Open the gallery |
 | `Esc` | Close or cancel |
-| `B`, `R`, `E`, `D`, `Delete` | Branch, regenerate, edit, duplicate, delete hovered node |
+| `B` | Branch from the hovered node |
+| `R` | Regenerate the hovered node |
+| `E` | Edit the hovered node |
+| `D` | Duplicate the hovered node |
+| `Delete` | Delete the hovered node |
