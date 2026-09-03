@@ -1,4 +1,4 @@
-use super::input_element::TextElement;
+use super::input_element::{TextElement, TextLayoutCache};
 use super::input_layout::TextLayout;
 use super::input_text::{
     line_range_at, normalize_inserted_text, offset_from_utf16_in, offset_to_utf16_in, word_range_at,
@@ -109,6 +109,7 @@ pub struct TextInput {
     pub(super) selection_reversed: bool,
     pub(super) marked: Option<Range<usize>>,
     pub(super) last_layout: Option<Arc<TextLayout>>,
+    pub(super) layout_cache: Option<TextLayoutCache>,
     pub(super) last_bounds: Option<Bounds<Pixels>>,
     pub(super) measured_visual_lines: usize,
     pub(super) scroll_x: f32,
@@ -155,6 +156,7 @@ impl TextInput {
             selection_reversed: false,
             marked: None,
             last_layout: None,
+            layout_cache: None,
             last_bounds: None,
             measured_visual_lines: 1,
             scroll_x: 0.,
@@ -206,6 +208,7 @@ impl TextInput {
 
     fn reset_layout_state(&mut self) {
         self.last_layout = None;
+        self.layout_cache = None;
         self.last_bounds = None;
         self.measured_visual_lines = 1;
         self.scroll_x = 0.;

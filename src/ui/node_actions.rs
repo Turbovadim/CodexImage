@@ -18,7 +18,7 @@ impl AppView {
     pub(super) fn on_board(
         &mut self,
         cx: &mut Context<Self>,
-        action: impl FnOnce(&mut Self, &str) -> Result<()>,
+        action: impl FnOnce(&mut Self, &str, &mut Context<Self>) -> Result<()>,
     ) {
         let board_id = match self.board_id() {
             Ok(id) => id.to_owned(),
@@ -27,7 +27,7 @@ impl AppView {
                 return;
             }
         };
-        if let Err(error) = action(self, &board_id) {
+        if let Err(error) = action(self, &board_id, cx) {
             self.show_error(error, cx);
         }
     }
@@ -86,7 +86,7 @@ impl AppView {
     }
 
     pub(super) fn regenerate_node(&mut self, id: &str, cx: &mut Context<Self>) {
-        self.on_board(cx, |this, board_id| {
+        self.on_board(cx, |this, board_id, _| {
             this.engine.regenerate(board_id, id, None, None)
         });
     }
@@ -157,7 +157,7 @@ impl AppView {
             attachment_urls: node.attachments,
             position,
         };
-        self.on_board(cx, |this, board_id| {
+        self.on_board(cx, |this, board_id, _| {
             this.engine.add_and_start(board_id, request).map(|_| ())
         });
     }

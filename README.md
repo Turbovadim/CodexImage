@@ -1,4 +1,4 @@
-# CodexImage GPUI
+# CodexImage
 
 A native, keyboard-first image-generation studio built directly on
 [Zed's GPUI](https://github.com/zed-industries/zed) and the Codex CLI.

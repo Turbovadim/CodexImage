@@ -191,22 +191,34 @@ pub(super) fn lightbox_target(
             });
         }
         let parent_id = node.parent_id.as_ref()?;
-        let mut siblings: Vec<_> = board
-            .nodes
-            .iter()
-            .filter(|candidate| {
-                candidate.parent_id.as_ref() == Some(parent_id) && !candidate.images.is_empty()
-            })
-            .collect();
-        siblings.sort_by_key(|candidate| (candidate.created_at, &candidate.id));
-        let current_index = siblings
-            .iter()
-            .position(|candidate| candidate.id == node.id)?;
-        let sibling_index = current_index as i32 + horizontal;
-        if sibling_index < 0 || (sibling_index as usize) >= siblings.len() {
-            return None;
+        // Horizontal navigation runs during both render and prefetch. Select
+        // the neighboring sort key in-place instead of allocating and sorting
+        // every sibling on each call.
+        let mut sibling = node;
+        for _ in 0..horizontal.unsigned_abs() {
+            let key = (sibling.created_at, sibling.id.as_str());
+            sibling = if horizontal > 0 {
+                board
+                    .nodes
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.parent_id.as_ref() == Some(parent_id)
+                            && !candidate.images.is_empty()
+                            && (candidate.created_at, candidate.id.as_str()) > key
+                    })
+                    .min_by_key(|candidate| (candidate.created_at, candidate.id.as_str()))?
+            } else {
+                board
+                    .nodes
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.parent_id.as_ref() == Some(parent_id)
+                            && !candidate.images.is_empty()
+                            && (candidate.created_at, candidate.id.as_str()) < key
+                    })
+                    .max_by_key(|candidate| (candidate.created_at, candidate.id.as_str()))?
+            };
         }
-        let sibling = siblings[sibling_index as usize];
         let image = if horizontal > 0 {
             sibling.images.first()
         } else {
@@ -364,7 +376,9 @@ impl AppView {
                 }
                 Some(Ok(_)) => load_error = Some("Image contains no displayable frames".to_owned()),
                 Some(Err(error)) => load_error = Some(format!("Could not load image: {error}")),
-                None => {}
+                // Do not fan out more neighbor work while the image the user
+                // explicitly requested is still waiting for a decode slot.
+                None => return,
             }
         }
         if let Some(error) = load_error {
@@ -382,12 +396,6 @@ impl AppView {
         }) else {
             return;
         };
-        let current_resource =
-            Resource::Path(Arc::from(self.display_image_path(&current.image, true)));
-        let _ = self
-            .image_cache
-            .update(cx, |cache, cx| cache.load(&current_resource, window, cx));
-
         let mut previous_path = None;
         for horizontal in [-1, 1] {
             let Some(target) = lightbox_target(board, &current, horizontal, 0) else {
@@ -399,9 +407,8 @@ impl AppView {
             }
             previous_path = Some(path.clone());
             let resource = Resource::Path(Arc::from(path));
-            let _ = self
-                .image_cache
-                .update(cx, |cache, cx| cache.load(&resource, window, cx));
+            self.image_cache
+                .update(cx, |cache, cx| cache.prefetch(&resource, window, cx));
         }
     }
 
@@ -479,14 +486,28 @@ impl AppView {
     }
 
     pub(super) fn continue_from_lightbox(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.composer_submission_pending {
+            self.show_toast("A generation is already starting".into(), false, None, cx);
+            return;
+        }
         let Overlay::Lightbox(lightbox) = &self.overlay else {
             return;
         };
+        let location = lightbox.displayed_location();
         let (node_id, image) = (lightbox.node_id.clone(), lightbox.image.clone());
         let prompt = self.modal_input.read(cx).content().trim().to_owned();
         if prompt.is_empty() {
             return;
         }
+        let board_id = match self.board_id() {
+            Ok(board_id) => board_id.to_owned(),
+            Err(error) => {
+                self.show_error(error, cx);
+                return;
+            }
+        };
+        let submitted_board_id = board_id.clone();
+        let submitted_prompt = prompt.clone();
         let request = NewNodesRequest {
             prompt,
             parent_id: Some(node_id.clone()),
@@ -502,19 +523,38 @@ impl AppView {
             attachment_urls: Vec::new(),
             position: None,
         };
-        match self
-            .board_id()
-            .map(str::to_owned)
-            .and_then(|board_id| self.engine.add_and_start(&board_id, request))
-        {
-            Ok(_) => {
-                self.modal_input.update(cx, |input, cx| input.clear(cx));
-                self.overlay = Overlay::None;
-                window.focus(&self.focus, cx);
-            }
-            Err(error) => self.show_error(error, cx),
-        }
+        self.composer_submission_pending = true;
         cx.notify();
+        let engine = self.engine.clone();
+        let submission = cx
+            .background_spawn(async move { engine.add_and_start(&board_id, request).map(|_| ()) });
+        cx.spawn_in(window, async move |weak, cx| {
+            let result = submission.await;
+            let _ = weak.update_in(cx, |view, window, cx| {
+                view.composer_submission_pending = false;
+                match result {
+                    Ok(()) => {
+                        let still_current = matches!(
+                            &view.overlay,
+                            Overlay::Lightbox(lightbox)
+                                if lightbox.displayed_location() == location
+                        ) && view
+                            .board_id()
+                            .is_ok_and(|board_id| board_id == submitted_board_id);
+                        let prompt_unchanged =
+                            view.modal_input.read(cx).content().trim() == submitted_prompt;
+                        if still_current && prompt_unchanged {
+                            view.modal_input.update(cx, |input, cx| input.clear(cx));
+                            view.overlay = Overlay::None;
+                            window.focus(&view.focus, cx);
+                        }
+                    }
+                    Err(error) => view.show_error(error, cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(super) fn render_lightbox(
@@ -549,13 +589,21 @@ impl AppView {
                     .update(cx, |cache, cx| cache.load_full(&resource, window, cx))
             })
             .flatten();
-        let capped = self
-            .image_cache
-            .update(cx, |cache, cx| cache.load(&resource, window, cx));
-        let display_image = match (native, capped) {
-            (Some(Ok(image)), _) if image.frame_count() > 0 => img(image),
-            (_, Some(Ok(image))) if image.frame_count() > 0 => img(image),
-            _ => img(thumbnail_path),
+        let native = native
+            .and_then(Result::ok)
+            .filter(|image| image.frame_count() > 0);
+        // Once the native tier is ready, stop touching the capped tier. It is
+        // no longer visible and can then participate in the next LRU trim.
+        let display_image = if let Some(image) = native {
+            img(image)
+        } else {
+            match self
+                .image_cache
+                .update(cx, |cache, cx| cache.load(&resource, window, cx))
+            {
+                Some(Ok(image)) if image.frame_count() > 0 => img(image),
+                _ => img(thumbnail_path),
+            }
         };
         let node = self
             .board
@@ -579,6 +627,8 @@ impl AppView {
         let image_left = (viewport_width - image_width) / 2. + pan_x;
         let image_top = (viewport_height - image_height) / 2. + pan_y;
         let lightbox_dragging = matches!(&self.drag, Some(DragState::Lightbox { .. }));
+        let continue_ready = !self.composer_submission_pending
+            && !self.modal_input.read(cx).content().trim().is_empty();
         let stage_cursor = if lightbox_dragging {
             gpui::CursorStyle::ClosedHand
         } else if lightbox.zoom > LIGHTBOX_MIN_ZOOM {
@@ -615,8 +665,12 @@ impl AppView {
             ))
             .child(control_button(
                 "Open original",
-                cx.listener(move |_, _, _, _| {
-                    let _ = std::process::Command::new("open").arg(&open_path).spawn();
+                cx.listener(move |_, _, _, cx| {
+                    let path = open_path.clone();
+                    cx.background_spawn(async move {
+                        let _ = std::process::Command::new("open").arg(path).spawn();
+                    })
+                    .detach();
                 }),
             ))
             .child(control_button(
@@ -714,19 +768,33 @@ impl AppView {
                         div()
                             .id("quick-continue")
                             .role(Role::Button)
-                            .aria_label("Continue from this image")
+                            .aria_label(if self.composer_submission_pending {
+                                "Starting generation"
+                            } else {
+                                "Continue from this image"
+                            })
                             .rounded_lg()
-                            .bg(theme::accent_strong())
                             .px_4()
                             .py_2()
                             .text_sm()
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(gpui::white())
-                            .cursor_pointer()
-                            .child("Continue ↵")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.generate(&Generate, window, cx)
-                            })),
+                            .child(if self.composer_submission_pending {
+                                "Starting…"
+                            } else {
+                                "Continue ↵"
+                            })
+                            .when(continue_ready, |button| {
+                                button
+                                    .bg(theme::accent_strong())
+                                    .text_color(gpui::white())
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.generate(&Generate, window, cx)
+                                    }))
+                            })
+                            .when(!continue_ready, |button| {
+                                button.bg(theme::hover()).text_color(theme::faint())
+                            }),
                     )
             );
         let location = lightbox.displayed_location();

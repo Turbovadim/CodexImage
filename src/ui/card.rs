@@ -6,6 +6,7 @@ use crate::model::BoardNode;
 use gpui::{Image, ImageFormat, SharedString};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicU8;
 
 pub use super::card_layout::{
@@ -22,7 +23,11 @@ pub const PROMPT_WRAP_COLUMNS: usize = 42;
 pub const COLLAPSED_PROMPT_LINES: usize = 6;
 pub const EXPANDED_PROMPT_LINES: usize = 18;
 pub const MEDIA_GAP: f32 = 1.;
-pub const CARD_SPRITE_WIDTHS: [f32; 4] = [85., 170., 340., 680.];
+/// SVG widths of the far-out sprite tiers; GPUI rasterizes each at 2x. Tier
+/// `i` serves zoom levels up to `width / CARD_WIDTH` (0.125, 0.25, 0.5). Above
+/// the last tier cards are painted directly: few are visible there, and a
+/// sprite for a 340 px card at zoom 1 would cost several megabytes each.
+pub const CARD_SPRITE_WIDTHS: [f32; 3] = [42.5, 85., 170.];
 pub const NO_SPRITE_TIER: u8 = u8::MAX;
 
 #[derive(Clone)]
@@ -51,14 +56,16 @@ pub struct CanvasNode {
     pub status_message: SharedString,
     pub attached_text: SharedString,
     pub scene: CardScene,
-    pub sprite_images: Vec<Arc<Image>>,
+    /// SVG sources are created only for tiers that actually become visible.
+    /// Eagerly encoding all four tiers for every node caused a large transient
+    /// allocator peak and populated GPUI's asset cache with unused images.
+    sprite_images: [OnceLock<Arc<Image>>; CARD_SPRITE_WIDTHS.len()],
     pub last_ready_sprite_tier: AtomicU8,
 }
 
 impl CanvasNode {
-    /// Builds everything needed to draw one card: its wrapped text, the assets
-    /// behind each image, the world-space scene, and one SVG sprite per zoom
-    /// tier so the canvas can blit instead of re-drawing at low zoom.
+    /// Builds the stable world-space scene for one card. Raster sprite sources
+    /// are encoded lazily by [`Self::sprite_image`] for visible zoom tiers.
     pub fn build(
         node: &BoardNode,
         prompt_lines: Vec<SharedString>,
@@ -90,20 +97,35 @@ impl CanvasNode {
             attached_text: attached_text_excerpt(node).into(),
             node: node.clone(),
             scene: CardScene::default(),
-            sprite_images: Vec::new(),
+            sprite_images: std::array::from_fn(|_| OnceLock::new()),
             last_ready_sprite_tier: AtomicU8::new(NO_SPRITE_TIER),
         };
         card.scene = build_card_scene(&card, expanded);
-        card.sprite_images = CARD_SPRITE_WIDTHS
-            .into_iter()
-            .map(|width| {
-                Arc::new(Image::from_bytes(
-                    ImageFormat::Svg,
-                    card_scene_svg(&card.scene, width).into_bytes(),
-                ))
-            })
-            .collect();
         card
+    }
+
+    pub fn sprite_image(&self, tier: usize) -> Option<Arc<Image>> {
+        let width = *CARD_SPRITE_WIDTHS.get(tier)?;
+        Some(
+            self.sprite_images[tier]
+                .get_or_init(|| {
+                    Arc::new(Image::from_bytes(
+                        ImageFormat::Svg,
+                        card_scene_svg(&self.scene, width).into_bytes(),
+                    ))
+                })
+                .clone(),
+        )
+    }
+
+    pub fn ready_sprite_image(&self, tier: usize) -> Option<&Image> {
+        self.sprite_images.get(tier)?.get().map(AsRef::as_ref)
+    }
+
+    pub fn sprite_image_is_initialized(&self, tier: usize) -> bool {
+        self.sprite_images
+            .get(tier)
+            .is_some_and(|image| image.get().is_some())
     }
 }
 
@@ -122,4 +144,60 @@ fn collapse_prompt_lines(lines: &[SharedString]) -> Vec<SharedString> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CARD_SPRITE_WIDTHS, CanvasNode, OutputLayout};
+    use crate::model::{BoardNode, NodeStatus};
+    use gpui::SharedString;
+    use std::sync::Arc;
+
+    fn node() -> BoardNode {
+        BoardNode {
+            id: "node".into(),
+            parent_id: None,
+            prompt: "A quiet mountain lake".into(),
+            aspect: "auto".into(),
+            source_images: Vec::new(),
+            attachments: Vec::new(),
+            images: Vec::new(),
+            image_labels: Vec::new(),
+            attempts: Vec::new(),
+            text: String::new(),
+            status: NodeStatus::Done,
+            error: None,
+            stop_reason: None,
+            x: None,
+            y: None,
+            created_at: 0,
+            run_started_at: None,
+            finished_at: None,
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn sprite_sources_are_created_only_for_requested_tiers() {
+        let card = CanvasNode::build(
+            &node(),
+            vec![SharedString::from("A quiet mountain lake")],
+            OutputLayout::None,
+            false,
+            |_| unreachable!("test node has no image assets"),
+        );
+
+        assert!((0..CARD_SPRITE_WIDTHS.len()).all(|tier| !card.sprite_image_is_initialized(tier)));
+        let image = card.sprite_image(2).expect("valid sprite tier");
+        assert!(card.sprite_image_is_initialized(2));
+        assert!(
+            (0..CARD_SPRITE_WIDTHS.len())
+                .filter(|&tier| tier != 2)
+                .all(|tier| !card.sprite_image_is_initialized(tier))
+        );
+        assert!(Arc::ptr_eq(
+            &image,
+            &card.sprite_image(2).expect("cached sprite tier")
+        ));
+    }
 }

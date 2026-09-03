@@ -160,19 +160,24 @@ fn bullet_paths(paths: &[PathBuf]) -> String {
 }
 
 pub fn tail_chars(value: &str, limit: usize) -> String {
-    let count = value.chars().count();
-    value.chars().skip(count.saturating_sub(limit)).collect()
+    if limit == 0 {
+        return String::new();
+    }
+    match value.char_indices().rev().nth(limit) {
+        Some((index, character)) => value[index + character.len_utf8()..].to_owned(),
+        None => value.to_owned(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::same_run_conditioning_section;
+    use super::{same_run_conditioning_section, tail_chars};
     use std::path::Path;
 
     #[test]
     fn same_run_instructions_force_conditioned_file_handoffs() {
         let instructions = same_run_conditioning_section(
-            Path::new("/Applications/Codex Image.app/codex-image"),
+            Path::new("/Applications/CodexImage.app/codex-image"),
             Path::new("/tmp/work space/same-run"),
         );
 
@@ -180,7 +185,14 @@ mod tests {
         assert!(instructions.contains("referenced_image_paths"));
         assert!(instructions.contains("Do not use `num_last_images_to_include`"));
         assert!(instructions.contains("Never put them in the final `outputs`"));
-        assert!(instructions.contains("'/Applications/Codex Image.app/codex-image'"));
+        assert!(instructions.contains("'/Applications/CodexImage.app/codex-image'"));
         assert!(instructions.contains("'/tmp/work space/same-run/step-N.png'"));
+    }
+
+    #[test]
+    fn activity_tails_keep_the_requested_unicode_characters() {
+        assert_eq!(tail_chars("a🙂бcd", 3), "бcd");
+        assert_eq!(tail_chars("a🙂бcd", 20), "a🙂бcd");
+        assert_eq!(tail_chars("a🙂бcd", 0), "");
     }
 }

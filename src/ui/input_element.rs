@@ -4,14 +4,32 @@ use super::input::{LINE_HEIGHT, TextInput, TextInputMode};
 use super::input_layout::{TextLayout, selection_quads};
 use super::theme;
 use gpui::{
-    App, Bounds, ContentMask, Element, ElementId, ElementInputHandler, Entity, GlobalElementId,
-    LayoutId, PaintQuad, Pixels, Point, Style, TextRun, UnderlineStyle, Window, fill, point,
-    prelude::*, px, relative, size,
+    App, Bounds, ContentMask, Element, ElementId, ElementInputHandler, Entity, Font,
+    GlobalElementId, Hsla, LayoutId, PaintQuad, Pixels, Point, SharedString, Style, TextRun,
+    UnderlineStyle, Window, fill, point, prelude::*, px, relative, size,
 };
+use std::ops::Range;
 use std::sync::Arc;
 
 pub(super) struct TextElement {
     pub(super) input: Entity<TextInput>,
+}
+
+#[derive(Clone, PartialEq)]
+struct TextShapeKey {
+    display_text: SharedString,
+    is_placeholder: bool,
+    marked: Option<Range<usize>>,
+    mode: TextInputMode,
+    wrap_width: Option<Pixels>,
+    font: Font,
+    font_size: Pixels,
+    color: Hsla,
+}
+
+pub(super) struct TextLayoutCache {
+    key: TextShapeKey,
+    layout: Arc<TextLayout>,
 }
 
 pub(super) struct Prepaint {
@@ -23,6 +41,7 @@ pub(super) struct Prepaint {
     scroll_x: f32,
     scroll_y: f32,
     vertical_inset: f32,
+    shape_key: TextShapeKey,
 }
 
 impl IntoElement for TextElement {
@@ -85,58 +104,70 @@ impl Element for TextElement {
         } else {
             (content.clone(), style.color)
         };
-        let base = TextRun {
-            len: display_text.len(),
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let shape_key = TextShapeKey {
+            display_text: display_text.clone(),
+            is_placeholder,
+            marked: marked.clone(),
+            mode,
+            wrap_width: mode.is_multiline().then_some(bounds.size.width),
             font: style.font(),
+            font_size,
             color,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
         };
-        let runs = if !is_placeholder {
-            if let Some(marked) = &marked {
-                vec![
-                    TextRun {
-                        len: marked.start,
-                        ..base.clone()
-                    },
-                    TextRun {
-                        len: marked.end - marked.start,
-                        underline: Some(UnderlineStyle {
-                            color: Some(color),
-                            thickness: px(1.),
-                            wavy: false,
-                        }),
-                        ..base.clone()
-                    },
-                    TextRun {
-                        len: display_text.len() - marked.end,
-                        ..base
-                    },
-                ]
-                .into_iter()
-                .filter(|run| run.len > 0)
-                .collect()
-            } else {
-                vec![base]
-            }
-        } else {
-            vec![base]
-        };
-        let shaped = window
-            .text_system()
-            .shape_text(
-                display_text,
-                style.font_size.to_pixels(window.rem_size()),
-                &runs,
-                mode.is_multiline().then_some(bounds.size.width),
-                None,
-            )
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-        let logical_content = if is_placeholder { "" } else { &content };
-        let layout = Arc::new(TextLayout::new(shaped, logical_content, px(LINE_HEIGHT)));
+        let layout = input
+            .layout_cache
+            .as_ref()
+            .filter(|cache| cache.key == shape_key)
+            .map(|cache| Arc::clone(&cache.layout))
+            .unwrap_or_else(|| {
+                let base = TextRun {
+                    len: display_text.len(),
+                    font: shape_key.font.clone(),
+                    color,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let runs = if !is_placeholder {
+                    if let Some(marked) = &marked {
+                        vec![
+                            TextRun {
+                                len: marked.start,
+                                ..base.clone()
+                            },
+                            TextRun {
+                                len: marked.end - marked.start,
+                                underline: Some(UnderlineStyle {
+                                    color: Some(color),
+                                    thickness: px(1.),
+                                    wavy: false,
+                                }),
+                                ..base.clone()
+                            },
+                            TextRun {
+                                len: display_text.len() - marked.end,
+                                ..base
+                            },
+                        ]
+                        .into_iter()
+                        .filter(|run| run.len > 0)
+                        .collect()
+                    } else {
+                        vec![base]
+                    }
+                } else {
+                    vec![base]
+                };
+                let shaped = window
+                    .text_system()
+                    .shape_text(display_text, font_size, &runs, shape_key.wrap_width, None)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+                let logical_content = if is_placeholder { "" } else { &content };
+                Arc::new(TextLayout::new(shaped, logical_content, px(LINE_HEIGHT)))
+            });
         let measured_visual_lines = layout.visual_line_count;
         let viewport_width = f32::from(bounds.size.width).max(0.);
         let viewport_height = f32::from(bounds.size.height).max(0.);
@@ -212,6 +243,7 @@ impl Element for TextElement {
             scroll_x,
             scroll_y,
             vertical_inset,
+            shape_key,
         }
     }
 
@@ -254,6 +286,16 @@ impl Element for TextElement {
         self.input.update(cx, |input, cx| {
             let height_changed = input.measured_visual_lines != prepaint.measured_visual_lines;
             input.last_layout = Some(prepaint.layout.clone());
+            if input
+                .layout_cache
+                .as_ref()
+                .is_none_or(|cache| cache.key != prepaint.shape_key)
+            {
+                input.layout_cache = Some(TextLayoutCache {
+                    key: prepaint.shape_key.clone(),
+                    layout: prepaint.layout.clone(),
+                });
+            }
             input.last_bounds = Some(bounds);
             input.measured_visual_lines = prepaint.measured_visual_lines;
             input.scroll_x = prepaint.scroll_x;

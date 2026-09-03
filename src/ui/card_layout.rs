@@ -101,19 +101,19 @@ pub fn wrap_prompt(value: &str, max_graphemes: usize) -> Vec<String> {
         let mut current = String::new();
         let mut current_len = 0;
         for word in paragraph.split_whitespace() {
-            let graphemes = UnicodeSegmentation::graphemes(word, true).collect::<Vec<_>>();
-            if graphemes.len() <= max_graphemes {
+            let grapheme_count = word.graphemes(true).count();
+            if grapheme_count <= max_graphemes {
                 let separator_len = usize::from(!current.is_empty());
-                if current_len + separator_len + graphemes.len() <= max_graphemes {
+                if current_len + separator_len + grapheme_count <= max_graphemes {
                     if separator_len == 1 {
                         current.push(' ');
                     }
                     current.push_str(word);
-                    current_len += separator_len + graphemes.len();
+                    current_len += separator_len + grapheme_count;
                 } else {
                     lines.push(std::mem::take(&mut current));
                     current.push_str(word);
-                    current_len = graphemes.len();
+                    current_len = grapheme_count;
                 }
                 continue;
             }
@@ -122,13 +122,12 @@ pub fn wrap_prompt(value: &str, max_graphemes: usize) -> Vec<String> {
                 lines.push(std::mem::take(&mut current));
                 current_len = 0;
             }
-            for chunk in graphemes.chunks(max_graphemes) {
-                let chunk = chunk.concat();
-                if chunk.graphemes(true).count() == max_graphemes {
-                    lines.push(chunk);
-                } else {
-                    current_len = chunk.graphemes(true).count();
-                    current = chunk;
+            for grapheme in word.graphemes(true) {
+                current.push_str(grapheme);
+                current_len += 1;
+                if current_len == max_graphemes {
+                    lines.push(std::mem::take(&mut current));
+                    current_len = 0;
                 }
             }
         }

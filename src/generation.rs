@@ -4,7 +4,7 @@ mod prompt;
 
 pub use conditioner::condition_image_for_reingestion;
 
-use crate::manifest::{OutputManifest, absolute_file_path, is_path_inside};
+use crate::manifest::{OutputManifest, absolute_file_path, is_canonical_path_inside};
 use crate::model::{
     Board, BoardNode, MAX_ACTIVE_PER_BOARD, NewNodesRequest, NodeStatus, StopReason,
 };
@@ -14,9 +14,9 @@ use codex::{CodexInvocation, configure_process_group, kill_process_group, read_t
 use parking_lot::Mutex;
 use prompt::{build_node_prompt, selection_recovery_prompt, tail_chars};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -158,9 +158,14 @@ impl GenerationEngine {
             bail!("Too many generations running on this board (max {MAX_ACTIVE_PER_BOARD})");
         }
         let nodes = self.inner.repository.add_nodes(board_id, request)?;
+        let board = self
+            .inner
+            .repository
+            .board_snapshot(board_id)
+            .context("Board not found")?;
         let total = nodes.len();
         for (index, node) in nodes.iter().enumerate() {
-            self.start_job(board_id, &node.id, index, total)?;
+            self.start_job(Arc::clone(&board), node.clone(), index, total)?;
         }
         Ok(nodes)
     }
@@ -174,10 +179,16 @@ impl GenerationEngine {
     ) -> Result<()> {
         let _submission = self.inner.submission_lock.lock();
         self.stop(node_id, Termination::Replaced, libc::SIGKILL);
-        self.inner
+        let node = self
+            .inner
             .repository
             .regenerate_node(board_id, node_id, prompt, aspect)?;
-        self.start_job(board_id, node_id, 0, 1)
+        let board = self
+            .inner
+            .repository
+            .board_snapshot(board_id)
+            .context("Board not found")?;
+        self.start_job(board, node, 0, 1)
     }
 
     pub fn stop_node(&self, node_id: &str) {
@@ -215,42 +226,42 @@ impl GenerationEngine {
         self.inner.repository.flush();
     }
 
-    fn start_job(&self, board_id: &str, node_id: &str, index: usize, count: usize) -> Result<()> {
-        let board = self
-            .inner
-            .repository
-            .board(board_id)
-            .context("Board not found")?;
-        let node = board
-            .nodes
-            .iter()
-            .find(|node| node.id == node_id)
-            .cloned()
-            .context("Node not found")?;
+    fn start_job(
+        &self,
+        board: Arc<Board>,
+        node: BoardNode,
+        index: usize,
+        count: usize,
+    ) -> Result<()> {
+        let node_id = node.id.clone();
         let control = Arc::new(JobControl {
-            board_id: board_id.to_owned(),
-            node_id: node_id.to_owned(),
+            board_id: board.id.clone(),
+            node_id: node_id.clone(),
             pid: AtomicI32::new(0),
             termination: Mutex::new(None),
         });
         self.inner
             .jobs
             .lock()
-            .insert(node_id.to_owned(), control.clone());
+            .insert(node_id.clone(), control.clone());
         let engine = self.clone();
-        thread::Builder::new()
+        let worker_control = control.clone();
+        if let Err(error) = thread::Builder::new()
             .name(format!(
                 "codex-generation-{}",
                 &node_id[..node_id.len().min(8)]
             ))
-            .spawn(move || engine.run_job(board, node, control, index, count))
-            .context("failed to start generation worker")?;
+            .spawn(move || engine.run_job(board, node, worker_control, index, count))
+        {
+            self.finish_control(&control);
+            return Err(error).context("failed to start generation worker");
+        }
         Ok(())
     }
 
     fn run_job(
         &self,
-        board: Board,
+        board: Arc<Board>,
         node: BoardNode,
         control: Arc<JobControl>,
         index: usize,
@@ -263,7 +274,7 @@ impl GenerationEngine {
             let _ = self
                 .inner
                 .repository
-                .update_node(&board.id, &node.id, |node| {
+                .mutate_node(&board.id, &node.id, |node| {
                     if node.status == NodeStatus::Running {
                         node.status = NodeStatus::Error;
                         node.error = Some(message);
@@ -353,22 +364,52 @@ impl GenerationEngine {
             }
         });
         let stderr_thread = thread::spawn(move || read_tail(stderr, 4 * 1024));
-        let mut log = OpenOptions::new().create(true).append(true).open(
-            self.inner
-                .repository
-                .paths()
-                .logs
-                .join(format!("{}.jsonl", board.id)),
-        )?;
+        let mut log = BufWriter::with_capacity(
+            64 * 1024,
+            OpenOptions::new().create(true).append(true).open(
+                self.inner
+                    .repository
+                    .paths()
+                    .logs
+                    .join(format!("{}.jsonl", board.id)),
+            )?,
+        );
         let mut runtime = Runtime::new();
         let mut last_poll = Instant::now();
+        let mut stdout_open = true;
+        let mut log_dirty = false;
         let exit_status = loop {
+            let wait = POLL_INTERVAL.saturating_sub(last_poll.elapsed());
+            if stdout_open {
+                match line_rx.recv_timeout(wait) {
+                    Ok(line) => {
+                        runtime.last_activity = Instant::now();
+                        writeln!(log, "{line}")?;
+                        log_dirty = true;
+                        self.handle_event(board, node, &mut runtime, &line);
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => stdout_open = false,
+                }
+            } else if !wait.is_zero() {
+                // A process normally closes stdout as it exits. If it closes
+                // the pipe early, retain cancellation and timeout checks
+                // without spinning a CPU core.
+                thread::sleep(wait.min(Duration::from_millis(80)));
+            }
             while let Ok(line) = line_rx.try_recv() {
                 runtime.last_activity = Instant::now();
                 writeln!(log, "{line}")?;
+                log_dirty = true;
                 self.handle_event(board, node, &mut runtime, &line);
             }
             if last_poll.elapsed() >= POLL_INTERVAL {
+                // Keep logs externally observable without turning the 64 KiB
+                // buffer back into one write syscall per streamed JSON line.
+                if log_dirty {
+                    log.flush()?;
+                    log_dirty = false;
+                }
                 if self.collect_images(board, node, control, &mut runtime)? {
                     runtime.last_activity = Instant::now();
                 }
@@ -383,13 +424,13 @@ impl GenerationEngine {
             if let Some(status) = child.try_wait()? {
                 break status;
             }
-            thread::sleep(Duration::from_millis(80));
         };
         let _ = stdout_thread.join();
         while let Ok(line) = line_rx.try_recv() {
             writeln!(log, "{line}")?;
             self.handle_event(board, node, &mut runtime, &line);
         }
+        log.flush()?;
         let stderr_tail = stderr_thread.join().unwrap_or_default();
         if !exit_status.success() && control.termination.lock().is_none() {
             runtime.failures.push(if stderr_tail.trim().is_empty() {
@@ -450,17 +491,15 @@ impl GenerationEngine {
             Some("turn.completed") => {
                 runtime.turn_completed = true;
                 if let Some(usage) = event.get("usage").and_then(Value::as_object) {
-                    let additions: BTreeMap<String, u64> = usage
-                        .iter()
-                        .filter_map(|(key, value)| value.as_u64().map(|value| (key.clone(), value)))
-                        .collect();
                     let _ = self
                         .inner
                         .repository
-                        .update_node(&board.id, &node.id, |node| {
-                            let usage = node.usage.get_or_insert_with(BTreeMap::new);
-                            for (key, value) in additions {
-                                *usage.entry(key).or_default() += value;
+                        .mutate_node(&board.id, &node.id, |node| {
+                            let totals = node.usage.get_or_insert_with(Default::default);
+                            for (key, value) in usage {
+                                if let Some(value) = value.as_u64() {
+                                    *totals.entry(key.clone()).or_default() += value;
+                                }
                             }
                         });
                 }
@@ -488,13 +527,16 @@ impl GenerationEngine {
             return Ok(false);
         }
         let mut changed = false;
-        for thread_id in runtime.watchers.clone() {
+        for thread_id in &runtime.watchers {
             let directory = self
                 .inner
                 .repository
                 .paths()
                 .generated_images
-                .join(&thread_id);
+                .join(thread_id);
+            let Ok(canonical_directory) = directory.canonicalize() else {
+                continue;
+            };
             let Ok(entries) = fs::read_dir(&directory) else {
                 continue;
             };
@@ -512,22 +554,31 @@ impl GenerationEngine {
                 if image::ImageFormat::from_path(&path).is_err() {
                     continue;
                 }
-                if runtime.sizes.insert(path.clone(), metadata.len()) != Some(metadata.len()) {
-                    continue;
+                match runtime.sizes.get_mut(&path) {
+                    Some(previous) if *previous == metadata.len() => {}
+                    Some(previous) => {
+                        *previous = metadata.len();
+                        continue;
+                    }
+                    None => {
+                        runtime.sizes.insert(path.clone(), metadata.len());
+                        continue;
+                    }
                 }
                 let canonical = path.canonicalize()?;
-                if !is_path_inside(&directory, &canonical) {
+                if !is_canonical_path_inside(&canonical_directory, &canonical) {
                     continue;
                 }
                 let url = self
                     .inner
                     .repository
                     .import_generated(&board.id, &canonical)?;
+                runtime.sizes.remove(&path);
                 runtime.seen.insert(path);
                 runtime.artifacts.insert(canonical, url.clone());
                 self.inner
                     .repository
-                    .update_node(&board.id, &node.id, |node| {
+                    .mutate_node(&board.id, &node.id, |node| {
                         if !node.attempts.contains(&url) {
                             node.attempts.push(url.clone());
                         }
@@ -561,7 +612,7 @@ impl GenerationEngine {
             if !text.is_empty() {
                 self.inner
                     .repository
-                    .update_node(&board.id, &node.id, |node| {
+                    .mutate_node(&board.id, &node.id, |node| {
                         if node.status == NodeStatus::Running {
                             node.text = text;
                         }
@@ -622,7 +673,7 @@ impl GenerationEngine {
         }
         self.inner
             .repository
-            .update_node(&board.id, &node.id, |node| {
+            .mutate_node(&board.id, &node.id, |node| {
                 if node.status != NodeStatus::Running {
                     return;
                 }
@@ -646,7 +697,7 @@ impl GenerationEngine {
             .unwrap_or(0);
         self.inner
             .repository
-            .update_node(&board.id, &node.id, |node| {
+            .mutate_node(&board.id, &node.id, |node| {
                 node.status = NodeStatus::Error;
                 node.error = Some(format!(
                     "No generation activity for 20 minutes. {}",
@@ -670,19 +721,25 @@ impl GenerationEngine {
     ) -> Result<()> {
         let mut images = Vec::new();
         let mut labels = Vec::new();
+        let watcher_directories: Vec<_> = runtime
+            .watchers
+            .iter()
+            .filter_map(|thread_id| {
+                self.inner
+                    .repository
+                    .paths()
+                    .generated_images
+                    .join(thread_id)
+                    .canonicalize()
+                    .ok()
+            })
+            .collect();
         for output in &manifest.outputs {
             let canonical = absolute_file_path(&output.path)?.canonicalize()?;
-            if !runtime.watchers.iter().any(|thread_id| {
-                is_path_inside(
-                    &self
-                        .inner
-                        .repository
-                        .paths()
-                        .generated_images
-                        .join(thread_id),
-                    &canonical,
-                )
-            }) {
+            if !watcher_directories
+                .iter()
+                .any(|directory| is_canonical_path_inside(directory, &canonical))
+            {
                 bail!("a selected image was not generated by this run");
             }
             let url = match runtime.artifacts.get(&canonical) {
@@ -701,7 +758,7 @@ impl GenerationEngine {
         }
         self.inner
             .repository
-            .update_node(&board.id, &node.id, |node| {
+            .mutate_node(&board.id, &node.id, |node| {
                 node.images = images;
                 node.image_labels = labels;
                 node.text = manifest.summary.clone();

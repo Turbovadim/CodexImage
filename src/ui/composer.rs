@@ -136,7 +136,20 @@ impl AppView {
                         save_pending_clipboard_images(directory, images, save_count)
                     })
                     .await;
-                    let _ = weak.update(cx, |view, cx| {
+                    let Some(view) = weak.upgrade() else {
+                        // The app closed after the batch reached disk. Those
+                        // files never became owned attachments, so remove them.
+                        if let Ok(paths) = result {
+                            smol::unblock(move || {
+                                for path in paths {
+                                    let _ = fs::remove_file(path);
+                                }
+                            })
+                            .await;
+                        }
+                        return;
+                    };
+                    view.update(cx, |view, cx| {
                         view.pending_attachment_writes =
                             view.pending_attachment_writes.saturating_sub(save_count);
                         match result {

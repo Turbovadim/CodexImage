@@ -1,0 +1,5 @@
+# The vendored GPUI occlusion patch is built against this toolchain.
+[toolchain]
+channel = "1.97.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

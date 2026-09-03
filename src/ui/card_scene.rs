@@ -118,6 +118,10 @@ pub struct CardScene {
     /// The media area of a running card, in card-local coordinates. The canvas
     /// paints the animated generating shimmer over this rectangle.
     pub generating_media: Option<CardRect>,
+    /// Cached scene facts used by every paint. Scanning all primitives per
+    /// visible node was measurable during camera movement.
+    pub has_blurred_images: bool,
+    pub max_high_resolution_dimension: f32,
 }
 
 impl CardScene {
@@ -163,6 +167,12 @@ impl CardScene {
         radius: f32,
         blurred: bool,
     ) {
+        self.has_blurred_images |= blurred;
+        if !blurred && asset.original.as_ref() != asset.thumbnail.as_ref() {
+            self.max_high_resolution_dimension = self
+                .max_high_resolution_dimension
+                .max(bounds.width.max(bounds.height));
+        }
         self.primitives.push(CardPrimitive::Image {
             asset,
             bounds,
@@ -184,6 +194,8 @@ pub fn build_card_scene(canvas_node: &CanvasNode, expanded: bool) -> CardScene {
         ),
         primitives: Vec::new(),
         generating_media: None,
+        has_blurred_images: false,
+        max_high_resolution_dimension: 0.,
     };
     // While the generation runs, any displayed image is an intermediate
     // attempt; blur it so the card marks progress without spoiling the result.

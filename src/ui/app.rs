@@ -4,8 +4,8 @@
 use super::canvas::CanvasConnector;
 use super::canvas_view::{DragState, MinimapScene};
 use super::card::{
-    CanvasImageAsset, CanvasNode, OutputLayout, PROMPT_WRAP_COLUMNS, card_height,
-    card_height_from_metadata, output_layout, wrap_prompt,
+    CanvasImageAsset, CanvasNode, PROMPT_WRAP_COLUMNS, card_height, card_height_from_metadata,
+    output_layout, wrap_prompt,
 };
 use super::composer::ComposerTarget;
 use super::format::read_image_ratio;
@@ -17,6 +17,8 @@ use super::keymap::{Escape, Generate, Quit, bind_keys, configure_menus};
 use super::lightbox::Lightbox;
 use super::overlays::{BoardRow, GalleryRow, Toast};
 use super::theme;
+#[cfg(target_os = "macos")]
+use super::window_memory::{VisibilityChange, WindowMemoryState, WindowOcclusionObserver};
 use crate::APP_NAME;
 use crate::generation::GenerationEngine;
 use crate::layout::{Position, compute_layout};
@@ -27,14 +29,13 @@ use crate::storage::{
 use anyhow::{Context as _, Result};
 use gpui::{
     App, AppContext, Bounds, Context, Entity, ExternalPaths, FocusHandle, Focusable, ListAlignment,
-    ListState, MouseButton, Render, Role, SharedString, TitlebarOptions, Window, WindowBounds,
-    WindowOptions, div, point, prelude::*, px, size,
+    ListState, MouseButton, Render, Role, SharedString, Subscription, Task, TitlebarOptions,
+    Window, WindowBounds, WindowOptions, div, point, prelude::*, px, size,
 };
 use gpui_platform::application;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
 
 pub(super) enum Overlay {
     None,
@@ -72,11 +73,19 @@ struct ImageJob {
     read_ratio: bool,
 }
 
+fn board_snapshots_equal(left: Option<&Arc<Board>>, right: Option<&Arc<Board>>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 pub(super) struct AppView {
     pub(super) engine: GenerationEngine,
     pub(super) receiver: async_channel::Receiver<RepositoryEvent>,
     pub(super) board_id: Option<String>,
-    pub(super) board: Option<Board>,
+    pub(super) board: Option<Arc<Board>>,
     pub(super) prompt: Entity<TextInput>,
     pub(super) modal_input: Entity<TextInput>,
     pub(super) search_input: Entity<TextInput>,
@@ -96,10 +105,9 @@ pub(super) struct AppView {
     pub(super) armed_board_delete: Option<String>,
     pub(super) toast: Option<Toast>,
     pub(super) toast_serial: u64,
+    pub(super) toast_task: Option<Task<()>>,
     pub(super) layout: HashMap<String, Position>,
     pub(super) heights: HashMap<String, f32>,
-    pub(super) prompt_lines: HashMap<String, Vec<SharedString>>,
-    pub(super) output_layouts: HashMap<String, OutputLayout>,
     pub(super) canvas_nodes: Arc<Vec<Arc<CanvasNode>>>,
     pub(super) canvas_connectors: Arc<Vec<CanvasConnector>>,
     pub(super) minimap_scene: Option<MinimapScene>,
@@ -114,12 +122,22 @@ pub(super) struct AppView {
     pub(super) image_ratios: HashMap<String, f32>,
     pub(super) image_assets: HashMap<String, ImageAsset>,
     pending_image_jobs: HashSet<String>,
+    image_metadata_tasks: Vec<Task<()>>,
     pub(super) transient_positions: HashMap<String, Position>,
     pub(super) camera_x: f32,
     pub(super) camera_y: f32,
     pub(super) zoom: f32,
-    /// When zoom last moved; sprite tiers only rebuild once it settles.
-    pub(super) last_zoom_change: Instant,
+    pub(super) zoom_settled: bool,
+    pub(super) zoom_settle_task: Option<Task<()>>,
+    pub(super) running_tick_task: Option<Task<()>>,
+    repository_task: Option<Task<()>>,
+    #[cfg(target_os = "macos")]
+    window_memory_state: WindowMemoryState,
+    #[cfg(target_os = "macos")]
+    _window_occlusion_observer: Option<WindowOcclusionObserver>,
+    #[cfg(target_os = "macos")]
+    window_occlusion_task: Option<Task<()>>,
+    _subscriptions: Vec<Subscription>,
     pub(super) drag: Option<DragState>,
 }
 
@@ -218,33 +236,35 @@ impl AppView {
         let search_input = cx.new(|cx| TextInput::single_line("Search boards…", cx));
         let image_cache = cx.new(|cx| DecodedImageCache::new(DECODED_IMAGE_CACHE_BUDGET, cx));
         let sprite_cache = cx.new(|cx| CardSpriteCache::new(CARD_SPRITE_CACHE_BUDGET, cx));
-        // Drop every decoded image when the window deactivates. This is what
-        // actually defragments the Metal atlas: LRU eviction leaves survivors
-        // scattered across 4 MB textures, while a full clear lets the atlas
-        // free them all and repack densely when the visible set re-decodes on
-        // return. Card sprites stay cached, so the canvas repaints instantly.
-        cx.observe_window_activation(window, |view, window, cx| {
+        #[cfg(target_os = "macos")]
+        let (window_occlusion_observer, window_occlusion_receiver) =
+            match WindowOcclusionObserver::new(window) {
+                Ok((observer, receiver)) => (Some(observer), Some(receiver)),
+                Err(error) => {
+                    eprintln!("Could not observe window occlusion: {error:#}");
+                    (None, None)
+                }
+            };
+        // Activation follows keyboard focus, not visibility. It only controls
+        // animation ticks; true occlusion owns the GPU cache lifetime below.
+        let activation_subscription = cx.observe_window_activation(window, |view, window, cx| {
             if window.is_window_active() {
-                return;
+                // Restart a visible running animation after the window becomes
+                // active. `render_canvas` decides whether a tick is needed.
+                cx.notify();
+            } else {
+                view.running_tick_task.take();
             }
-            let released = view
-                .image_cache
-                .update(cx, |cache, cx| cache.clear(window, cx));
-            if released {
-                window.refresh();
-            }
-        })
-        .detach();
-        cx.subscribe(&prompt, |this, _, event, cx| {
+        });
+        let prompt_subscription = cx.subscribe(&prompt, |this, _, event, cx| {
             this.handle_input_event(event, cx)
-        })
-        .detach();
-        cx.observe(&search_input, |_, _, cx| cx.notify()).detach();
+        });
+        let search_subscription = cx.observe(&search_input, |_, _, cx| cx.notify());
         let summaries = engine.repository().summaries();
         let board_id = summaries.first().map(|summary| summary.id.clone());
         let board = board_id
             .as_deref()
-            .and_then(|id| engine.repository().board(id));
+            .and_then(|id| engine.repository().board_snapshot(id));
         let gallery_list_state = ListState::new(
             board.as_ref().map_or(0, |board| board.nodes.len()),
             ListAlignment::Top,
@@ -274,10 +294,9 @@ impl AppView {
             armed_board_delete: None,
             toast: None,
             toast_serial: 0,
+            toast_task: None,
             layout: HashMap::new(),
             heights: HashMap::new(),
-            prompt_lines: HashMap::new(),
-            output_layouts: HashMap::new(),
             canvas_nodes: Arc::new(Vec::new()),
             canvas_connectors: Arc::new(Vec::new()),
             minimap_scene: None,
@@ -289,23 +308,43 @@ impl AppView {
             image_ratios: HashMap::new(),
             image_assets: HashMap::new(),
             pending_image_jobs: HashSet::new(),
+            image_metadata_tasks: Vec::new(),
             transient_positions: HashMap::new(),
             camera_x: 80.,
             camera_y: 90.,
             zoom: 1.,
-            last_zoom_change: Instant::now(),
+            zoom_settled: true,
+            zoom_settle_task: None,
+            running_tick_task: None,
+            repository_task: None,
+            #[cfg(target_os = "macos")]
+            window_memory_state: WindowMemoryState::default(),
+            #[cfg(target_os = "macos")]
+            _window_occlusion_observer: window_occlusion_observer,
+            #[cfg(target_os = "macos")]
+            window_occlusion_task: None,
+            _subscriptions: vec![
+                activation_subscription,
+                prompt_subscription,
+                search_subscription,
+            ],
             drag: None,
         };
         view.refresh_image_metadata(cx);
         view.refresh_layout();
         let receiver = view.receiver.clone();
         let window_handle = window.window_handle();
-        cx.spawn(async move |weak, cx| {
+        view.repository_task = Some(cx.spawn(async move |weak, cx| {
             while let Ok(event) = receiver.recv().await {
+                let mut events = Vec::with_capacity(receiver.len().saturating_add(1).min(256));
+                events.push(event);
+                while let Ok(event) = receiver.try_recv() {
+                    events.push(event);
+                }
                 if window_handle
                     .update(cx, |_, window, cx| {
                         weak.update(cx, |view, cx| {
-                            view.handle_repository_event(event, window, cx)
+                            view.handle_repository_events(events, window, cx)
                         })
                     })
                     .and_then(|result| result)
@@ -314,50 +353,117 @@ impl AppView {
                     break;
                 }
             }
-        })
-        .detach();
+        }));
+        #[cfg(target_os = "macos")]
+        if let Some(receiver) = window_occlusion_receiver {
+            let window_handle = window.window_handle();
+            view.window_occlusion_task = Some(cx.spawn(async move |weak, cx| {
+                while let Ok(visible) = receiver.recv().await {
+                    if window_handle
+                        .update(cx, |_, window, cx| {
+                            weak.update(cx, |view, cx| {
+                                view.handle_window_visibility(visible, window, cx)
+                            })
+                        })
+                        .and_then(|result| result)
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }));
+        }
         window.focus(&view.focus, cx);
         view
     }
 
-    fn handle_repository_event(
+    #[cfg(target_os = "macos")]
+    fn handle_window_visibility(
         &mut self,
-        event: RepositoryEvent,
+        visible: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match event {
-            RepositoryEvent::Changed => {
-                if let Some(id) = self.board_id.as_deref() {
-                    self.board = self.engine.repository().board(id);
+        match self.window_memory_state.update(visible) {
+            VisibilityChange::None => {}
+            VisibilityChange::Release => {
+                self.running_tick_task.take();
+                let images_released = self
+                    .image_cache
+                    .update(cx, |cache, cx| cache.clear(window, cx));
+                let sprites_released = self
+                    .sprite_cache
+                    .update(cx, |cache, cx| cache.clear(window, cx));
+                if images_released || sprites_released {
+                    // Invalidate the retained scene so it cannot keep using
+                    // atlas entries removed by either cache.
+                    window.refresh();
                 }
-                self.refresh_image_metadata(cx);
-                self.refresh_layout();
             }
-            RepositoryEvent::ImagesRewritten => {
-                self.clear_render_caches(window, cx);
-                self.image_assets.clear();
-                self.image_ratios.clear();
-                self.pending_image_jobs.clear();
-                if let Some(id) = self.board_id.as_deref() {
-                    self.board = self.engine.repository().board(id);
+            VisibilityChange::Restore => {
+                // Images and sprites repopulate on demand in the next render.
+                cx.notify();
+                window.refresh();
+            }
+        }
+    }
+
+    fn handle_repository_events(
+        &mut self,
+        events: Vec<RepositoryEvent>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut changed = false;
+        let mut images_rewritten = false;
+        let mut visual_change = false;
+        for event in events {
+            match event {
+                RepositoryEvent::Changed => changed = true,
+                RepositoryEvent::ImagesRewritten => images_rewritten = true,
+                RepositoryEvent::Activity { node_id, text } => {
+                    if self.activity.get(&node_id) != Some(&text) {
+                        self.activity.insert(node_id, text);
+                        visual_change = true;
+                    }
                 }
-                self.refresh_image_metadata(cx);
-                self.refresh_layout();
-            }
-            RepositoryEvent::Activity { node_id, text } => {
-                self.activity.insert(node_id, text);
-            }
-            RepositoryEvent::PersistFailed(message) => {
-                self.show_toast(
+                RepositoryEvent::PersistFailed(message) => self.show_toast(
                     format!("Could not save this board: {message}"),
                     true,
                     None,
                     cx,
-                );
+                ),
             }
         }
-        cx.notify();
+
+        if images_rewritten {
+            self.clear_render_caches(window, cx);
+            self.reset_image_metadata();
+            changed = true;
+        }
+        if changed {
+            let next_board = self
+                .board_id
+                .as_deref()
+                .and_then(|id| self.engine.repository().board_snapshot(id));
+            let board_changed = !board_snapshots_equal(self.board.as_ref(), next_board.as_ref());
+            if board_changed || images_rewritten {
+                self.board = next_board;
+                self.refresh_image_metadata(cx);
+                self.refresh_layout();
+                visual_change = true;
+            } else if matches!(self.overlay, Overlay::Boards) {
+                // A different board changed. Only the switcher's summaries can
+                // have changed; the open canvas remains byte-for-byte equal.
+                self.refresh_overlay_data();
+                visual_change = true;
+            }
+        }
+        if visual_change
+            && (changed || !matches!(self.overlay, Overlay::Gallery | Overlay::Lightbox(_)))
+        {
+            cx.notify();
+        }
     }
 
     /// Rebuilds the derived board state. Cards whose node, layout, and images
@@ -370,58 +476,43 @@ impl AppView {
             .map(|canvas_node| (canvas_node.node.id.as_str(), canvas_node))
             .collect();
         if let Some(board) = &self.board {
-            let prompt_lines = board
-                .nodes
-                .iter()
-                .map(|node| {
-                    let lines = cached
-                        .get(node.id.as_str())
-                        .filter(|previous| previous.node.prompt == node.prompt)
-                        .map(|previous| previous.prompt_lines.clone())
-                        .unwrap_or_else(|| {
-                            wrap_prompt(&node.prompt, PROMPT_WRAP_COLUMNS)
-                                .into_iter()
-                                .map(SharedString::from)
-                                .collect()
-                        });
-                    (node.id.clone(), lines)
-                })
-                .collect::<HashMap<_, _>>();
-            let output_layouts = board
-                .nodes
-                .iter()
-                .map(|node| (node.id.clone(), output_layout(node, &self.image_ratios)))
-                .collect::<HashMap<_, _>>();
-            let heights = board
-                .nodes
-                .iter()
-                .map(|node| {
-                    let total_prompt_lines =
-                        prompt_lines.get(&node.id).map_or(1, |lines| lines.len());
-                    let output_height = output_layouts
-                        .get(&node.id)
-                        .map_or(0., OutputLayout::height);
-                    (
-                        node.id.clone(),
-                        card_height_from_metadata(
-                            node,
-                            self.expanded_prompts.contains(&node.id),
-                            total_prompt_lines,
-                            output_height,
-                        ),
-                    )
-                })
-                .collect();
+            // Keep transient derivation index-aligned with the board. The old
+            // string-keyed prompt/output maps cloned every node id and every
+            // wrapped-line Vec even when a repository event changed one node.
+            let mut derived = Vec::with_capacity(board.nodes.len());
+            let mut heights = HashMap::with_capacity(board.nodes.len());
+            for node in &board.nodes {
+                let previous_with_same_prompt = cached
+                    .get(node.id.as_str())
+                    .copied()
+                    .filter(|previous| previous.node.prompt == node.prompt);
+                let prompt_lines = previous_with_same_prompt.is_none().then(|| {
+                    wrap_prompt(&node.prompt, PROMPT_WRAP_COLUMNS)
+                        .into_iter()
+                        .map(SharedString::from)
+                        .collect::<Vec<_>>()
+                });
+                let prompt_line_count = prompt_lines.as_ref().map_or_else(
+                    || previous_with_same_prompt.map_or(1, |previous| previous.prompt_lines.len()),
+                    Vec::len,
+                );
+                let output_layout = output_layout(node, &self.image_ratios);
+                let height = card_height_from_metadata(
+                    node,
+                    self.expanded_prompts.contains(&node.id),
+                    prompt_line_count,
+                    output_layout.height(),
+                );
+                heights.insert(node.id.clone(), height);
+                derived.push((prompt_lines, output_layout));
+            }
             let layout = compute_layout(&board.nodes, &heights);
             let canvas_nodes = board
                 .nodes
                 .iter()
-                .map(|node| {
+                .zip(derived)
+                .map(|(node, (prompt_lines, output_layout))| {
                     let expanded = self.expanded_prompts.contains(&node.id);
-                    let output_layout = output_layouts
-                        .get(&node.id)
-                        .cloned()
-                        .unwrap_or(OutputLayout::None);
                     if let Some(reusable) = cached.get(node.id.as_str()).filter(|previous| {
                         previous.expanded == expanded
                             && previous.output_layout == output_layout
@@ -430,25 +521,27 @@ impl AppView {
                     }) {
                         return Arc::clone(reusable);
                     }
+                    let prompt_lines = prompt_lines.unwrap_or_else(|| {
+                        cached
+                            .get(node.id.as_str())
+                            .map(|previous| previous.prompt_lines.clone())
+                            .unwrap_or_default()
+                    });
                     Arc::new(CanvasNode::build(
                         node,
-                        prompt_lines.get(&node.id).cloned().unwrap_or_default(),
+                        prompt_lines,
                         output_layout,
                         expanded,
                         |url| self.canvas_image_asset(url),
                     ))
                 })
                 .collect();
-            self.prompt_lines = prompt_lines;
-            self.output_layouts = output_layouts;
             self.canvas_nodes = Arc::new(canvas_nodes);
             self.heights = heights;
             self.layout = layout;
         } else {
             self.layout.clear();
             self.heights.clear();
-            self.prompt_lines.clear();
-            self.output_layouts.clear();
             self.canvas_nodes = Arc::new(Vec::new());
         }
         self.refresh_canvas_scene();
@@ -487,10 +580,19 @@ impl AppView {
     /// Resolves each image to the file the canvas should draw. Anything that
     /// requires decoding — building a missing thumbnail, reading an aspect
     /// ratio — is handed to the background executor and applied when it lands.
-    fn refresh_image_metadata(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn reset_image_metadata(&mut self) {
+        self.image_metadata_tasks.clear();
+        self.pending_image_jobs.clear();
+        self.image_assets.clear();
+        self.image_ratios.clear();
+    }
+
+    pub(super) fn refresh_image_metadata(&mut self, cx: &mut Context<Self>) {
         let (Some(board_id), Some(board)) = (self.board_id.as_deref(), self.board.as_ref()) else {
+            self.image_metadata_tasks.clear();
             self.image_assets.clear();
             self.image_ratios.clear();
+            self.pending_image_jobs.clear();
             return;
         };
         let repository = self.engine.repository();
@@ -552,17 +654,18 @@ impl AppView {
         self.pending_image_jobs
             .retain(|url| seen.contains(url.as_str()));
         drop(seen);
-        self.spawn_image_jobs(jobs, cx);
+        self.spawn_image_jobs(board_id.to_owned(), jobs, cx);
     }
 
     /// Decodes in batches so a board full of new images costs one layout pass
     /// per batch rather than one per image, while still filling in progressively.
-    fn spawn_image_jobs(&mut self, jobs: Vec<ImageJob>, cx: &mut Context<Self>) {
-        const BATCH: usize = 8;
+    fn spawn_image_jobs(&mut self, board_id: String, jobs: Vec<ImageJob>, cx: &mut Context<Self>) {
+        const BATCH: usize = 64;
         if jobs.is_empty() {
             return;
         }
-        cx.spawn(async move |weak, cx| {
+        self.image_metadata_tasks.retain(|task| !task.is_ready());
+        let task = cx.spawn(async move |weak, cx| {
             for batch in jobs.chunks(BATCH) {
                 let batch = batch.to_vec();
                 let resolved = smol::unblock(move || {
@@ -593,43 +696,105 @@ impl AppView {
                 })
                 .await;
                 if weak
-                    .update(cx, |view, cx| view.apply_image_metadata(resolved, cx))
+                    .update(cx, |view, cx| {
+                        view.apply_image_metadata(&board_id, resolved, cx)
+                    })
                     .is_err()
                 {
                     break;
                 }
             }
-        })
-        .detach();
+        });
+        self.image_metadata_tasks.push(task);
     }
 
-    fn apply_image_metadata(&mut self, resolved: Vec<ResolvedImage>, cx: &mut Context<Self>) {
-        let mut changed = false;
+    fn apply_image_metadata(
+        &mut self,
+        board_id: &str,
+        resolved: Vec<ResolvedImage>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.board_id.as_deref() != Some(board_id) {
+            return;
+        }
+        let mut assets_changed = false;
+        let mut layout_changed = false;
         for image in resolved {
             self.pending_image_jobs.remove(&image.url);
-            if let Some(asset) = self.image_assets.get_mut(&image.url) {
-                if let Some(thumbnail) = image.thumbnail
-                    && asset.thumbnail != thumbnail
-                {
-                    asset.thumbnail = thumbnail;
-                    changed = true;
-                }
-                let sprite = image.sprite.unwrap_or_else(|| asset.thumbnail.clone());
-                if asset.sprite != sprite {
-                    asset.sprite = sprite;
-                    changed = true;
-                }
+            let Some(asset) = self.image_assets.get_mut(&image.url) else {
+                // The URL was removed while its background job was running.
+                // Do not resurrect stale ratios or paths into the open board.
+                continue;
+            };
+            if let Some(thumbnail) = image.thumbnail
+                && asset.thumbnail != thumbnail
+            {
+                asset.thumbnail = thumbnail;
+                assets_changed = true;
+            }
+            let sprite = image.sprite.unwrap_or_else(|| asset.thumbnail.clone());
+            if asset.sprite != sprite {
+                asset.sprite = sprite;
+                assets_changed = true;
             }
             if let Some(ratio) = image.ratio
                 && self.image_ratios.insert(image.url, ratio) != Some(ratio)
             {
-                changed = true;
+                layout_changed = true;
             }
         }
-        if changed {
+        if layout_changed {
             self.refresh_layout();
             cx.notify();
+        } else if assets_changed {
+            self.refresh_canvas_assets();
+            cx.notify();
         }
+    }
+
+    /// Rebuilds only cards whose resolved file paths changed. Thumbnail and
+    /// sprite arrivals do not affect card heights or tree placement, so a full
+    /// layout/minimap/connector pass here only multiplied startup work.
+    fn refresh_canvas_assets(&mut self) {
+        let Some(board) = &self.board else { return };
+        let previous = std::mem::take(&mut self.canvas_nodes);
+        let cached: HashMap<&str, &Arc<CanvasNode>> = previous
+            .iter()
+            .map(|canvas_node| (canvas_node.node.id.as_str(), canvas_node))
+            .collect();
+        let canvas_nodes = board
+            .nodes
+            .iter()
+            .map(|node| {
+                let previous = cached.get(node.id.as_str()).copied();
+                if let Some(previous) = previous
+                    && self.canvas_node_assets_are_current(previous)
+                {
+                    return Arc::clone(previous);
+                }
+                let prompt_lines = previous
+                    .filter(|previous| previous.node.prompt == node.prompt)
+                    .map(|previous| previous.prompt_lines.clone())
+                    .unwrap_or_else(|| {
+                        wrap_prompt(&node.prompt, PROMPT_WRAP_COLUMNS)
+                            .into_iter()
+                            .map(SharedString::from)
+                            .collect()
+                    });
+                let output_layout = previous
+                    .map(|previous| previous.output_layout.clone())
+                    .unwrap_or_else(|| output_layout(node, &self.image_ratios));
+                Arc::new(CanvasNode::build(
+                    node,
+                    prompt_lines,
+                    output_layout,
+                    self.expanded_prompts.contains(&node.id),
+                    |url| self.canvas_image_asset(url),
+                ))
+            })
+            .collect();
+        self.canvas_nodes = Arc::new(canvas_nodes);
+        self.refresh_overlay_data();
     }
 
     /// Whether a cached card still points at the files the app would resolve
@@ -686,14 +851,15 @@ impl AppView {
         }
         let board = self.engine.repository().create_board()?;
         self.board_id = Some(board.id.clone());
-        self.board = Some(board.clone());
+        self.board = self.engine.repository().board_snapshot(&board.id);
         Ok(board.id)
     }
 
     pub(super) fn open_board(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.clear_render_caches(window, cx);
+        self.reset_image_metadata();
         self.board_id = Some(id.clone());
-        self.board = self.engine.repository().board(&id);
+        self.board = self.engine.repository().board_snapshot(&id);
         self.overlay = Overlay::None;
         self.target = None;
         self.expanded_prompts.clear();
@@ -701,6 +867,8 @@ impl AppView {
         self.camera_x = 80.;
         self.camera_y = 90.;
         self.zoom = 1.;
+        self.zoom_settled = true;
+        self.zoom_settle_task.take();
         self.refresh_image_metadata(cx);
         self.refresh_layout();
         window.focus(&self.focus, cx);
@@ -800,6 +968,9 @@ impl Render for AppView {
             .as_ref()
             .is_none_or(|board| board.nodes.is_empty());
         let overlay_covers_canvas = matches!(self.overlay, Overlay::Gallery | Overlay::Lightbox(_));
+        if empty || overlay_covers_canvas {
+            self.sync_running_tick(false, cx);
+        }
         let mut root = div()
             .image_cache(self.image_cache.clone())
             .id("codex-image-app")

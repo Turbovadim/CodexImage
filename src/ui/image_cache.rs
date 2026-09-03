@@ -6,8 +6,8 @@
 //! buffers and GPU atlas entries when the decoded-byte budget is exceeded.
 
 use gpui::{
-    App, Asset, Context, Image, ImageCache, ImageCacheError, ImageCacheItem, ImgResourceLoader,
-    RenderImage, Resource, Task, WeakEntity, Window,
+    App, Asset, Context, EntityId, Image, ImageCache, ImageCacheError, ImageCacheItem,
+    ImgResourceLoader, RenderImage, Resource, Task, WeakEntity, Window,
 };
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -21,9 +21,13 @@ use std::time::{Duration, Instant};
 pub const DECODED_IMAGE_CACHE_BUDGET: usize = 96 * 1024 * 1024;
 const DECODED_IMAGE_CACHE_MAX_ITEMS: usize = 1_024;
 // Large enough that a whole board of small far-zoom sprites stays resident;
-// a full zoom-out otherwise evicts and re-rasterizes hundreds of cards.
-pub const CARD_SPRITE_CACHE_BUDGET: usize = 32 * 1024 * 1024;
-const CARD_SPRITE_CACHE_MAX_ITEMS: usize = 4_096;
+// a full zoom-out otherwise evicts and re-rasterizes hundreds of cards. The
+// smallest tier costs ~75 KB per 800 px card, so this holds roughly 600 of them.
+pub const CARD_SPRITE_CACHE_BUDGET: usize = 48 * 1024 * 1024;
+// Two full 424-card tiers fit, including the previous tier used while a new
+// zoom level rasterizes. A higher cap retained completed-but-not-yet-observed
+// GPUI assets whose decoded bytes could not be accounted here.
+const CARD_SPRITE_CACHE_MAX_ITEMS: usize = 1_024;
 
 // Every eviction cycle forces two full-window redraws. When the visible set
 // alone exceeds the budget nothing can be evicted, so uncapped cycles become
@@ -46,8 +50,8 @@ struct DecodeKey {
 
 /// GPUI's stock loader decodes files at native size. This wrapper downscales
 /// oversized decodes so a huge attachment costs display-sized memory instead
-/// of native-sized memory. The full decode still exists transiently, but only
-/// the capped copy is cached and uploaded to the Metal atlas.
+/// of native-sized memory. ImageIO avoids the native buffer for oversized
+/// static images on macOS; other formats only retain the capped copy.
 enum CappedImageLoader {}
 
 impl Asset for CappedImageLoader {
@@ -67,6 +71,23 @@ impl Asset for CappedImageLoader {
             {
                 return Ok(Arc::new(image));
             }
+
+            // ImageIO can create a capped thumbnail without materializing the
+            // native pixel buffer. Pure-Rust decode remains faster for images
+            // near the target size, but an 8K source otherwise peaks at its
+            // full hundreds-of-megabytes buffer plus the resized output.
+            #[cfg(target_os = "macos")]
+            if let Resource::Path(path) = &source.resource
+                && prefers_direct_imageio(path, source.max_dimension)
+                && let Ok(bytes) = std::fs::read(path)
+                && let Some(image) =
+                    super::imageio::decode_render_image(bytes, source.max_dimension)
+            {
+                let image = Arc::new(image);
+                super::disk_cache::store(path, source.max_dimension, &image);
+                return Ok(image);
+            }
+
             let decoded = match load.await {
                 Ok(image) => Ok(match source.max_dimension {
                     Some(max_dimension) => downscale_to_fit(image, max_dimension),
@@ -80,7 +101,7 @@ impl Asset for CappedImageLoader {
                     if let Resource::Path(path) = &source.resource
                         && let Ok(bytes) = std::fs::read(path)
                         && let Some(image) =
-                            super::imageio::decode_render_image(&bytes, source.max_dimension)
+                            super::imageio::decode_render_image(bytes, source.max_dimension)
                     {
                         Ok(Arc::new(image))
                     } else {
@@ -98,42 +119,85 @@ impl Asset for CappedImageLoader {
     }
 }
 
-/// Returns the image unchanged when its long edge already fits within `max`;
-/// otherwise resizes the frame down to it. Animations pass through untouched
-/// because per-frame delays are not reachable through `RenderImage`.
-fn downscale_to_fit(image: Arc<RenderImage>, max: u32) -> Arc<RenderImage> {
-    if image.frame_count() != 1 {
-        return image;
+#[cfg(target_os = "macos")]
+fn prefers_direct_imageio(path: &std::path::Path, max_dimension: Option<u32>) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    if extension
+        .as_deref()
+        .is_some_and(|extension| matches!(extension, "heic" | "heif" | "hif"))
+    {
+        // GPUI has no decoder for these, so going straight to ImageIO avoids
+        // reading the entire file once just to discover that fact.
+        return true;
     }
-    let size = image.size(0);
-    let (width, height) = (size.width.0 as u32, size.height.0 as u32);
-    if width == 0 || height == 0 || width.max(height) <= max {
-        return image;
-    }
-    let Some(buffer) = image
-        .as_bytes(0)
-        .and_then(|bytes| image::RgbaImage::from_raw(width, height, bytes.to_vec()))
-    else {
-        return image;
+    let Some(max_dimension) = max_dimension else {
+        return false;
     };
-    let scale = max as f32 / width.max(height) as f32;
-    let scaled_width = ((width as f32 * scale).round() as u32).max(1);
-    let scaled_height = ((height as f32 * scale).round() as u32).max(1);
-    // The BGRA channel order survives resizing: every filter works per channel.
-    let resized = image::imageops::resize(
-        &buffer,
-        scaled_width,
-        scaled_height,
-        image::imageops::FilterType::CatmullRom,
-    );
-    Arc::new(RenderImage::new(vec![image::Frame::new(resized)]))
+    // Animated formats stay in GPUI's decoder so frame delays and all frames
+    // survive. SVG also stays in its renderer. These are the common static
+    // formats for which ImageIO's thumbnail path is behaviorally equivalent.
+    let supported_static = extension.as_deref().is_some_and(|extension| {
+        matches!(extension, "png" | "jpg" | "jpeg" | "tif" | "tiff" | "bmp")
+    });
+    supported_static
+        && image::image_dimensions(path)
+            .is_ok_and(|(width, height)| width.max(height) > max_dimension.saturating_mul(2))
+}
+
+/// Returns the image unchanged when every frame already fits within `max`;
+/// otherwise resizes oversized frames and preserves their delays.
+fn downscale_to_fit(image: Arc<RenderImage>, max: u32) -> Arc<RenderImage> {
+    if image.frame_count() == 0
+        || (0..image.frame_count()).all(|index| {
+            let size = image.size(index);
+            (size.width.0 as u32).max(size.height.0 as u32) <= max
+        })
+    {
+        return image;
+    }
+
+    let mut frames = Vec::with_capacity(image.frame_count());
+    for index in 0..image.frame_count() {
+        let size = image.size(index);
+        let (width, height) = (size.width.0 as u32, size.height.0 as u32);
+        let Some(bytes) = image.as_bytes(index) else {
+            return image;
+        };
+        let Some(buffer) =
+            image::ImageBuffer::<image::Rgba<u8>, &[u8]>::from_raw(width, height, bytes)
+        else {
+            return image;
+        };
+        let resized = if width == 0 || height == 0 || width.max(height) <= max {
+            image::RgbaImage::from_raw(width, height, bytes.to_vec())
+                .expect("the borrowed image buffer already validated its length")
+        } else {
+            let scale = max as f32 / width.max(height) as f32;
+            let scaled_width = ((width as f32 * scale).round() as u32).max(1);
+            let scaled_height = ((height as f32 * scale).round() as u32).max(1);
+            // The BGRA channel order survives resizing: every filter works per channel.
+            image::imageops::resize(
+                &buffer,
+                scaled_width,
+                scaled_height,
+                image::imageops::FilterType::CatmullRom,
+            )
+        };
+        frames.push(image::Frame::from_parts(resized, 0, 0, image.delay(index)));
+    }
+    Arc::new(RenderImage::new(frames))
 }
 
 struct CacheEntry {
     image: ImageCacheItem,
     decoded_bytes: usize,
     last_used: u64,
-    _notification: Task<()>,
+    load_serial: u64,
+    notify_targets: Vec<EntityId>,
+    _notification: Option<Task<()>>,
 }
 
 struct EvictionCycle<K> {
@@ -181,10 +245,12 @@ impl<K: Clone + Eq + Hash> EvictionCycle<K> {
         if !self.scheduled || self.generation != generation {
             return None;
         }
-        let visible = std::mem::take(&mut self.used);
-        self.last_visible = visible.clone();
         self.scheduled = false;
-        Some(visible)
+        Some(std::mem::take(&mut self.used))
+    }
+
+    fn remember_visible(&mut self, visible: HashSet<K>) {
+        self.last_visible = visible;
     }
 
     fn cancel(&mut self) {
@@ -247,8 +313,8 @@ trait Weighted: 'static + Sized {
     fn budget(&mut self) -> &mut Budget<Self::Key>;
     fn budget_ref(&self) -> &Budget<Self::Key>;
     fn item_count(&self) -> usize;
-    /// The least-recently-used key that `protected` does not cover.
-    fn oldest_unprotected(&self, protected: &HashSet<Self::Key>) -> Option<Self::Key>;
+    /// Every unprotected key, ordered least-recently-used first.
+    fn eviction_candidates(&self, protected: &HashSet<Self::Key>) -> Vec<Self::Key>;
     fn release(&mut self, key: &Self::Key, window: Option<&mut Window>, cx: &mut App);
     /// A handle the deferred eviction frames can come back through.
     fn weak_self(&self) -> WeakEntity<Self>;
@@ -306,6 +372,7 @@ trait Weighted: 'static + Sized {
                             cache.budget().backoff =
                                 Some(Instant::now() + SATURATED_EVICTION_SPACING);
                         }
+                        cache.budget().cycle.remember_visible(visible);
                     });
                 });
             });
@@ -319,12 +386,12 @@ trait Weighted: 'static + Sized {
         cx: &mut App,
     ) -> bool {
         let mut evicted = false;
-        while self.over_limit() {
-            // A single image can be larger than the budget. Keep it, because
-            // refusing to cache it would start a new decode on every frame.
-            let Some(oldest) = self.oldest_unprotected(protected) else {
+        // Selecting the minimum from the whole map for every removal made a
+        // large trim quadratic. Sort candidates once, then release linearly.
+        for oldest in self.eviction_candidates(protected) {
+            if !self.over_limit() {
                 break;
-            };
+            }
             self.release(&oldest, Some(window), cx);
             evicted = true;
         }
@@ -347,6 +414,9 @@ pub(super) struct DecodedImageCache {
     /// generations. Each one lives and dies with its base entry.
     blurred: HashMap<DecodeKey, Blurred>,
     budget: Budget<DecodeKey>,
+    next_load_serial: u64,
+    pending_notifications: HashSet<EntityId>,
+    notification_scheduled: bool,
     weak_self: WeakEntity<Self>,
 }
 
@@ -365,12 +435,15 @@ impl Weighted for DecodedImageCache {
         self.entries.len()
     }
 
-    fn oldest_unprotected(&self, protected: &HashSet<DecodeKey>) -> Option<DecodeKey> {
-        self.entries
+    fn eviction_candidates(&self, protected: &HashSet<DecodeKey>) -> Vec<DecodeKey> {
+        let mut candidates: Vec<_> = self
+            .entries
             .iter()
             .filter(|(key, _)| !protected.contains(*key))
-            .min_by_key(|(_, entry)| entry.last_used)
-            .map(|(key, _)| key.clone())
+            .map(|(key, entry)| (entry.last_used, key.clone()))
+            .collect();
+        candidates.sort_unstable_by_key(|(last_used, _)| *last_used);
+        candidates.into_iter().map(|(_, key)| key).collect()
     }
 
     fn weak_self(&self) -> WeakEntity<Self> {
@@ -404,6 +477,9 @@ impl DecodedImageCache {
             entries: HashMap::new(),
             blurred: HashMap::new(),
             budget: Budget::new(byte_budget, DECODED_IMAGE_CACHE_MAX_ITEMS),
+            next_load_serial: 0,
+            pending_notifications: HashSet::new(),
+            notification_scheduled: false,
             weak_self: cx.weak_entity(),
         }
     }
@@ -424,6 +500,21 @@ impl DecodedImageCache {
             window,
             cx,
         )
+    }
+
+    /// Starts a capped neighbor decode without treating it as visible, keeping
+    /// it fresh on every render, or notifying the window when it completes.
+    pub fn prefetch(&mut self, resource: &Resource, window: &mut Window, cx: &mut App) {
+        let key = DecodeKey {
+            resource: resource.clone(),
+            max_dimension: Some(DECODED_LONG_EDGE_CAP),
+        };
+        if self.entries.contains_key(&key) {
+            return;
+        }
+        let last_used = self.budget.tick();
+        self.start_load(key.clone(), last_used, None, window, cx);
+        self.schedule_eviction(&key, true, window);
     }
 
     /// Loads the native-resolution decode. Only the lightbox asks for this,
@@ -451,6 +542,7 @@ impl DecodedImageCache {
         cx: &mut App,
     ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
         let last_used = self.record_use(key.clone());
+        let target = window.current_view();
 
         if self.entries.contains_key(&key) {
             let (result, added_bytes) = {
@@ -460,6 +552,9 @@ impl DecodedImageCache {
                     .expect("the cache entry was just found");
                 entry.last_used = last_used;
                 let was_loading = matches!(entry.image, ImageCacheItem::Loading(_));
+                if was_loading && !entry.notify_targets.contains(&target) {
+                    entry.notify_targets.push(target);
+                }
                 let result = entry.image.get();
                 let added_bytes = if was_loading {
                     result
@@ -470,8 +565,11 @@ impl DecodedImageCache {
                 } else {
                     0
                 };
-                if was_loading {
+                if was_loading && result.is_some() {
                     entry.decoded_bytes = added_bytes;
+                    // This render observed the result directly, so the waiter
+                    // does not need to invalidate it again.
+                    entry.notify_targets.clear();
                 }
                 (result, added_bytes)
             };
@@ -480,26 +578,104 @@ impl DecodedImageCache {
             return result;
         }
 
+        self.start_load(key.clone(), last_used, Some(target), window, cx);
+        self.schedule_eviction(&key, true, window);
+        None
+    }
+
+    fn start_load(
+        &mut self,
+        key: DecodeKey,
+        last_used: u64,
+        target: Option<EntityId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         let (task, _) = cx.fetch_asset::<CappedImageLoader>(&key);
-        let entity = window.current_view();
-        let notification_task = task.clone();
-        let notification = window.spawn(cx, async move |cx| {
-            let _ = notification_task.await;
-            cx.on_next_frame(move |_, cx| {
-                cx.notify(entity);
-            });
-        });
+        self.next_load_serial = self.next_load_serial.wrapping_add(1);
+        let load_serial = self.next_load_serial;
         self.entries.insert(
             key.clone(),
             CacheEntry {
                 image: ImageCacheItem::Loading(task.clone()),
                 decoded_bytes: 0,
                 last_used,
-                _notification: notification,
+                load_serial,
+                notify_targets: target.into_iter().collect(),
+                _notification: None,
             },
         );
-        self.schedule_eviction(&key, true, window);
-        None
+
+        let notification_task = task.clone();
+        let cache = self.weak_self.clone();
+        let completed_key = key.clone();
+        let notification = window.spawn(cx, async move |cx| {
+            let result = notification_task.await;
+            let _ = cx.update(|window, app| {
+                let _ = cache.update(app, |cache, _| {
+                    let Some((added_bytes, targets)) =
+                        cache.complete_load(&completed_key, load_serial, result)
+                    else {
+                        return;
+                    };
+                    cache.schedule_eviction(&completed_key, added_bytes > 0, window);
+                    cache.queue_notifications(targets, window);
+                });
+            });
+        });
+        if let Some(entry) = self.entries.get_mut(&key)
+            && entry.load_serial == load_serial
+        {
+            entry._notification = Some(notification);
+        }
+    }
+
+    /// Accounts a result as soon as its background task completes. Without
+    /// this, a decode that became invisible before its next paint retained CPU
+    /// and GPU memory while reporting zero bytes to the eviction budget.
+    fn complete_load(
+        &mut self,
+        key: &DecodeKey,
+        load_serial: u64,
+        result: Result<Arc<RenderImage>, ImageCacheError>,
+    ) -> Option<(usize, Vec<EntityId>)> {
+        let entry = self.entries.get_mut(key)?;
+        if entry.load_serial != load_serial || !matches!(entry.image, ImageCacheItem::Loading(_)) {
+            return None;
+        }
+        let decoded_bytes = result
+            .as_ref()
+            .ok()
+            .map(|image| decoded_image_bytes(image))
+            .unwrap_or(0);
+        entry.image = ImageCacheItem::Loaded(result);
+        entry.decoded_bytes = decoded_bytes;
+        let targets = std::mem::take(&mut entry.notify_targets);
+        self.budget.add_bytes(decoded_bytes);
+        Some((decoded_bytes, targets))
+    }
+
+    fn queue_notifications(&mut self, targets: Vec<EntityId>, window: &mut Window) {
+        if targets.is_empty() {
+            return;
+        }
+        self.pending_notifications.extend(targets);
+        if self.notification_scheduled {
+            return;
+        }
+        self.notification_scheduled = true;
+        let cache = self.weak_self.clone();
+        window.on_next_frame(move |_, cx| {
+            let targets = cache
+                .update(cx, |cache, _| {
+                    cache.notification_scheduled = false;
+                    std::mem::take(&mut cache.pending_notifications)
+                })
+                .unwrap_or_default();
+            for target in targets {
+                cx.notify(target);
+            }
+        });
     }
 
     /// Loads the heavily blurred stand-in for an image. The base image decode
@@ -535,24 +711,24 @@ impl DecodedImageCache {
                 .background_executor()
                 .spawn(async move { blur_render_image(&base) })
                 .await;
-            let stored = cache
-                .update(cx, |cache, _| {
+            let _ = cx.update(|window, app| {
+                let _ = cache.update(app, |cache, _| {
                     // The base entry may have been evicted while this ran, in
                     // which case the stand-in has nothing left to stand in for.
                     let Some(blurred) = blurred.filter(|_| cache.entries.contains_key(&pending))
                     else {
                         cache.blurred.remove(&pending);
-                        return false;
+                        return;
                     };
                     let blurred = Arc::new(blurred);
                     cache.budget.add_bytes(decoded_image_bytes(&blurred));
-                    cache.blurred.insert(pending, Blurred::Ready(blurred));
-                    true
-                })
-                .unwrap_or(false);
-            if stored {
-                cx.on_next_frame(move |_, cx| cx.notify(view));
-            }
+                    cache
+                        .blurred
+                        .insert(pending.clone(), Blurred::Ready(blurred));
+                    cache.schedule_eviction(&pending, true, window);
+                    cache.queue_notifications(vec![view], window);
+                });
+            });
         });
         self.blurred.insert(key, Blurred::Pending { _task: task });
         None
@@ -572,6 +748,8 @@ impl DecodedImageCache {
         let released = !entries.is_empty() || !blurred.is_empty();
         self.budget.decoded_bytes = 0;
         self.budget.cycle.cancel();
+        self.budget.backoff = None;
+        self.pending_notifications.clear();
         for (_, blurred) in blurred {
             if let Blurred::Ready(image) = blurred {
                 cx.drop_image(image, window.as_deref_mut());
@@ -587,12 +765,11 @@ impl DecodedImageCache {
     }
 }
 
-/// Applies a true Gaussian convolution to the sprite thumbnail at its native
-/// resolution. Processing stays in premultiplied linear-light floats until the
-/// final BGRA8 conversion so translucent edges and dark gradients stay clean.
+/// Applies a true Gaussian convolution to a sprite-sized copy. Processing
+/// stays in premultiplied linear-light floats until the final BGRA8 conversion
+/// so translucent edges and dark gradients stay clean.
 fn blur_render_image(image: &RenderImage) -> Option<RenderImage> {
-    // Sprite thumbnails have a 320 px long edge. Scaling sigma with the input
-    // keeps the same apparent blur for genuinely smaller source images.
+    const MAX_BLUR_DIMENSION: u32 = 320;
     const BLUR_SIGMA_AT_320_PX: f32 = 14.0;
 
     let size = image.size(0);
@@ -601,15 +778,39 @@ fn blur_render_image(image: &RenderImage) -> Option<RenderImage> {
         return None;
     }
     let pixels = image.as_bytes(0)?;
-    if pixels.len() != width as usize * height as usize * 4 {
+    if width
+        .checked_mul(height)?
+        .checked_mul(4)
+        .is_none_or(|expected| expected as usize != pixels.len())
+    {
         return None;
     }
+    // A missing sprite thumbnail can briefly send a 1080 px thumbnail or a
+    // capped original here. Shrink before converting to four-float pixels and
+    // running the convolution, whose cost grows with pixel count and sigma.
+    let scaled = if width.max(height) > MAX_BLUR_DIMENSION {
+        let source = image::ImageBuffer::<image::Rgba<u8>, &[u8]>::from_raw(width, height, pixels)?;
+        let scale = MAX_BLUR_DIMENSION as f32 / width.max(height) as f32;
+        Some(image::imageops::resize(
+            &source,
+            ((width as f32 * scale).round() as u32).max(1),
+            ((height as f32 * scale).round() as u32).max(1),
+            image::imageops::FilterType::Triangle,
+        ))
+    } else {
+        None
+    };
+    let (work_width, work_height, pixels) = if let Some(scaled) = &scaled {
+        (scaled.width(), scaled.height(), scaled.as_raw().as_slice())
+    } else {
+        (width, height, pixels)
+    };
     // RenderImage stores straight-alpha BGRA. The image operations are
     // channel-agnostic, so BGR order is harmless, but interpolation and blur
     // require premultiplied alpha to avoid colored transparent pixels bleeding
     // into their neighbors.
-    let buffer = image::Rgba32FImage::from_fn(width, height, |x, y| {
-        let index = (y as usize * width as usize + x as usize) * 4;
+    let buffer = image::Rgba32FImage::from_fn(work_width, work_height, |x, y| {
+        let index = (y as usize * work_width as usize + x as usize) * 4;
         let alpha = pixels[index + 3] as f32 / 255.0;
         image::Rgba([
             srgb_to_linear(pixels[index]) * alpha,
@@ -618,9 +819,9 @@ fn blur_render_image(image: &RenderImage) -> Option<RenderImage> {
             alpha,
         ])
     });
-    let sigma = (width.max(height) as f32 * BLUR_SIGMA_AT_320_PX / 320.0).max(0.8);
+    let sigma = (work_width.max(work_height) as f32 * BLUR_SIGMA_AT_320_PX / 320.0).max(0.8);
     let blurred = image::imageops::blur(&buffer, sigma);
-    let output = image::RgbaImage::from_fn(width, height, |x, y| {
+    let output = image::RgbaImage::from_fn(work_width, work_height, |x, y| {
         let pixel = blurred.get_pixel(x, y).0;
         let alpha = pixel[3].clamp(0.0, 1.0);
         let inverse_alpha = if alpha > f32::EPSILON {
@@ -702,12 +903,18 @@ impl Weighted for CardSpriteCache {
         self.entries.len()
     }
 
-    fn oldest_unprotected(&self, protected: &HashSet<u64>) -> Option<u64> {
-        self.entries
+    fn eviction_candidates(&self, protected: &HashSet<u64>) -> Vec<u64> {
+        let mut candidates: Vec<_> = self
+            .entries
             .iter()
             .filter(|(image_id, _)| !protected.contains(*image_id))
-            .min_by_key(|(_, entry)| entry.last_used)
-            .map(|(image_id, _)| *image_id)
+            .map(|(image_id, entry)| (entry.last_used, *image_id))
+            .collect();
+        candidates.sort_unstable_by_key(|(last_used, _)| *last_used);
+        candidates
+            .into_iter()
+            .map(|(_, image_id)| image_id)
+            .collect()
     }
 
     fn weak_self(&self) -> WeakEntity<Self> {
@@ -749,6 +956,7 @@ impl CardSpriteCache {
         let image_id = source.id();
         let last_used = self.record_use(image_id);
 
+        let mut inserted = false;
         if let Some(entry) = self.entries.get_mut(&image_id) {
             entry.last_used = last_used;
             if let Some(rendered) = &entry.rendered {
@@ -757,6 +965,7 @@ impl CardSpriteCache {
                 return Some(rendered);
             }
         } else {
+            inserted = true;
             self.entries.insert(
                 image_id,
                 SpriteEntry {
@@ -766,6 +975,11 @@ impl CardSpriteCache {
                     last_used,
                 },
             );
+        }
+        // Pending GPUI assets have no decoded byte count yet, so the item cap
+        // must be enforced even when `use_render_image` returns `None` below.
+        if inserted {
+            self.schedule_eviction(&image_id, true, window);
         }
 
         let rendered = source.use_render_image(window, cx)?;
@@ -789,20 +1003,23 @@ impl CardSpriteCache {
         Some(rendered)
     }
 
-    pub fn clear(&mut self, window: &mut Window, cx: &mut App) {
-        self.release_all(Some(window), cx);
+    pub fn clear(&mut self, window: &mut Window, cx: &mut App) -> bool {
+        self.release_all(Some(window), cx)
     }
 
-    fn release_all(&mut self, mut window: Option<&mut Window>, cx: &mut App) {
+    fn release_all(&mut self, mut window: Option<&mut Window>, cx: &mut App) -> bool {
         let entries = std::mem::take(&mut self.entries);
+        let released = !entries.is_empty();
         self.budget.decoded_bytes = 0;
         self.budget.cycle.cancel();
+        self.budget.backoff = None;
         for (_, entry) in entries {
             entry.source.remove_asset(cx);
             if let Some(rendered) = entry.rendered {
                 cx.drop_image(rendered, window.as_deref_mut());
             }
         }
+        released
     }
 }
 
@@ -815,6 +1032,8 @@ fn decoded_image_bytes(image: &RenderImage) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    use super::prefers_direct_imageio;
     use super::{EvictionCycle, blur_render_image, decoded_image_bytes, downscale_to_fit};
     use gpui::RenderImage;
     use std::sync::Arc;
@@ -834,10 +1053,17 @@ mod tests {
         let untouched = downscale_to_fit(small.clone(), 2048);
         assert_eq!(untouched.id, small.id);
 
-        let frame = image::Frame::new(image::RgbaImage::new(4000, 1000));
+        let delay = image::Delay::from_numer_denom_ms(80, 1);
+        let frame = image::Frame::from_parts(image::RgbaImage::new(4000, 1000), 0, 0, delay);
         let animated = Arc::new(RenderImage::new(vec![frame.clone(), frame]));
-        let untouched = downscale_to_fit(animated.clone(), 2048);
-        assert_eq!(untouched.id, animated.id);
+        let capped = downscale_to_fit(animated.clone(), 2048);
+        assert_ne!(capped.id, animated.id);
+        assert_eq!(capped.frame_count(), 2);
+        assert_eq!(
+            (capped.size(1).width.0, capped.size(1).height.0),
+            (2048, 512)
+        );
+        assert_eq!(capped.delay(1).numer_denom_ms(), delay.numer_denom_ms());
     }
 
     #[test]
@@ -873,6 +1099,46 @@ mod tests {
     }
 
     #[test]
+    fn gaussian_blur_bounds_oversized_fallback_inputs_before_convolution() {
+        let source = RenderImage::new(vec![image::Frame::new(image::RgbaImage::new(1280, 640))]);
+        let blurred = blur_render_image(&source).expect("blurred stand-in");
+
+        assert_eq!(
+            (blurred.size(0).width.0, blurred.size(0).height.0),
+            (320, 160)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn imageio_downsample_threshold_excludes_small_and_animated_sources() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let oversized = directory.path().join("oversized.png");
+        image::RgbaImage::new(5000, 10)
+            .save(&oversized)
+            .expect("oversized png");
+        let near_cap = directory.path().join("near-cap.png");
+        image::RgbaImage::new(4000, 10)
+            .save(&near_cap)
+            .expect("near-cap png");
+
+        assert!(prefers_direct_imageio(&oversized, Some(2048)));
+        assert!(!prefers_direct_imageio(&near_cap, Some(2048)));
+        assert!(!prefers_direct_imageio(
+            &directory.path().join("animated.gif"),
+            Some(2048)
+        ));
+        assert!(!prefers_direct_imageio(
+            &directory.path().join("vector.svg"),
+            Some(2048)
+        ));
+        assert!(prefers_direct_imageio(
+            &directory.path().join("photo.heic"),
+            None
+        ));
+    }
+
+    #[test]
     fn eviction_cycle_collects_a_complete_visible_set() {
         let mut cycle = EvictionCycle::default();
         assert!(cycle.should_start(true, &7, true));
@@ -883,10 +1149,11 @@ mod tests {
         cycle.record(8);
         cycle.record(7);
 
-        assert_eq!(
-            cycle.finish_collection(generation),
-            Some([7, 8].into_iter().collect())
-        );
+        let visible = cycle
+            .finish_collection(generation)
+            .expect("completed collection");
+        assert_eq!(visible, [7, 8].into_iter().collect());
+        cycle.remember_visible(visible);
         assert!(!cycle.should_start(true, &7, false));
         assert!(cycle.should_start(true, &9, false));
     }

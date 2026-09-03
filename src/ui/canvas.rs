@@ -1,7 +1,9 @@
 //! Painting the infinite canvas: the dot grid, the dashed parent connectors,
 //! and each visible card (as a cached sprite when one is ready).
 
-use super::card::{CanvasNode, CardImageFit, CardPrimitive, CardRect, CardScene};
+use super::card::{
+    CARD_SPRITE_WIDTHS, CanvasNode, CardImageFit, CardPrimitive, CardRect, CardScene,
+};
 use super::image_cache::{CardSpriteCache, DecodedImageCache};
 use super::theme;
 use crate::layout::CARD_WIDTH;
@@ -27,6 +29,9 @@ const GRID_COLOR_BGRA: [u8; 3] = [0x2d, 0x22, 0x1e];
 const GRID_MIN_SCREEN_GAP: f32 = 22.;
 const GRID_MAX_DENSITY_STEP: f32 = 1_024.;
 pub const VIEWPORT_CULL_MARGIN: f32 = 96.;
+/// Smooth a large first frame over a few bounded frames instead of encoding
+/// every newly visible SVG source in one application-thread burst.
+pub const MAX_SPRITE_SOURCE_BUILDS_PER_FRAME: usize = 24;
 const CONNECTOR_STROKE_WIDTH: f32 = 1.6;
 const CONNECTOR_DASH_LENGTH: f32 = 7.;
 const CONNECTOR_GAP_LENGTH: f32 = 5.;
@@ -254,9 +259,9 @@ impl ConnectorStyle {
     fn for_zoom(zoom: f32) -> Self {
         debug_assert!(zoom > 0.);
         Self {
-            stroke_width: CONNECTOR_STROKE_WIDTH * zoom,
-            dash_length: CONNECTOR_DASH_LENGTH * zoom,
-            gap_length: CONNECTOR_GAP_LENGTH * zoom,
+            stroke_width: (CONNECTOR_STROKE_WIDTH * zoom).max(0.55),
+            dash_length: (CONNECTOR_DASH_LENGTH * zoom).max(2.5),
+            gap_length: (CONNECTOR_GAP_LENGTH * zoom).max(1.75),
         }
     }
 }
@@ -478,61 +483,59 @@ pub fn paint_canvas_node(
     zoom_settled: bool,
     image_cache: &Entity<DecodedImageCache>,
     sprite_cache: &Entity<CardSpriteCache>,
+    sprite_source_budget: &mut usize,
     window: &mut Window,
     cx: &mut App,
-) {
+) -> bool {
     let bounds = canvas_bounds(
         frame.screen_x,
         frame.screen_y,
         CARD_WIDTH * zoom,
         frame.height,
     );
-    let tier = if zoom <= 0.25 {
-        0
-    } else if zoom <= 0.5 {
-        1
-    } else if zoom <= 1. {
-        2
-    } else {
-        3
-    };
     // resvg implements large feGaussianBlur filters with quantized box-blur
     // passes, which become visible as contour bands over dark images. Running
     // cards are few and short-lived, so paint their shared CPU-blurred image
     // directly instead of rasterizing the blurred image into a card sprite.
-    let has_blurred_images = canvas_node
-        .scene
-        .primitives
-        .iter()
-        .any(|primitive| matches!(primitive, CardPrimitive::Image { blurred: true, .. }));
-    // While the zoom gesture is still moving, keep blitting whichever tier is
-    // already rendered instead of requesting the target tier: every tier
-    // crossing otherwise re-rasterizes each visible card's sprite, which is
-    // the gesture's dominant CPU and I/O cost. The correct tier is requested
-    // once zoom settles.
-    let previous_tier = canvas_node.last_ready_sprite_tier.load(Ordering::Relaxed) as usize;
-    let mut sprite = if !has_blurred_images
-        && !zoom_settled
-        && previous_tier < canvas_node.sprite_images.len()
-    {
-        sprite_cache.update(cx, |cache, _| {
-            cache.ready(&canvas_node.sprite_images[previous_tier], window)
-        })
-    } else {
-        None
-    };
-    if !has_blurred_images && sprite.is_none() {
-        sprite = canvas_node.sprite_images.get(tier).and_then(|image| {
-            sprite_cache.update(cx, |cache, cx| cache.load(image.clone(), window, cx))
-        });
-        if sprite.is_some() {
-            canvas_node
-                .last_ready_sprite_tier
-                .store(tier as u8, Ordering::Relaxed);
-        } else if previous_tier < canvas_node.sprite_images.len() && previous_tier != tier {
-            sprite = sprite_cache.update(cx, |cache, _| {
-                cache.ready(&canvas_node.sprite_images[previous_tier], window)
+    let tier = sprite_tier_for_zoom(zoom).filter(|_| !canvas_node.scene.has_blurred_images);
+    let mut sprite = None;
+    let mut deferred_sprite_source = false;
+    if let Some(tier) = tier {
+        // While the zoom gesture is still moving, keep blitting whichever tier
+        // is already rendered instead of requesting the target tier: every
+        // tier crossing otherwise re-rasterizes each visible card's sprite,
+        // which is the gesture's dominant CPU and I/O cost. The correct tier
+        // is requested once zoom settles.
+        let previous_tier = canvas_node.last_ready_sprite_tier.load(Ordering::Relaxed) as usize;
+        if !zoom_settled && previous_tier < CARD_SPRITE_WIDTHS.len() {
+            sprite = canvas_node
+                .ready_sprite_image(previous_tier)
+                .and_then(|image| sprite_cache.update(cx, |cache, _| cache.ready(image, window)));
+        }
+        if sprite.is_none() {
+            let source = if canvas_node.sprite_image_is_initialized(tier) {
+                canvas_node.sprite_image(tier)
+            } else if *sprite_source_budget > 0 {
+                *sprite_source_budget -= 1;
+                canvas_node.sprite_image(tier)
+            } else {
+                deferred_sprite_source = true;
+                None
+            };
+            sprite = source.and_then(|image| {
+                sprite_cache.update(cx, |cache, cx| cache.load(image, window, cx))
             });
+            if sprite.is_some() {
+                canvas_node
+                    .last_ready_sprite_tier
+                    .store(tier as u8, Ordering::Relaxed);
+            } else if previous_tier < CARD_SPRITE_WIDTHS.len() && previous_tier != tier {
+                sprite = canvas_node
+                    .ready_sprite_image(previous_tier)
+                    .and_then(|image| {
+                        sprite_cache.update(cx, |cache, _| cache.ready(image, window))
+                    });
+            }
         }
     }
     if let Some(sprite) = sprite {
@@ -544,15 +547,9 @@ pub fn paint_canvas_node(
     paint_high_resolution_card_images(frame, &canvas_node.scene, zoom, image_cache, window, cx);
 
     if let Some(status_line) = &frame.status_line {
-        // A visible running card is the only thing that keeps the canvas
-        // repainting: its elapsed-time counter and its shimmer both move every
-        // frame. Asking here — rather than from a timer that ran whether or
-        // not anything was animating — means an idle app never wakes up, and a
-        // card whose media area has not appeared yet still ticks.
-        let view = window.current_view();
-        window.on_next_frame(move |_, cx| cx.notify(view));
-
-        if let Some(media) = canvas_node.scene.generating_media {
+        if let Some(media) = canvas_node.scene.generating_media
+            && !cx.reduce_motion()
+        {
             paint_generating_shimmer(transform_card_rect(media, frame, zoom), window);
         }
         paint_canvas_text(
@@ -570,15 +567,33 @@ pub fn paint_canvas_node(
     }
 
     if frame.targeted {
-        window.paint_quad(quad(
-            bounds,
-            px(20. * zoom),
-            gpui::transparent_black(),
-            px(zoom),
-            theme::accent(),
-            BorderStyle::Solid,
-        ));
+        paint_target_outline(bounds, zoom, window);
     }
+    deferred_sprite_source
+}
+
+/// The smallest sprite tier that still covers the card's on-screen width, or
+/// `None` above the last tier, where cards are painted directly.
+fn sprite_tier_for_zoom(zoom: f32) -> Option<usize> {
+    CARD_SPRITE_WIDTHS
+        .iter()
+        .position(|width| zoom * CARD_WIDTH <= *width)
+}
+
+/// Whether the canvas is zoomed in past every sprite tier.
+fn paints_cards_directly(zoom: f32) -> bool {
+    sprite_tier_for_zoom(zoom).is_none()
+}
+
+fn paint_target_outline(bounds: Bounds<Pixels>, zoom: f32, window: &mut Window) {
+    window.paint_quad(quad(
+        bounds,
+        px(20. * zoom),
+        gpui::transparent_black(),
+        px(zoom.max(0.75)),
+        theme::accent(),
+        BorderStyle::Solid,
+    ));
 }
 
 /// One shimmer cycle across the media area, as in a skeleton placeholder. The
@@ -733,13 +748,18 @@ fn paint_card_scene(
                         radius,
                         blurred,
                     } => paint_canvas_image(
-                        // Direct painting is a transient stand-in until the
-                        // tier's sprite lands, so it always uses the small
-                        // thumbnail. Loading the full-size one for those few
-                        // frames is what used to re-read hundreds of MB of
-                        // sidecars per zoom tier crossing; sharpness at rest
-                        // comes from sprites and the high-resolution overlay.
-                        &asset.sprite,
+                        // Past the sprite tiers this is the card's resting
+                        // look, so it earns the 1080 px thumbnail; the
+                        // original takes over once even that is too small.
+                        // Within the tiers direct painting is a transient
+                        // stand-in until the sprite lands, and the tiny
+                        // thumbnail avoids re-reading hundreds of MB of
+                        // sidecars per tier crossing.
+                        if paints_cards_directly(zoom) {
+                            &asset.thumbnail
+                        } else {
+                            &asset.sprite
+                        },
                         transform_card_rect(*bounds, frame, zoom),
                         CanvasImageStyle {
                             fit: match fit {
@@ -768,6 +788,9 @@ fn paint_high_resolution_card_images(
     cx: &mut App,
 ) {
     let scale_factor = window.scale_factor();
+    if scene.max_high_resolution_dimension * zoom * scale_factor <= THUMBNAIL_MAX_DIMENSION as f32 {
+        return;
+    }
     for primitive in &scene.primitives {
         let CardPrimitive::Image {
             asset,
@@ -823,7 +846,7 @@ mod tests {
         CARD_WIDTH, CanvasConnector, CardRect, ConnectorStyle, DashCommand, GRID_COLOR_BGRA,
         GRID_GAP, GRID_MIN_SCREEN_GAP, GRID_TEXTURE_SCALE, GRID_TILE_SIZE, dot_grid_metrics,
         dot_grid_texture_pixels, edge_is_visible, image_needs_high_resolution, rect_is_visible,
-        trace_dashed_polyline,
+        sprite_tier_for_zoom, trace_dashed_polyline,
     };
     use gpui::{point, px};
 
@@ -833,6 +856,16 @@ mod tests {
         assert!(rect_is_visible(790., 590., 30., 30., 800., 600., 16.));
         assert!(!rect_is_visible(-200., 40., 100., 100., 800., 600., 16.));
         assert!(!rect_is_visible(900., 40., 30., 30., 800., 600., 16.));
+    }
+
+    #[test]
+    fn sprite_tiers_cover_far_out_zoom_and_stop_at_half_scale() {
+        assert_eq!(sprite_tier_for_zoom(0.08), Some(0));
+        assert_eq!(sprite_tier_for_zoom(0.125), Some(0));
+        assert_eq!(sprite_tier_for_zoom(0.2), Some(1));
+        assert_eq!(sprite_tier_for_zoom(0.5), Some(2));
+        assert_eq!(sprite_tier_for_zoom(0.51), None);
+        assert_eq!(sprite_tier_for_zoom(1.), None);
     }
 
     #[test]
@@ -881,9 +914,9 @@ mod tests {
         assert_eq!(
             ConnectorStyle::for_zoom(0.25),
             ConnectorStyle {
-                stroke_width: 0.4,
-                dash_length: 1.75,
-                gap_length: 1.25,
+                stroke_width: 0.55,
+                dash_length: 2.5,
+                gap_length: 1.75,
             }
         );
     }

@@ -3,7 +3,7 @@
 use crate::model::{Board, BoardNode, NodeStatus, StopReason};
 use crate::storage::now_ms;
 use gpui::ImageFormat;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 
 pub fn read_image_ratio(path: &Path) -> Option<f32> {
@@ -120,25 +120,75 @@ pub fn node_depths(board: &Board) -> HashMap<String, usize> {
     let by_id: HashMap<_, _> = board
         .nodes
         .iter()
-        .map(|node| (node.id.as_str(), node))
+        .enumerate()
+        .map(|(index, node)| (node.id.as_str(), index))
         .collect();
-    board
+    let parents: Vec<_> = board
         .nodes
         .iter()
         .map(|node| {
-            let mut depth = 0;
-            let mut current = node.parent_id.as_deref();
-            let mut seen = HashSet::new();
-            while let Some(id) = current {
-                if !seen.insert(id) {
-                    break;
-                }
-                let Some(parent) = by_id.get(id) else { break };
-                depth += 1;
-                current = parent.parent_id.as_deref();
-            }
-            (node.id.clone(), depth)
+            node.parent_id
+                .as_deref()
+                .and_then(|parent| by_id.get(parent))
+                .copied()
         })
+        .collect();
+    let mut depths = vec![None; board.nodes.len()];
+    let mut visit_generation = vec![usize::MAX; board.nodes.len()];
+    let mut visit_position = vec![0; board.nodes.len()];
+    let mut path = Vec::new();
+
+    for start in 0..board.nodes.len() {
+        if depths[start].is_some() {
+            continue;
+        }
+        path.clear();
+        let mut current = start;
+        loop {
+            if let Some(mut depth) = depths[current] {
+                while let Some(node) = path.pop() {
+                    depth += 1;
+                    depths[node] = Some(depth);
+                }
+                break;
+            }
+
+            if visit_generation[current] == start {
+                let cycle_start = visit_position[current];
+                let cycle_depth = path.len() - cycle_start;
+                for &node in &path[cycle_start..] {
+                    depths[node] = Some(cycle_depth);
+                }
+                let mut depth = cycle_depth;
+                for &node in path[..cycle_start].iter().rev() {
+                    depth += 1;
+                    depths[node] = Some(depth);
+                }
+                break;
+            }
+
+            visit_generation[current] = start;
+            visit_position[current] = path.len();
+            path.push(current);
+            let Some(parent) = parents[current] else {
+                let node = path.pop().expect("current node was just pushed");
+                depths[node] = Some(0);
+                let mut depth = 0;
+                while let Some(node) = path.pop() {
+                    depth += 1;
+                    depths[node] = Some(depth);
+                }
+                break;
+            };
+            current = parent;
+        }
+    }
+
+    board
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (node.id.clone(), depths[index].unwrap_or(0)))
         .collect()
 }
 
@@ -164,10 +214,62 @@ pub fn image_format_for_path(path: &Path) -> Option<ImageFormat> {
 
 #[cfg(test)]
 mod tests {
-    use super::single_line_excerpt;
+    use super::{node_depths, single_line_excerpt};
+    use crate::model::{Board, BoardNode, NodeStatus};
+
+    fn node(id: impl Into<String>, parent_id: Option<String>) -> BoardNode {
+        BoardNode {
+            id: id.into(),
+            parent_id,
+            prompt: String::new(),
+            aspect: "auto".into(),
+            source_images: Vec::new(),
+            attachments: Vec::new(),
+            images: Vec::new(),
+            image_labels: Vec::new(),
+            attempts: Vec::new(),
+            text: String::new(),
+            status: NodeStatus::Done,
+            error: None,
+            stop_reason: None,
+            x: None,
+            y: None,
+            created_at: 0,
+            run_started_at: None,
+            finished_at: None,
+            usage: None,
+        }
+    }
 
     #[test]
     fn single_line_excerpt_removes_line_breaks_and_limits_characters() {
         assert_eq!(single_line_excerpt("one\ntwo\rthree", 9), "one two t");
+    }
+
+    #[test]
+    fn node_depths_memoize_long_chains_and_bound_cycles() {
+        let mut nodes = Vec::with_capacity(4_099);
+        for index in 0..4_096 {
+            nodes.push(node(
+                format!("chain-{index}"),
+                (index > 0).then(|| format!("chain-{}", index - 1)),
+            ));
+        }
+        nodes.push(node("cycle-a", Some("cycle-b".into())));
+        nodes.push(node("cycle-b", Some("cycle-a".into())));
+        nodes.push(node("cycle-child", Some("cycle-a".into())));
+        let board = Board {
+            id: "board".into(),
+            title: String::new(),
+            created_at: 0,
+            nodes,
+        };
+
+        let depths = node_depths(&board);
+
+        assert_eq!(depths["chain-4095"], 4_095);
+        assert_eq!(depths["cycle-a"], 2);
+        assert_eq!(depths["cycle-b"], 2);
+        assert_eq!(depths["cycle-child"], 3);
     }
 }

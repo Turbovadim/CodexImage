@@ -38,44 +38,36 @@ pub fn next_grapheme_boundary(text: &str, offset: usize) -> usize {
 }
 
 pub fn previous_word_boundary(text: &str, offset: usize) -> usize {
-    let graphemes: Vec<_> = text
+    let mut graphemes = text
         .grapheme_indices(true)
-        .take_while(|(index, _)| *index < offset)
-        .collect();
-    let mut index = graphemes.len();
-    while index > 0 && boundary_class(graphemes[index - 1].1) == BoundaryClass::Whitespace {
-        index -= 1;
-    }
-    if index == 0 {
+        .rev()
+        .filter(|(index, _)| *index < offset)
+        .skip_while(|(_, grapheme)| boundary_class(grapheme) == BoundaryClass::Whitespace);
+    let Some((mut boundary, grapheme)) = graphemes.next() else {
         return 0;
+    };
+    let class = boundary_class(grapheme);
+    for (index, grapheme) in graphemes {
+        if boundary_class(grapheme) != class {
+            break;
+        }
+        boundary = index;
     }
-    let class = boundary_class(graphemes[index - 1].1);
-    while index > 0 && boundary_class(graphemes[index - 1].1) == class {
-        index -= 1;
-    }
-    graphemes.get(index).map_or(0, |(offset, _)| *offset)
+    boundary
 }
 
 pub fn next_word_boundary(text: &str, offset: usize) -> usize {
-    let graphemes: Vec<_> = text
+    let mut graphemes = text
         .grapheme_indices(true)
         .filter(|(index, _)| *index >= offset)
-        .collect();
-    let mut index = 0;
-    while index < graphemes.len() && boundary_class(graphemes[index].1) == BoundaryClass::Whitespace
-    {
-        index += 1;
-    }
-    if index == graphemes.len() {
+        .skip_while(|(_, grapheme)| boundary_class(grapheme) == BoundaryClass::Whitespace);
+    let Some((_, grapheme)) = graphemes.next() else {
         return text.len();
-    }
-    let class = boundary_class(graphemes[index].1);
-    while index < graphemes.len() && boundary_class(graphemes[index].1) == class {
-        index += 1;
-    }
+    };
+    let class = boundary_class(grapheme);
     graphemes
-        .get(index)
-        .map_or(text.len(), |(offset, _)| *offset)
+        .find_map(|(index, grapheme)| (boundary_class(grapheme) != class).then_some(index))
+        .unwrap_or(text.len())
 }
 
 pub fn word_range_at(text: &str, offset: usize) -> Range<usize> {

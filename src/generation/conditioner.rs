@@ -3,6 +3,7 @@
 
 use anyhow::{Context, Result};
 use image::{ColorType, DynamicImage, ImageBuffer, ImageFormat, Rgba, RgbaImage};
+use std::borrow::Cow;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -100,7 +101,12 @@ fn conditioned_image(decoded: &DynamicImage, strength: f64) -> Option<DynamicIma
         return None;
     }
 
-    let image = decoded.to_rgba8();
+    // Generated PNGs are normally RGBA8. Borrow that buffer for detection so
+    // clean images do not pay for a full-resolution copy that is thrown away.
+    let image = match decoded {
+        DynamicImage::ImageRgba8(image) => Cow::Borrowed(image),
+        _ => Cow::Owned(decoded.to_rgba8()),
+    };
     let (pattern, signal_rms) = estimate_phase_pattern(&image)?;
     if !(MIN_SIGNAL_RMS..=MAX_SIGNAL_RMS).contains(&signal_rms) {
         return None;
@@ -139,26 +145,29 @@ fn estimate_phase_pattern(image: &RgbaImage) -> Option<(PhasePattern, f64)> {
         for x in 1..width - 1 {
             let phase_y = y as usize % 2;
             let phase_x = x as usize % 2;
+            // Load each pixel once. The old per-channel iterator fetched this
+            // 3x3 neighborhood three times for every source pixel.
+            let top_left = image.get_pixel(x - 1, y - 1).0;
+            let top = image.get_pixel(x, y - 1).0;
+            let top_right = image.get_pixel(x + 1, y - 1).0;
+            let left = image.get_pixel(x - 1, y).0;
             let center = image.get_pixel(x, y).0;
-            let neighbors = [
-                (x - 1, y - 1, 1.0),
-                (x, y - 1, 2.0),
-                (x + 1, y - 1, 1.0),
-                (x - 1, y, 2.0),
-                (x, y, 4.0),
-                (x + 1, y, 2.0),
-                (x - 1, y + 1, 1.0),
-                (x, y + 1, 2.0),
-                (x + 1, y + 1, 1.0),
-            ];
+            let right = image.get_pixel(x + 1, y).0;
+            let bottom_left = image.get_pixel(x - 1, y + 1).0;
+            let bottom = image.get_pixel(x, y + 1).0;
+            let bottom_right = image.get_pixel(x + 1, y + 1).0;
             for channel in 0..3 {
-                let blurred = neighbors
-                    .iter()
-                    .map(|&(neighbor_x, neighbor_y, weight)| {
-                        f64::from(image.get_pixel(neighbor_x, neighbor_y).0[channel]) * weight
-                    })
-                    .sum::<f64>()
-                    / 16.0;
+                let blurred = f64::from(
+                    u32::from(top_left[channel])
+                        + 2 * u32::from(top[channel])
+                        + u32::from(top_right[channel])
+                        + 2 * u32::from(left[channel])
+                        + 4 * u32::from(center[channel])
+                        + 2 * u32::from(right[channel])
+                        + u32::from(bottom_left[channel])
+                        + 2 * u32::from(bottom[channel])
+                        + u32::from(bottom_right[channel]),
+                ) / 16.0;
                 sums[phase_y][phase_x][channel] += f64::from(center[channel]) - blurred;
             }
             counts[phase_y][phase_x] += 1;
@@ -194,19 +203,23 @@ fn estimate_phase_pattern(image: &RgbaImage) -> Option<(PhasePattern, f64)> {
 }
 
 fn subtract_phase_pattern(image: &RgbaImage, pattern: &PhasePattern, strength: f64) -> Rgba16Image {
+    let correction = pattern.map(|row| {
+        row.map(|phase| {
+            phase.map(|value| value.clamp(-MAX_PHASE_CORRECTION, MAX_PHASE_CORRECTION) * strength)
+        })
+    });
     Rgba16Image::from_fn(image.width(), image.height(), |x, y| {
         let source = image.get_pixel(x, y).0;
-        let phase = pattern[y as usize % 2][x as usize % 2];
-        let corrected = std::array::from_fn(|channel| {
-            let value = if channel == 3 {
-                f64::from(source[channel])
-            } else {
-                f64::from(source[channel])
-                    - phase[channel].clamp(-MAX_PHASE_CORRECTION, MAX_PHASE_CORRECTION) * strength
-            };
-            (value.clamp(0.0, 255.0) * 257.0).round() as u16
-        });
-        Rgba(corrected)
+        let phase = correction[y as usize % 2][x as usize % 2];
+        let correct = |channel: usize| {
+            ((f64::from(source[channel]) - phase[channel]).clamp(0.0, 255.0) * 257.0).round() as u16
+        };
+        Rgba([
+            correct(0),
+            correct(1),
+            correct(2),
+            u16::from(source[3]) * 257,
+        ])
     })
 }
 

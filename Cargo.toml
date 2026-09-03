@@ -1,3 +1,13 @@
+[workspace]
+members = ["."]
+# The vendored GPUI occlusion patch is its own workspace; it is consumed through
+# the `[patch]` table below rather than as a workspace member.
+exclude = [
+    "vendor/zed-gpui-occlusion/crates/gpui_apple",
+    "vendor/zed-gpui-occlusion/crates/gpui_macos",
+]
+resolver = "2"
+
 [package]
 name = "codex-image"
 version = "0.1.0"
@@ -10,8 +20,8 @@ anyhow = "1"
 async-channel = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 dirs = "6"
-gpui = { git = "https://github.com/zed-industries/zed", rev = "ba0e2a94295c99f48f00cdaa2858a29adae6f09d", package = "gpui" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "ba0e2a94295c99f48f00cdaa2858a29adae6f09d", package = "gpui_platform", features = ["font-kit"] }
+gpui = { git = "https://github.com/zed-industries/zed", rev = "ac099b4a809a564f06907125e7a536c33cb60084", package = "gpui" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "ac099b4a809a564f06907125e7a536c33cb60084", package = "gpui_platform", features = ["font-kit"] }
 image = { version = "0.25", default-features = false, features = ["avif", "bmp", "gif", "ico", "jpeg", "png", "pnm", "tiff", "webp"] }
 libc = "0.2"
 lz4_flex = "0.14.0"
@@ -23,12 +33,23 @@ unicode-segmentation = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+block = "0.1"
+cocoa = "=0.26.0"
 core-foundation = "0.10"
 core-graphics = "0.25.0"
 foreign-types = "0.5"
+objc = "0.2"
+raw-window-handle = "0.6"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Replaces GPUI's macOS platform crates with the vendored occlusion patch, which
+# tears down a fully occluded window's Metal layer and renderer-owned GPU memory.
+# Cargo only honours this table in the workspace root.
+[patch."https://github.com/zed-industries/zed"]
+gpui_apple = { path = "vendor/zed-gpui-occlusion/crates/gpui_apple" }
+gpui_macos = { path = "vendor/zed-gpui-occlusion/crates/gpui_macos" }
 
 [profile.release]
 lto = "thin"

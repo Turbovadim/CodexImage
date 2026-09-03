@@ -4,8 +4,9 @@
 use super::app::AppView;
 use super::app::Overlay;
 use super::canvas::{
-    CanvasConnector, CanvasNodeFrame, ToolbarButtonPaint, VIEWPORT_CULL_MARGIN, paint_canvas_node,
-    paint_connectors, paint_dot_grid, paint_node_toolbar, rect_is_visible,
+    CanvasConnector, CanvasNodeFrame, MAX_SPRITE_SOURCE_BUILDS_PER_FRAME, ToolbarButtonPaint,
+    VIEWPORT_CULL_MARGIN, paint_canvas_node, paint_connectors, paint_dot_grid, paint_node_toolbar,
+    rect_is_visible,
 };
 use super::card::{
     ATTACHMENT_ROW_HEIGHT, COLLAPSED_PROMPT_LINES, CanvasNode, CardRect, EXPANDED_PROMPT_LINES,
@@ -25,6 +26,7 @@ use gpui::{
     div, fill, point, prelude::*, px, size,
 };
 use std::sync::Arc;
+use std::time::Duration;
 
 pub(super) const NODE_TOOLBAR_HEIGHT: f32 = 36.;
 /// World-space toolbar metrics; everything scales with the canvas zoom so the
@@ -37,6 +39,11 @@ const MIN_ZOOM: f32 = 0.08;
 const MAX_ZOOM: f32 = 2.;
 /// How long zoom must hold still before sprites re-render for the new tier.
 const ZOOM_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+/// Shimmer does not need to track a 120 Hz display, but one-second updates are
+/// visibly stepped. A single 30 FPS coordinator keeps active cards smooth
+/// without restoring one next-frame callback per card.
+const RUNNING_ANIMATION_INTERVAL: Duration = Duration::from_millis(33);
+const REDUCED_MOTION_STATUS_INTERVAL: Duration = Duration::from_secs(1);
 const MINIMAP_WIDTH: f32 = 142.;
 const MINIMAP_HEIGHT: f32 = 96.;
 const MINIMAP_RIGHT: f32 = 18.;
@@ -277,10 +284,13 @@ impl AppView {
         let viewport = window.viewport_size();
         let width = f32::from(viewport.width) - 100.;
         let height = f32::from(viewport.height) - 150.;
+        let old_zoom = self.zoom;
         self.zoom = (width / (max_x - min_x).max(1.))
             .min(height / (max_y - min_y).max(1.))
             .clamp(MIN_ZOOM, 1.);
-        self.last_zoom_change = std::time::Instant::now();
+        if self.zoom != old_zoom {
+            self.schedule_zoom_settle(cx);
+        }
         self.camera_x =
             (f32::from(viewport.width) - (max_x - min_x) * self.zoom) / 2. - min_x * self.zoom;
         self.camera_y =
@@ -330,15 +340,27 @@ impl AppView {
     fn zoom_at(&mut self, position: Point<Pixels>, factor: f32, cx: &mut Context<Self>) {
         let old = self.zoom;
         let new = (old * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        if new == old {
+            return;
+        }
         let world_x = (f32::from(position.x) - self.camera_x) / old;
         let world_y = (f32::from(position.y) - self.camera_y) / old;
         self.camera_x = f32::from(position.x) - world_x * new;
         self.camera_y = f32::from(position.y) - world_y * new;
-        if self.zoom != new {
-            self.last_zoom_change = std::time::Instant::now();
-        }
         self.zoom = new;
+        self.schedule_zoom_settle(cx);
         cx.notify();
+    }
+
+    fn schedule_zoom_settle(&mut self, cx: &mut Context<Self>) {
+        self.zoom_settled = false;
+        self.zoom_settle_task = Some(cx.spawn(async move |weak, cx| {
+            cx.background_executor().timer(ZOOM_SETTLE_DELAY).await;
+            let _ = weak.update(cx, |view, cx| {
+                view.zoom_settled = true;
+                cx.notify();
+            });
+        }));
     }
 
     pub(super) fn locate_node(&mut self, node_id: &str, window: &Window, cx: &mut Context<Self>) {
@@ -346,15 +368,18 @@ impl AppView {
             return;
         };
         self.overlay = Overlay::None;
+        let old_zoom = self.zoom;
         self.zoom = 1.;
-        self.last_zoom_change = std::time::Instant::now();
+        if self.zoom != old_zoom {
+            self.schedule_zoom_settle(cx);
+        }
         self.camera_x =
             f32::from(window.viewport_size().width) / 2. - (position.x + CARD_WIDTH / 2.);
         self.camera_y = 100. - position.y;
         cx.notify();
     }
 
-    pub(super) fn render_canvas(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_canvas(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let viewport = window.viewport_size();
         let minimap = self.render_minimap(viewport, cx);
         let zoom_controls = self.render_zoom_controls(cx);
@@ -394,6 +419,12 @@ impl AppView {
                 })
             })
             .collect::<Vec<_>>();
+        self.sync_running_tick(
+            visible_nodes
+                .iter()
+                .any(|frame| frame.status_line.is_some()),
+            cx,
+        );
 
         let toolbar_buttons = self.hovered_node.as_deref().and_then(|hovered_id| {
             visible_nodes.iter().find_map(|frame| {
@@ -410,18 +441,12 @@ impl AppView {
         let image_cache = self.image_cache.clone();
         let sprite_cache = self.sprite_cache.clone();
         let zoom = self.zoom;
-        let zoom_settled = self.last_zoom_change.elapsed() >= ZOOM_SETTLE_DELAY;
+        let zoom_settled = self.zoom_settled;
         let camera_x = self.camera_x;
         let camera_y = self.camera_y;
         let background = canvas(
             |_, _, _| (),
             move |bounds, _, window, cx| {
-                if !zoom_settled {
-                    // Keep repainting until the settle delay elapses so the
-                    // frozen sprite tiers upgrade right after the gesture.
-                    let entity = window.current_view();
-                    window.on_next_frame(move |_, cx| cx.notify(entity));
-                }
                 paint_dot_grid(bounds, camera_x, camera_y, zoom, window);
                 paint_connectors(
                     &canvas_connectors,
@@ -432,19 +457,26 @@ impl AppView {
                     viewport_height,
                     window,
                 );
+                let mut sprite_source_budget = MAX_SPRITE_SOURCE_BUILDS_PER_FRAME;
+                let mut deferred_sprite_source = false;
                 for frame in &visible_nodes {
                     if let Some(node) = canvas_nodes.get(frame.node_index) {
-                        paint_canvas_node(
+                        deferred_sprite_source |= paint_canvas_node(
                             frame,
                             node,
                             zoom,
                             zoom_settled,
                             &image_cache,
                             &sprite_cache,
+                            &mut sprite_source_budget,
                             window,
                             cx,
                         );
                     }
+                }
+                if deferred_sprite_source {
+                    let entity = window.current_view();
+                    window.on_next_frame(move |_, cx| cx.notify(entity));
                 }
                 if let Some(buttons) = &toolbar_buttons {
                     paint_node_toolbar(buttons, zoom, window, cx);
@@ -487,6 +519,32 @@ impl AppView {
             layer = layer.child(minimap);
         }
         layer.child(zoom_controls).into_any_element()
+    }
+
+    /// Own one bounded animation clock for all visible running cards. The
+    /// render pass stops it as soon as the active card leaves the viewport.
+    pub(super) fn sync_running_tick(&mut self, active: bool, cx: &mut Context<Self>) {
+        if !active {
+            self.running_tick_task.take();
+            return;
+        }
+        if self.running_tick_task.is_some() {
+            return;
+        }
+
+        let interval = if cx.reduce_motion() {
+            REDUCED_MOTION_STATUS_INTERVAL
+        } else {
+            RUNNING_ANIMATION_INTERVAL
+        };
+        self.running_tick_task = Some(cx.spawn(async move |weak, cx| {
+            loop {
+                cx.background_executor().timer(interval).await;
+                if weak.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        }));
     }
 
     fn running_status_line(&self, node: &BoardNode, now: i64) -> SharedString {
@@ -989,7 +1047,7 @@ impl AppView {
         let drag = self.drag.take();
         if let Some(DragState::Node { id, .. }) = drag {
             if let Some(position) = self.transient_positions.remove(&id) {
-                self.on_board(cx, |this, board_id| {
+                self.on_board(cx, |this, board_id, _cx| {
                     // Pin every still-automatic card where it stands, not just
                     // the dragged one. Otherwise the tree layout re-centres the
                     // remaining cards and they flow into the space the user
@@ -1006,17 +1064,10 @@ impl AppView {
                         .collect();
                     positions.push((id.clone(), position.x, position.y));
                     this.engine.repository().move_nodes(board_id, &positions)?;
-                    // The repository confirms the move through an async event a
-                    // few frames from now; apply it to the local copy too so no
-                    // card falls back to its pre-drag layout slot.
-                    if let Some(board) = &mut this.board {
-                        for (id, x, y) in &positions {
-                            if let Some(node) = board.nodes.iter_mut().find(|node| &node.id == id) {
-                                node.x = Some(*x);
-                                node.y = Some(*y);
-                            }
-                        }
-                    }
+                    // Refresh the cheap immutable snapshot immediately so no
+                    // card falls back to its pre-drag slot while the async
+                    // repository event is still queued.
+                    this.board = this.engine.repository().board_snapshot(board_id);
                     this.refresh_layout();
                     Ok(())
                 });

@@ -3,3 +3,4 @@
 /.DS_Store
 /data
 dist
+/vendor/zed-gpui-occlusion/target

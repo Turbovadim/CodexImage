@@ -18,6 +18,7 @@ use core_graphics::geometry::{CGPoint, CGRect, CGSize};
 use core_graphics::image::CGImage;
 use foreign_types::ForeignType;
 use gpui::RenderImage;
+use std::sync::Arc;
 
 type CGImageSourceRef = core_foundation::base::CFTypeRef;
 
@@ -54,8 +55,10 @@ const BITMAP_INFO_BGRA_PREMULTIPLIED: u32 = (2 << 12) | 2;
 /// so the long edge fits it (it never upscales). Returns `None` whenever this
 /// decoder cannot reproduce what GPUI's own loader would (animations, SVG,
 /// unknown formats), signalling the caller to fall back.
-pub fn decode_render_image(bytes: &[u8], max_dimension: Option<u32>) -> Option<RenderImage> {
-    let data = CFData::from_buffer(bytes);
+pub fn decode_render_image(bytes: Vec<u8>, max_dimension: Option<u32>) -> Option<RenderImage> {
+    // `from_arc` lets ImageIO retain the file bytes without copying the whole
+    // encoded image into a second CFData allocation.
+    let data = CFData::from_arc(Arc::new(bytes));
     let source = unsafe {
         let source = CGImageSourceCreateWithData(data.as_concrete_TypeRef(), std::ptr::null());
         if source.is_null() {
@@ -112,24 +115,28 @@ pub fn decode_render_image(bytes: &[u8], max_dimension: Option<u32>) -> Option<R
     if width == 0 || height == 0 || width > u32::MAX as usize || height > u32::MAX as usize {
         return None;
     }
-    let mut context = CGContext::create_bitmap_context(
-        None,
-        width,
-        height,
-        8,
-        width * 4,
-        &CGColorSpace::create_device_rgb(),
-        BITMAP_INFO_BGRA_PREMULTIPLIED,
-    );
-    context.draw_image(
-        CGRect::new(
-            &CGPoint::new(0., 0.),
-            &CGSize::new(width as f64, height as f64),
-        ),
-        &image,
-    );
-
-    let mut pixels = context.data().to_vec();
+    let bytes_per_row = width.checked_mul(4)?;
+    let mut pixels = vec![0; bytes_per_row.checked_mul(height)?];
+    {
+        // Give Core Graphics the final Vec directly. Asking it to allocate the
+        // bitmap and then calling `data().to_vec()` doubled decoded peak memory.
+        let context = CGContext::create_bitmap_context(
+            Some(pixels.as_mut_ptr().cast()),
+            width,
+            height,
+            8,
+            bytes_per_row,
+            &CGColorSpace::create_device_rgb(),
+            BITMAP_INFO_BGRA_PREMULTIPLIED,
+        );
+        context.draw_image(
+            CGRect::new(
+                &CGPoint::new(0., 0.),
+                &CGSize::new(width as f64, height as f64),
+            ),
+            &image,
+        );
+    }
     unpremultiply(&mut pixels);
     let buffer = image::RgbaImage::from_raw(width as u32, height as u32, pixels)?;
     Some(RenderImage::new(vec![image::Frame::new(buffer)]))
@@ -171,10 +178,10 @@ mod tests {
         }
         let bytes = encoded_png(&source);
 
-        let full = decode_render_image(&bytes, None).expect("full decode");
+        let full = decode_render_image(bytes.clone(), None).expect("full decode");
         assert_eq!((full.size(0).width.0, full.size(0).height.0), (100, 50));
 
-        let capped = decode_render_image(&bytes, Some(32)).expect("capped decode");
+        let capped = decode_render_image(bytes, Some(32)).expect("capped decode");
         assert_eq!((capped.size(0).width.0, capped.size(0).height.0), (32, 16));
         // Red in BGRA order: blue channel low, red channel high.
         let pixel = &capped.as_bytes(0).expect("frame bytes")[..4];
@@ -189,7 +196,7 @@ mod tests {
         }
         let bytes = encoded_png(&source);
 
-        let decoded = decode_render_image(&bytes, None).expect("decode");
+        let decoded = decode_render_image(bytes, None).expect("decode");
         let pixel = &decoded.as_bytes(0).expect("frame bytes")[..4];
         // BGRA order, straight alpha: each channel within rounding distance.
         assert!((pixel[0] as i32 - 40).abs() <= 3, "blue was {}", pixel[0]);

@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 pub(super) struct Toast {
-    pub(super) text: String,
+    pub(super) text: SharedString,
     pub(super) error: bool,
     pub(super) undo: Option<(String, String)>,
     pub(super) serial: u64,
@@ -250,12 +250,12 @@ impl AppView {
         self.toast_serial += 1;
         let serial = self.toast_serial;
         self.toast = Some(Toast {
-            text,
+            text: text.into(),
             error,
             undo,
             serial,
         });
-        cx.spawn(async move |weak, cx| {
+        self.toast_task = Some(cx.spawn(async move |weak, cx| {
             cx.background_executor()
                 .timer(Duration::from_secs(lifetime))
                 .await;
@@ -269,8 +269,7 @@ impl AppView {
                     cx.notify();
                 }
             });
-        })
-        .detach();
+        }));
         cx.notify();
     }
 
@@ -514,10 +513,16 @@ impl AppView {
                                                 .first()
                                                 .map(|summary| summary.id.clone());
                                             this.board_id = next.clone();
-                                            this.board = next
-                                                .as_deref()
-                                                .and_then(|id| this.engine.repository().board(id));
+                                            this.board = next.as_deref().and_then(|id| {
+                                                this.engine.repository().board_snapshot(id)
+                                            });
                                             this.armed_board_delete = None;
+                                            // The selected board changed
+                                            // synchronously, so the queued
+                                            // repository event will see the
+                                            // same Arc and skip a refresh.
+                                            this.reset_image_metadata();
+                                            this.refresh_image_metadata(cx);
                                             this.refresh_layout();
                                         }
                                         Err(error) => this.show_error(error, cx),
@@ -983,7 +988,10 @@ impl AppView {
                     .child("Undo")
                     .on_click(cx.listener(move |this, _, _, cx| {
                         match this.engine.repository().undo_delete(&board_id, &undo_id) {
-                            Ok(_) => this.toast = None,
+                            Ok(_) => {
+                                this.toast = None;
+                                this.toast_task.take();
+                            }
                             Err(error) => this.show_error(error, cx),
                         }
                         cx.notify();
@@ -1004,6 +1012,7 @@ impl AppView {
                 .child("×")
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.toast = None;
+                    this.toast_task.take();
                     cx.notify();
                 })),
         )

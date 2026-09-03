@@ -1,5 +1,5 @@
 use crate::model::BoardNode;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 pub const CARD_WIDTH: f32 = 340.0;
 const H_GAP: f32 = 64.0;
@@ -40,28 +40,29 @@ pub fn compute_layout(
     heights: &HashMap<String, f32>,
 ) -> HashMap<String, Position> {
     let mut tree = Tree::new(nodes, heights);
-    let roots = tree.roots(nodes);
 
     let mut root_x = 0.0;
-    for root in &roots {
+    for root_index in 0..tree.roots.len() {
+        let root = tree.roots[root_index];
         tree.measure(root);
     }
-    for root in &roots {
+    for root_index in 0..tree.roots.len() {
+        let root = tree.roots[root_index];
         tree.place(root, root_x, 0.0);
-        if !tree.manual.contains_key(&root.id) {
-            root_x += tree.width(&root.id) + ROOT_GAP;
+        if tree.manual[root].is_none() {
+            root_x += tree.width(root) + ROOT_GAP;
         }
     }
 
-    let mut occupied: Vec<Rect> = nodes
-        .iter()
-        .filter(|node| tree.manual.contains_key(&node.id) && tree.positions.contains_key(&node.id))
-        .map(|node| tree.rect(&node.id))
+    let mut occupied: Vec<Rect> = (0..nodes.len())
+        .filter(|&node| tree.manual[node].is_some() && tree.positions[node].is_some())
+        .map(|node| tree.rect(node))
         .collect();
-    for root in &roots {
+    for root_index in 0..tree.roots.len() {
+        let root = tree.roots[root_index];
         tree.separate(root, &mut occupied);
     }
-    tree.positions
+    tree.into_positions()
 }
 
 /// Finds the nearest free column beside `anchor` for a card of `height`,
@@ -97,156 +98,179 @@ pub fn free_spot_near(anchor: Position, height: f32, occupied: &[(Position, f32)
 }
 
 struct Tree<'nodes> {
-    children: HashMap<&'nodes str, Vec<&'nodes BoardNode>>,
-    manual: HashMap<String, Position>,
-    heights: &'nodes HashMap<String, f32>,
-    widths: HashMap<String, f32>,
-    positions: HashMap<String, Position>,
-    visiting: HashSet<String>,
+    nodes: &'nodes [BoardNode],
+    children: Vec<Vec<usize>>,
+    roots: Vec<usize>,
+    manual: Vec<Option<Position>>,
+    heights: Vec<f32>,
+    widths: Vec<f32>,
+    positions: Vec<Option<Position>>,
+    visiting: Vec<bool>,
+    shift_marks: Vec<u32>,
+    shift_generation: u32,
 }
 
 impl<'nodes> Tree<'nodes> {
     fn new(nodes: &'nodes [BoardNode], heights: &'nodes HashMap<String, f32>) -> Self {
-        Self {
-            children: HashMap::new(),
-            manual: nodes
-                .iter()
-                .filter_map(|node| {
-                    Some((
-                        node.id.clone(),
-                        Position {
-                            x: node.x?,
-                            y: node.y?,
-                        },
-                    ))
-                })
-                .collect(),
-            heights,
-            widths: HashMap::new(),
-            positions: HashMap::new(),
-            visiting: HashSet::new(),
-        }
-    }
+        let node_count = nodes.len();
+        let ids: HashMap<&str, usize> = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (node.id.as_str(), index))
+            .collect();
+        let mut sorted: Vec<usize> = (0..node_count).collect();
+        sorted.sort_by_key(|&index| (nodes[index].created_at, &nodes[index].id));
 
-    /// Indexes every node under its parent and returns the nodes that have none.
-    fn roots(&mut self, nodes: &'nodes [BoardNode]) -> Vec<&'nodes BoardNode> {
-        let ids: HashSet<&str> = nodes.iter().map(|node| node.id.as_str()).collect();
-        let mut sorted: Vec<&BoardNode> = nodes.iter().collect();
-        sorted.sort_by_key(|node| (node.created_at, &node.id));
-
+        let mut children = vec![Vec::new(); node_count];
         let mut roots = Vec::new();
         for node in sorted {
-            match node
+            if let Some(parent) = nodes[node]
                 .parent_id
                 .as_deref()
-                .filter(|parent| ids.contains(parent))
+                .and_then(|parent| ids.get(parent))
+                .copied()
             {
-                Some(parent) => self.children.entry(parent).or_default().push(node),
-                None => roots.push(node),
+                children[parent].push(node);
+            } else {
+                roots.push(node);
             }
         }
-        roots
+
+        Self {
+            nodes,
+            children,
+            roots,
+            manual: nodes
+                .iter()
+                .map(|node| {
+                    Some(Position {
+                        x: node.x?,
+                        y: node.y?,
+                    })
+                })
+                .collect(),
+            heights: nodes
+                .iter()
+                .map(|node| {
+                    heights
+                        .get(node.id.as_str())
+                        .copied()
+                        .unwrap_or(ESTIMATED_CARD_HEIGHT)
+                })
+                .collect(),
+            widths: vec![CARD_WIDTH; node_count],
+            positions: vec![None; node_count],
+            visiting: vec![false; node_count],
+            shift_marks: vec![0; node_count],
+            shift_generation: 0,
+        }
     }
 
-    fn children_of(&self, node: &BoardNode) -> Vec<&'nodes BoardNode> {
-        self.children
-            .get(node.id.as_str())
-            .cloned()
-            .unwrap_or_default()
+    fn width(&self, node: usize) -> f32 {
+        self.widths[node]
     }
 
-    fn width(&self, id: &str) -> f32 {
-        self.widths.get(id).copied().unwrap_or(CARD_WIDTH)
+    fn height(&self, node: usize) -> f32 {
+        self.heights[node]
     }
 
-    fn height(&self, id: &str) -> f32 {
-        self.heights
-            .get(id)
-            .copied()
-            .unwrap_or(ESTIMATED_CARD_HEIGHT)
-    }
-
-    fn rect(&self, id: &str) -> Rect {
-        let position = self.positions.get(id).copied().unwrap_or_default();
+    fn rect(&self, node: usize) -> Rect {
+        let position = self.positions[node].unwrap_or_default();
         Rect {
             x: position.x,
             y: position.y,
             right: position.x + CARD_WIDTH,
-            bottom: position.y + self.height(id),
+            bottom: position.y + self.height(node),
         }
+    }
+
+    fn into_positions(self) -> HashMap<String, Position> {
+        let mut result = HashMap::with_capacity(self.positions.len());
+        for (index, position) in self.positions.into_iter().enumerate() {
+            if let Some(position) = position {
+                result.insert(self.nodes[index].id.clone(), position);
+            }
+        }
+        result
     }
 
     /// Records how wide each subtree is, ignoring manually placed children
     /// because they are not part of their parent's band.
-    fn measure(&mut self, node: &'nodes BoardNode) -> f32 {
-        if !self.visiting.insert(node.id.clone()) {
+    fn measure(&mut self, node: usize) -> f32 {
+        if self.visiting[node] {
             return CARD_WIDTH;
         }
-        let mut child_widths = Vec::new();
-        for child in self.children_of(node) {
+        self.visiting[node] = true;
+        let mut child_width = 0.;
+        let mut automatic_children = 0;
+        for child_index in 0..self.children[node].len() {
+            let child = self.children[node][child_index];
             let width = self.measure(child);
-            if !self.manual.contains_key(&child.id) {
-                child_widths.push(width);
+            if self.manual[child].is_none() {
+                child_width += width;
+                automatic_children += 1;
             }
         }
-        self.visiting.remove(&node.id);
+        self.visiting[node] = false;
 
-        let width = if child_widths.is_empty() {
+        let width = if automatic_children == 0 {
             CARD_WIDTH
         } else {
-            child_widths.iter().sum::<f32>() + H_GAP * (child_widths.len() - 1) as f32
+            child_width + H_GAP * (automatic_children - 1) as f32
         }
         .max(CARD_WIDTH);
-        self.widths.insert(node.id.clone(), width);
+        self.widths[node] = width;
         width
     }
 
     /// Centres `node` in the band starting at `band_x`, then lays its children
     /// out as a row underneath it.
-    fn place(&mut self, node: &'nodes BoardNode, band_x: f32, y: f32) {
-        if !self.visiting.insert(node.id.clone()) {
+    fn place(&mut self, node: usize, band_x: f32, y: f32) {
+        if self.visiting[node] {
             return;
         }
-        let position = self.manual.get(&node.id).copied().unwrap_or(Position {
-            x: band_x + self.width(&node.id) / 2.0 - CARD_WIDTH / 2.0,
+        self.visiting[node] = true;
+        let position = self.manual[node].unwrap_or(Position {
+            x: band_x + self.width(node) / 2.0 - CARD_WIDTH / 2.0,
             y,
         });
-        self.positions.insert(node.id.clone(), position);
+        self.positions[node] = Some(position);
 
-        let children = self.children_of(node);
-        let automatic: Vec<_> = children
-            .iter()
-            .filter(|child| !self.manual.contains_key(&child.id))
-            .collect();
-        let row_width = automatic
-            .iter()
-            .map(|child| self.width(&child.id))
-            .sum::<f32>()
-            + H_GAP * automatic.len().saturating_sub(1) as f32;
-        let row_y = position.y + self.height(&node.id) + V_GAP;
-        let mut x = position.x + CARD_WIDTH / 2.0 - row_width / 2.0;
-        for child in children {
-            let is_manual = self.manual.contains_key(&child.id);
-            self.place(child, x, row_y);
-            if !is_manual {
-                x += self.width(&child.id) + H_GAP;
+        let mut row_width = 0.;
+        let mut automatic_children = 0usize;
+        for &child in &self.children[node] {
+            if self.manual[child].is_none() {
+                row_width += self.width(child);
+                automatic_children += 1;
             }
         }
-        self.visiting.remove(&node.id);
+        row_width += H_GAP * automatic_children.saturating_sub(1) as f32;
+        let row_y = position.y + self.height(node) + V_GAP;
+        let mut x = position.x + CARD_WIDTH / 2.0 - row_width / 2.0;
+        for child_index in 0..self.children[node].len() {
+            let child = self.children[node][child_index];
+            let is_manual = self.manual[child].is_some();
+            self.place(child, x, row_y);
+            if !is_manual {
+                x += self.width(child) + H_GAP;
+            }
+        }
+        self.visiting[node] = false;
     }
 
     /// Nudges automatically placed subtrees sideways until they no longer
     /// collide with anything already laid down. The first hit picks whichever
     /// direction moves the subtree less; later hits keep that direction so the
     /// subtree cannot oscillate between two neighbours forever.
-    fn separate(&mut self, node: &'nodes BoardNode, occupied: &mut Vec<Rect>) {
-        if !self.visiting.insert(node.id.clone()) {
+    fn separate(&mut self, node: usize, occupied: &mut Vec<Rect>) {
+        if self.visiting[node] {
             return;
         }
-        if !self.manual.contains_key(&node.id) {
+        self.visiting[node] = true;
+        if self.manual[node].is_none() {
             let mut direction = 0.0f32;
             for _ in 0..MAX_OVERLAP_PASSES {
-                let rect = self.rect(&node.id);
+                let rect = self.rect(node);
                 let Some(hit) = occupied
                     .iter()
                     .copied()
@@ -268,28 +292,107 @@ impl<'nodes> Tree<'nodes> {
                 direction = dx.signum();
                 self.shift_subtree(node, dx);
             }
-            occupied.push(self.rect(&node.id));
+            occupied.push(self.rect(node));
         }
-        for child in self.children_of(node) {
+        for child_index in 0..self.children[node].len() {
+            let child = self.children[node][child_index];
             self.separate(child, occupied);
         }
-        self.visiting.remove(&node.id);
+        self.visiting[node] = false;
     }
 
-    fn shift_subtree(&mut self, node: &'nodes BoardNode, dx: f32) {
-        let mut shifted = HashSet::new();
-        self.shift(node, dx, &mut shifted);
+    fn shift_subtree(&mut self, node: usize, dx: f32) {
+        self.shift_generation = self.shift_generation.wrapping_add(1);
+        if self.shift_generation == 0 {
+            self.shift_marks.fill(0);
+            self.shift_generation = 1;
+        }
+        self.shift(node, dx, self.shift_generation);
     }
 
-    fn shift(&mut self, node: &'nodes BoardNode, dx: f32, shifted: &mut HashSet<String>) {
-        if self.manual.contains_key(&node.id) || !shifted.insert(node.id.clone()) {
+    fn shift(&mut self, node: usize, dx: f32, generation: u32) {
+        if self.manual[node].is_some() || self.shift_marks[node] == generation {
             return;
         }
-        if let Some(position) = self.positions.get_mut(&node.id) {
+        self.shift_marks[node] = generation;
+        if let Some(position) = &mut self.positions[node] {
             position.x += dx;
         }
-        for child in self.children_of(node) {
-            self.shift(child, dx, shifted);
+        for child_index in 0..self.children[node].len() {
+            let child = self.children[node][child_index];
+            self.shift(child, dx, generation);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Position, V_GAP, compute_layout};
+    use crate::model::{BoardNode, NodeStatus};
+    use std::collections::HashMap;
+
+    fn node(index: usize, parent: Option<usize>) -> BoardNode {
+        BoardNode {
+            id: format!("node-{index:04}"),
+            parent_id: parent.map(|parent| format!("node-{parent:04}")),
+            prompt: String::new(),
+            aspect: "auto".into(),
+            source_images: Vec::new(),
+            attachments: Vec::new(),
+            images: Vec::new(),
+            image_labels: Vec::new(),
+            attempts: Vec::new(),
+            text: String::new(),
+            status: NodeStatus::Done,
+            error: None,
+            stop_reason: None,
+            x: None,
+            y: None,
+            created_at: index as i64,
+            run_started_at: None,
+            finished_at: None,
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn large_indexed_tree_layout_is_complete_and_input_order_independent() {
+        const NODE_COUNT: usize = 511;
+        let nodes: Vec<_> = (0..NODE_COUNT)
+            .map(|index| node(index, (index > 0).then(|| (index - 1) / 2)))
+            .collect();
+        let heights: HashMap<_, _> = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (node.id.clone(), 180. + (index % 7) as f32 * 11.))
+            .collect();
+
+        let expected = compute_layout(&nodes, &heights);
+        let mut reversed = nodes.clone();
+        reversed.reverse();
+        assert_eq!(compute_layout(&reversed, &heights), expected);
+        assert_eq!(expected.len(), NODE_COUNT);
+
+        for index in 1..NODE_COUNT {
+            let parent = (index - 1) / 2;
+            let position = expected[&nodes[index].id];
+            let parent_position = expected[&nodes[parent].id];
+            assert_eq!(
+                position.y,
+                parent_position.y + heights[&nodes[parent].id] + V_GAP
+            );
+            assert!(position.x.is_finite());
+        }
+    }
+
+    #[test]
+    fn manual_node_keeps_its_position() {
+        let mut nodes = vec![node(0, None), node(1, Some(0)), node(2, Some(0))];
+        nodes[1].x = Some(-725.);
+        nodes[1].y = Some(315.);
+
+        let positions = compute_layout(&nodes, &HashMap::new());
+
+        assert_eq!(positions[&nodes[1].id], Position { x: -725., y: 315. });
     }
 }

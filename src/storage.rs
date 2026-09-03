@@ -25,6 +25,7 @@ pub const THUMBNAIL_MAX_DIMENSION: u32 = 1080;
 // Rasterizing hundreds of cards during a zoom-out then decodes ~40 KB files
 // instead of the full-size thumbnails.
 pub const SPRITE_THUMBNAIL_MAX_DIMENSION: u32 = 320;
+const THUMBNAIL_SWEEP_VERSION: u8 = 1;
 
 #[derive(Clone, Debug)]
 pub enum RepositoryEvent {
@@ -45,11 +46,16 @@ pub struct Repository {
     paths: Arc<DataPaths>,
     events: async_channel::Sender<RepositoryEvent>,
     writer: Arc<writer::BoardWriter>,
+    cleanup: Arc<writer::CleanupWorker>,
 }
 
 #[derive(Debug)]
 struct RepositoryState {
-    boards: Vec<Board>,
+    // Boards are copy-on-write so the background writer can snapshot a few
+    // cheap handles and serialize without holding the repository lock. A
+    // mutation only clones its board when a write of the previous revision is
+    // still in flight.
+    boards: Vec<Arc<Board>>,
     trash: HashMap<String, TrashEntry>,
 }
 
@@ -166,26 +172,30 @@ impl Repository {
                 }
             }
         }
-        let state = Arc::new(RwLock::new(RepositoryState {
-            boards,
-            trash: HashMap::new(),
-        }));
         let paths = Arc::new(paths);
         // The startup migration runs before the app can observe anything, so
         // it writes inline; every later save goes through the writer thread.
         if changed {
-            write_boards(&paths.boards_file, &state.read().boards)?;
+            write_boards(&paths.boards_file, &boards)?;
         }
+        let state = Arc::new(RwLock::new(RepositoryState {
+            boards: boards.into_iter().map(Arc::new).collect(),
+            trash: HashMap::new(),
+        }));
         let writer = Arc::new(writer::BoardWriter::spawn(
             Arc::clone(&state),
             paths.boards_file.clone(),
             events.clone(),
         ));
+        let cleanup = Arc::new(
+            writer::CleanupWorker::spawn().context("failed to start storage cleanup worker")?,
+        );
         Ok(Self {
             inner: state,
             paths,
             events,
             writer,
+            cleanup,
         })
     }
 
@@ -194,10 +204,21 @@ impl Repository {
     }
 
     pub fn boards(&self) -> Vec<Board> {
-        self.inner.read().boards.clone()
+        self.inner
+            .read()
+            .boards
+            .iter()
+            .map(|board| board.as_ref().clone())
+            .collect()
     }
 
     pub fn board(&self, board_id: &str) -> Option<Board> {
+        self.board_snapshot(board_id)
+            .map(|board| board.as_ref().clone())
+    }
+
+    /// Cheap immutable board snapshot for background generation work.
+    pub(crate) fn board_snapshot(&self, board_id: &str) -> Option<Arc<Board>> {
         self.inner
             .read()
             .boards
@@ -207,10 +228,15 @@ impl Repository {
     }
 
     pub fn node(&self, board_id: &str, node_id: &str) -> Option<BoardNode> {
-        self.board(board_id)?
+        self.inner
+            .read()
+            .boards
+            .iter()
+            .find(|board| board.id == board_id)?
             .nodes
-            .into_iter()
+            .iter()
             .find(|node| node.id == node_id)
+            .cloned()
     }
 
     pub fn summaries(&self) -> Vec<BoardSummary> {
@@ -220,25 +246,28 @@ impl Repository {
             .boards
             .iter()
             .map(|board| {
-                let updated_at = board
-                    .nodes
-                    .iter()
-                    .map(|node| node.created_at)
-                    .max()
-                    .unwrap_or(board.created_at);
+                let mut updated_at = None;
+                let mut image_count = 0;
+                let mut last_image = None;
+                let mut total_tokens = 0;
+                for node in &board.nodes {
+                    updated_at = Some(updated_at.map_or(node.created_at, |updated_at: i64| {
+                        updated_at.max(node.created_at)
+                    }));
+                    image_count += node.images.len();
+                    if let Some(image) = node.images.last() {
+                        last_image = Some(image.clone());
+                    }
+                    total_tokens += node.token_count();
+                }
                 BoardSummary {
                     id: board.id.clone(),
                     title: board.title.clone(),
                     created_at: board.created_at,
-                    updated_at,
-                    image_count: board.nodes.iter().map(|node| node.images.len()).sum(),
-                    last_image: board
-                        .nodes
-                        .iter()
-                        .flat_map(|node| &node.images)
-                        .last()
-                        .cloned(),
-                    total_tokens: board.nodes.iter().map(BoardNode::token_count).sum(),
+                    updated_at: updated_at.unwrap_or(board.created_at),
+                    image_count,
+                    last_image,
+                    total_tokens,
                 }
             })
             .collect();
@@ -253,7 +282,7 @@ impl Repository {
             created_at: now_ms(),
             nodes: Vec::new(),
         };
-        self.inner.write().boards.push(board.clone());
+        self.inner.write().boards.push(Arc::new(board.clone()));
         self.persist_and_notify();
         Ok(board)
     }
@@ -286,12 +315,7 @@ impl Repository {
             self.paths.workspaces.join(board_id),
         ];
         let log = self.paths.logs.join(format!("{board_id}.jsonl"));
-        std::thread::spawn(move || {
-            for path in directories {
-                let _ = fs::remove_dir_all(path);
-            }
-            let _ = fs::remove_file(log);
-        });
+        self.cleanup.request(directories, log);
         Ok(())
     }
 
@@ -304,17 +328,25 @@ impl Repository {
         if request.attachment_paths.len() + request.attachment_urls.len() > MAX_ATTACHMENTS {
             bail!("Too many attachments (max {MAX_ATTACHMENTS})");
         }
-        let board = self.board(board_id).context("Board not found")?;
-        let parent = match request.parent_id.as_deref() {
-            Some(parent_id) => Some(
-                board
-                    .nodes
-                    .iter()
-                    .find(|node| node.id == parent_id)
-                    .cloned()
-                    .context("Parent node not found")?,
-            ),
-            None => None,
+        let parent = {
+            let state = self.inner.read();
+            let board = state
+                .boards
+                .iter()
+                .find(|board| board.id == board_id)
+                .context("Board not found")?;
+            request
+                .parent_id
+                .as_deref()
+                .map(|parent_id| {
+                    board
+                        .nodes
+                        .iter()
+                        .find(|node| node.id == parent_id)
+                        .cloned()
+                        .context("Parent node not found")
+                })
+                .transpose()?
         };
         let source_images = match (&parent, request.source_images) {
             (Some(_), Some(images)) => images,
@@ -411,8 +443,12 @@ impl Repository {
         }
         let mut state = self.inner.write();
         let board = board_mut(&mut state, board_id)?;
-        for (id, x, y) in positions {
-            if let Some(node) = board.nodes.iter_mut().find(|node| &node.id == id) {
+        let positions_by_id: HashMap<&str, (f32, f32)> = positions
+            .iter()
+            .map(|(id, x, y)| (id.as_str(), (*x, *y)))
+            .collect();
+        for node in &mut board.nodes {
+            if let Some((x, y)) = positions_by_id.get(node.id.as_str()) {
                 node.x = Some(*x);
                 node.y = Some(*y);
             }
@@ -428,17 +464,30 @@ impl Repository {
         node_id: &str,
         update: impl FnOnce(&mut BoardNode),
     ) -> Result<BoardNode> {
+        self.mutate_node(board_id, node_id, |node| {
+            update(node);
+            node.clone()
+        })
+    }
+
+    /// Mutates a node without cloning it for a return value. Generation event
+    /// handling uses this for frequent status, usage, and artifact updates.
+    pub(crate) fn mutate_node<T>(
+        &self,
+        board_id: &str,
+        node_id: &str,
+        update: impl FnOnce(&mut BoardNode) -> T,
+    ) -> Result<T> {
         let mut state = self.inner.write();
         let node = board_mut(&mut state, board_id)?
             .nodes
             .iter_mut()
             .find(|node| node.id == node_id)
             .context("Node not found")?;
-        update(node);
-        let node = node.clone();
+        let result = update(node);
         drop(state);
         self.persist_and_notify();
-        Ok(node)
+        Ok(result)
     }
 
     pub fn delete_subtree(&self, board_id: &str, node_id: &str) -> Result<(Vec<String>, String)> {
@@ -448,24 +497,26 @@ impl Repository {
         if !board.nodes.iter().any(|node| node.id == node_id) {
             bail!("Node not found");
         }
-        let mut ids = HashSet::from([node_id.to_owned()]);
-        loop {
-            let before = ids.len();
-            let descendants: Vec<_> = board
-                .nodes
-                .iter()
-                .filter(|node| {
-                    node.parent_id
-                        .as_ref()
-                        .is_some_and(|parent| ids.contains(parent))
-                })
-                .map(|node| node.id.clone())
-                .collect();
-            ids.extend(descendants);
-            if before == ids.len() {
-                break;
+        let mut children_by_parent: HashMap<&str, Vec<&str>> = HashMap::new();
+        for node in &board.nodes {
+            if let Some(parent_id) = node.parent_id.as_deref() {
+                children_by_parent
+                    .entry(parent_id)
+                    .or_default()
+                    .push(&node.id);
             }
         }
+        let mut ids = HashSet::new();
+        let mut pending = vec![node_id];
+        while let Some(id) = pending.pop() {
+            if !ids.insert(id.to_owned()) {
+                continue;
+            }
+            if let Some(children) = children_by_parent.get(id) {
+                pending.extend(children.iter().copied());
+            }
+        }
+        drop(children_by_parent);
         let mut deleted = Vec::new();
         board.nodes.retain(|node| {
             if ids.contains(&node.id) {
@@ -498,12 +549,13 @@ impl Repository {
             bail!("Nothing to undo");
         }
         let board = board_mut(&mut state, board_id)?;
-        let existing: HashSet<_> = board.nodes.iter().map(|node| node.id.clone()).collect();
+        let existing: HashSet<_> = board.nodes.iter().map(|node| node.id.as_str()).collect();
         let restored: Vec<_> = entry
             .nodes
             .into_iter()
-            .filter(|node| !existing.contains(&node.id))
+            .filter(|node| !existing.contains(node.id.as_str()))
             .collect();
+        drop(existing);
         let ids = restored.iter().map(|node| node.id.clone()).collect();
         board.nodes.extend(restored);
         drop(state);
@@ -523,8 +575,10 @@ impl Repository {
     }
 
     pub fn image_path(&self, board_id: &str, url: &str) -> Option<PathBuf> {
-        let prefix = format!("/images/{board_id}/");
-        let name = url.strip_prefix(&prefix)?;
+        let name = url
+            .strip_prefix("/images/")?
+            .strip_prefix(board_id)?
+            .strip_prefix('/')?;
         if Path::new(name).components().count() != 1 {
             return None;
         }
@@ -550,18 +604,15 @@ impl Repository {
         let candidates = {
             let state = self.inner.read();
             let mut seen = HashSet::new();
-            state
-                .boards
-                .iter()
-                .flat_map(|board| {
-                    board.nodes.iter().flat_map(|node| {
-                        node.attempts
-                            .iter()
-                            .map(|url| (board.id.clone(), url.clone()))
-                    })
-                })
-                .filter(|candidate| seen.insert(candidate.clone()))
-                .collect::<Vec<_>>()
+            let mut candidates = Vec::new();
+            for board in &state.boards {
+                for url in board.nodes.iter().flat_map(|node| &node.attempts) {
+                    if seen.insert((board.id.as_str(), url.as_str())) {
+                        candidates.push((board.id.clone(), url.clone()));
+                    }
+                }
+            }
+            candidates
         };
 
         let mut rewritten = false;
@@ -617,15 +668,38 @@ impl Repository {
     /// raise the thumbnail size; run it on a background thread, it decodes
     /// every affected original.
     pub fn refresh_undersized_thumbnails(&self) {
+        // Imports always create both current thumbnail sizes. This versioned
+        // marker turns the upgrade scan into the one-time pass its contract
+        // promises, while a dimension or algorithm change gets a new marker.
+        let marker = self.paths.images.join(format!(
+            ".thumbnail-sweep-v{THUMBNAIL_SWEEP_VERSION}-{THUMBNAIL_MAX_DIMENSION}-{SPRITE_THUMBNAIL_MAX_DIMENSION}"
+        ));
+        if marker.is_file() {
+            return;
+        }
         let Ok(boards) = fs::read_dir(&self.paths.images) else {
             return;
         };
         let mut regenerated = false;
-        for board in boards.flatten() {
-            let Ok(entries) = fs::read_dir(board.path()) else {
+        let mut complete = true;
+        for board in boards {
+            let Ok(board) = board else {
+                complete = false;
                 continue;
             };
-            for entry in entries.flatten() {
+            let board_path = board.path();
+            if !board_path.is_dir() {
+                continue;
+            }
+            let Ok(entries) = fs::read_dir(board_path) else {
+                complete = false;
+                continue;
+            };
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    complete = false;
+                    continue;
+                };
                 let path = entry.path();
                 let is_thumbnail = path
                     .file_name()
@@ -639,29 +713,35 @@ impl Repository {
                 else {
                     continue;
                 };
-                let source_dimensions = image::image_dimensions(&path);
+                let Ok(source_dimensions) = image::image_dimensions(&path) else {
+                    complete = false;
+                    continue;
+                };
                 // A missing or unreadable thumbnail beside a readable original
                 // counts as undersized and is rebuilt.
-                let undersized = |candidate: &Path, target: u32| match (
-                    image::image_dimensions(candidate),
-                    source_dimensions.as_ref().ok().copied(),
-                ) {
-                    (Ok((thumb_w, thumb_h)), Some((width, height))) => {
-                        thumb_w.max(thumb_h) < width.max(height).min(target)
-                    }
-                    (Err(_), Some(_)) => true,
-                    _ => false,
+                let undersized = |candidate: &Path, target: u32| {
+                    image::image_dimensions(candidate).map_or(true, |(thumb_w, thumb_h)| {
+                        thumb_w.max(thumb_h)
+                            < source_dimensions.0.max(source_dimensions.1).min(target)
+                    })
                 };
                 if undersized(&thumbnail, THUMBNAIL_MAX_DIMENSION) {
                     if create_thumbnail(&path).is_ok() {
                         regenerated = true;
+                    } else {
+                        complete = false;
                     }
-                } else if undersized(&sprite, SPRITE_THUMBNAIL_MAX_DIMENSION)
-                    && create_sprite_thumbnail(&path).is_ok()
-                {
-                    regenerated = true;
+                } else if undersized(&sprite, SPRITE_THUMBNAIL_MAX_DIMENSION) {
+                    if create_sprite_thumbnail(&path).is_ok() {
+                        regenerated = true;
+                    } else {
+                        complete = false;
+                    }
                 }
             }
+        }
+        if complete {
+            let _ = atomic_write(&marker, b"complete\n");
         }
         if regenerated {
             // Thumbnail paths held by the view must be resolved again after a
@@ -823,11 +903,12 @@ fn load_boards(path: &Path) -> Result<Vec<Board>> {
 }
 
 fn board_mut<'a>(state: &'a mut RepositoryState, board_id: &str) -> Result<&'a mut Board> {
-    state
+    let board = state
         .boards
         .iter_mut()
         .find(|board| board.id == board_id)
-        .context("Board not found")
+        .context("Board not found")?;
+    Ok(Arc::make_mut(board))
 }
 
 fn purge_expired_trash(state: &mut RepositoryState) {
@@ -1006,8 +1087,10 @@ pub fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DataPaths, Repository, RepositoryEvent, create_thumbnail, thumbnail_path_for};
-    use crate::model::NewNodesRequest;
+    use super::{
+        DataPaths, Repository, RepositoryEvent, board_mut, create_thumbnail, thumbnail_path_for,
+    };
+    use crate::model::{BoardNode, NewNodesRequest, NodeStatus};
     use async_channel::{Receiver, unbounded};
     use image::{ColorType, DynamicImage, ImageFormat, Rgba, RgbaImage};
     use std::fs;
@@ -1045,6 +1128,30 @@ mod tests {
         DynamicImage::ImageRgba8(image).save(path).unwrap();
     }
 
+    fn node(id: impl Into<String>, parent_id: Option<String>) -> BoardNode {
+        BoardNode {
+            id: id.into(),
+            parent_id,
+            prompt: "test".into(),
+            aspect: "auto".into(),
+            source_images: Vec::new(),
+            attachments: Vec::new(),
+            images: Vec::new(),
+            image_labels: Vec::new(),
+            attempts: Vec::new(),
+            text: String::new(),
+            status: NodeStatus::Done,
+            error: None,
+            stop_reason: None,
+            x: None,
+            y: None,
+            created_at: 0,
+            run_started_at: None,
+            finished_at: None,
+            usage: None,
+        }
+    }
+
     #[test]
     fn thumbnail_paths_preserve_svg_embeddable_formats() {
         assert_eq!(
@@ -1077,6 +1184,30 @@ mod tests {
                 .format(),
             Some(ImageFormat::Png)
         );
+    }
+
+    #[test]
+    fn deleting_a_deep_subtree_visits_each_node_once() {
+        let directory = TempDir::new().unwrap();
+        let (repository, _) = repository(&directory);
+        let board = repository.create_board().unwrap();
+        {
+            let mut state = repository.inner.write();
+            let board = board_mut(&mut state, &board.id).unwrap();
+            board.nodes = (0..1_000)
+                .map(|index| {
+                    node(
+                        format!("node-{index}"),
+                        (index > 0).then(|| format!("node-{}", index - 1)),
+                    )
+                })
+                .collect();
+        }
+
+        let (deleted, _) = repository.delete_subtree(&board.id, "node-0").unwrap();
+
+        assert_eq!(deleted.len(), 1_000);
+        assert!(repository.board(&board.id).unwrap().nodes.is_empty());
     }
 
     /// Board mutations arrive from the main thread and from every generation

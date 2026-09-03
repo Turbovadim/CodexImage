@@ -22,5 +22,7 @@ mod node_actions;
 mod overlays;
 mod theme;
 mod tooltip;
+#[cfg(target_os = "macos")]
+mod window_memory;
 
 pub use app::run;

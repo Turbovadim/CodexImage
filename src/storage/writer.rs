@@ -11,9 +11,13 @@
 //! into a single write and the newest state always lands last.
 
 use super::{RepositoryEvent, RepositoryState, atomic_write};
+use crate::model::Board;
 use parking_lot::{Condvar, Mutex, RwLock};
+use serde::Serialize;
+use serde::ser::{SerializeSeq, Serializer};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -82,6 +86,10 @@ impl BoardWriter {
     /// `FLUSH_TIMEOUT` elapses. Used on quit and by tests.
     pub(super) fn flush(&self) {
         let mut queue = self.shared.queue.lock();
+        // This forced revision is also a synchronization barrier. A mutation
+        // may have released the repository write lock but not reached
+        // `request` yet; the writer's snapshot will wait for that lock and
+        // include the mutation even when shutdown interleaves at that point.
         queue.requested += 1;
         let target = queue.requested;
         self.shared.changed.notify_all();
@@ -131,8 +139,11 @@ fn run(
         };
 
         // Read the state *after* observing `target`, so what lands on disk is
-        // never older than the revision that was asked for.
-        let result = serde_json::to_vec_pretty(&state.read().boards)
+        // never older than the revision that was asked for. Cloning the Arc
+        // handles releases the repository lock before the expensive JSON
+        // serialization and disk write.
+        let boards = state.read().boards.clone();
+        let result = serde_json::to_vec_pretty(&BoardSnapshot(&boards))
             .map_err(anyhow::Error::from)
             .and_then(|bytes| atomic_write(boards_file, &bytes));
 
@@ -156,9 +167,59 @@ fn run(
     }
 }
 
+/// Serializes the pointed-to boards as the same JSON array used on disk. The
+/// serde `rc` feature is deliberately unnecessary for this internal wrapper.
+struct BoardSnapshot<'a>(&'a [Arc<Board>]);
+
+impl Serialize for BoardSnapshot<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for board in self.0 {
+            sequence.serialize_element(board.as_ref())?;
+        }
+        sequence.end()
+    }
+}
+
+/// Serializes board-directory deletion onto one detached worker. Deleting a
+/// board stays non-blocking for GPUI without creating an unbounded thread for
+/// every click.
+pub(super) struct CleanupWorker {
+    requests: mpsc::Sender<CleanupRequest>,
+}
+
+struct CleanupRequest {
+    directories: [PathBuf; 3],
+    log: PathBuf,
+}
+
+impl CleanupWorker {
+    pub(super) fn spawn() -> std::io::Result<Self> {
+        let (requests, receiver) = mpsc::channel::<CleanupRequest>();
+        let _detached = thread::Builder::new()
+            .name("storage-cleanup".into())
+            .spawn(move || {
+                while let Ok(request) = receiver.recv() {
+                    for directory in request.directories {
+                        let _ = std::fs::remove_dir_all(directory);
+                    }
+                    let _ = std::fs::remove_file(request.log);
+                }
+            })?;
+        Ok(Self { requests })
+    }
+
+    pub(super) fn request(&self, directories: [PathBuf; 3], log: PathBuf) {
+        let _ = self.requests.send(CleanupRequest { directories, log });
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::BoardWriter;
+    use super::{BoardSnapshot, BoardWriter};
     use crate::model::Board;
     use crate::storage::{RepositoryEvent, RepositoryState};
     use parking_lot::RwLock;
@@ -175,14 +236,15 @@ mod tests {
                     created_at: 0,
                     nodes: Vec::new(),
                 })
+                .map(Arc::new)
                 .collect(),
             trash: HashMap::new(),
         }))
     }
 
     /// The writer snapshots the board list at write time, not at request time.
-    /// That is what makes concurrent mutations safe: a write already in flight
-    /// can never commit a board list older than one a later mutation produced.
+    /// This is what makes the final forced revision safe: it cannot commit a
+    /// board list older than a mutation that already holds the state lock.
     #[test]
     fn a_flush_persists_state_mutated_after_the_request() {
         let directory = tempfile::TempDir::new().expect("temporary directory");
@@ -192,7 +254,7 @@ mod tests {
 
         let writer = BoardWriter::spawn(Arc::clone(&state), boards_file.clone(), sender);
         writer.request();
-        state.write().boards[0].title = "second".into();
+        Arc::make_mut(&mut state.write().boards[0]).title = "second".into();
         writer.flush();
 
         let written = std::fs::read_to_string(&boards_file).expect("boards file");
@@ -218,6 +280,17 @@ mod tests {
             "500 requests caused {} writes",
             writer.writes()
         );
+    }
+
+    #[test]
+    fn arc_snapshot_preserves_the_existing_json_format() {
+        let state = state(&["first", "second"]);
+        let boards = state.read().boards.clone();
+        let actual = serde_json::to_vec_pretty(&BoardSnapshot(&boards)).unwrap();
+        let expected_boards: Vec<_> = boards.iter().map(|board| board.as_ref().clone()).collect();
+        let expected = serde_json::to_vec_pretty(&expected_boards).unwrap();
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
