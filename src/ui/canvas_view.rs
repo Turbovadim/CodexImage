@@ -39,11 +39,9 @@ const MIN_ZOOM: f32 = 0.08;
 const MAX_ZOOM: f32 = 2.;
 /// How long zoom must hold still before sprites re-render for the new tier.
 const ZOOM_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
-/// Shimmer does not need to track a 120 Hz display, but one-second updates are
-/// visibly stepped. A single 30 FPS coordinator keeps active cards smooth
-/// without restoring one next-frame callback per card.
-const RUNNING_ANIMATION_INTERVAL: Duration = Duration::from_millis(33);
-const REDUCED_MOTION_STATUS_INTERVAL: Duration = Duration::from_secs(1);
+/// Only the elapsed-time label needs a clock. Generation activity arrives
+/// through repository events; no decorative animation keeps the canvas busy.
+const RUNNING_STATUS_INTERVAL: Duration = Duration::from_secs(1);
 const MINIMAP_WIDTH: f32 = 142.;
 const MINIMAP_HEIGHT: f32 = 96.;
 const MINIMAP_RIGHT: f32 = 18.;
@@ -69,7 +67,7 @@ pub(super) struct MinimapScene {
     node_rects: Arc<Vec<MinimapNodeRect>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(super) enum CanvasClickTarget {
     Image {
         node_id: String,
@@ -183,7 +181,14 @@ pub(super) enum DragState {
         start: Point<Pixels>,
         origin: Position,
     },
-    NodeClick(CanvasClickTarget),
+    NodeClick {
+        target: CanvasClickTarget,
+        start: Point<Pixels>,
+    },
+}
+
+fn pointer_moved(start: Point<Pixels>, position: Point<Pixels>) -> bool {
+    f32::from(position.x - start.x).powi(2) + f32::from(position.y - start.y).powi(2) >= 9.
 }
 
 impl AppView {
@@ -422,7 +427,8 @@ impl AppView {
         self.sync_running_tick(
             visible_nodes
                 .iter()
-                .any(|frame| frame.status_line.is_some()),
+                .any(|frame| frame.status_line.is_some())
+                && window.is_window_active(),
             cx,
         );
 
@@ -488,7 +494,7 @@ impl AppView {
         let cursor = match &self.drag {
             Some(DragState::Canvas { .. }) => gpui::CursorStyle::ClosedHand,
             Some(DragState::Node { .. }) => gpui::CursorStyle::ClosedHand,
-            Some(DragState::NodeClick(_)) => gpui::CursorStyle::PointingHand,
+            Some(DragState::NodeClick { .. }) => gpui::CursorStyle::PointingHand,
             _ if self.hovered_node.is_some() => gpui::CursorStyle::PointingHand,
             _ => gpui::CursorStyle::OpenHand,
         };
@@ -521,8 +527,7 @@ impl AppView {
         layer.child(zoom_controls).into_any_element()
     }
 
-    /// Own one bounded animation clock for all visible running cards. The
-    /// render pass stops it as soon as the active card leaves the viewport.
+    /// Update elapsed time only while running cards are visible in the active window.
     pub(super) fn sync_running_tick(&mut self, active: bool, cx: &mut Context<Self>) {
         if !active {
             self.running_tick_task.take();
@@ -532,14 +537,11 @@ impl AppView {
             return;
         }
 
-        let interval = if cx.reduce_motion() {
-            REDUCED_MOTION_STATUS_INTERVAL
-        } else {
-            RUNNING_ANIMATION_INTERVAL
-        };
         self.running_tick_task = Some(cx.spawn(async move |weak, cx| {
             loop {
-                cx.background_executor().timer(interval).await;
+                cx.background_executor()
+                    .timer(RUNNING_STATUS_INTERVAL)
+                    .await;
                 if weak.update(cx, |_, cx| cx.notify()).is_err() {
                     break;
                 }
@@ -955,7 +957,10 @@ impl AppView {
         if let Some((index, origin)) = self.canvas_node_at(event.position) {
             let canvas_node = &self.canvas_nodes[index];
             self.drag = match self.canvas_click_target(canvas_node, event.position, origin) {
-                Some(target) => Some(DragState::NodeClick(target)),
+                Some(target) => Some(DragState::NodeClick {
+                    target,
+                    start: event.position,
+                }),
                 None => Some(DragState::Node {
                     id: canvas_node.node.id.clone(),
                     start: event.position,
@@ -1002,6 +1007,12 @@ impl AppView {
             return;
         }
         match &self.drag {
+            Some(DragState::NodeClick { start, .. })
+                if event.dragging() && pointer_moved(*start, event.position) =>
+            {
+                self.drag = None;
+                cx.notify();
+            }
             Some(DragState::Canvas { start, origin }) if event.dragging() => {
                 self.camera_x = origin.0 + f32::from(event.position.x - start.x);
                 self.camera_y = origin.1 + f32::from(event.position.y - start.y);
@@ -1009,11 +1020,7 @@ impl AppView {
             }
             Some(DragState::Node {
                 id, start, origin, ..
-            }) if event.dragging()
-                && (f32::from(event.position.x - start.x).powi(2)
-                    + f32::from(event.position.y - start.y).powi(2))
-                    >= 9. =>
-            {
+            }) if event.dragging() && pointer_moved(*start, event.position) => {
                 self.transient_positions.insert(
                     id.clone(),
                     Position {
@@ -1045,7 +1052,7 @@ impl AppView {
 
     pub(super) fn mouse_up(
         &mut self,
-        _: &MouseUpEvent,
+        event: &MouseUpEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1081,8 +1088,19 @@ impl AppView {
                     Ok(())
                 });
             }
-        } else if let Some(DragState::NodeClick(click_target)) = drag {
-            match click_target {
+        } else if let Some(DragState::NodeClick { target, start }) = drag {
+            // A click commits only on the original target. Dragging away must
+            // not open an image, retry a generation, or delete a node.
+            let released_target =
+                self.canvas_node_at(event.position)
+                    .and_then(|(index, origin)| {
+                        self.canvas_click_target(&self.canvas_nodes[index], event.position, origin)
+                    });
+            if pointer_moved(start, event.position) || released_target.as_ref() != Some(&target) {
+                cx.notify();
+                return;
+            }
+            match target {
                 CanvasClickTarget::Image { node_id, url } => {
                     self.open_lightbox(node_id, url, window, cx);
                 }
@@ -1125,5 +1143,128 @@ impl AppView {
             ToolbarAction::Duplicate => self.duplicate_node(node_id, cx),
             ToolbarAction::Delete => self.delete_node(node_id, cx),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        generation::GenerationEngine,
+        storage::{DataPaths, Repository},
+    };
+    use gpui::TestAppContext;
+
+    fn test_engine() -> (
+        tempfile::TempDir,
+        GenerationEngine,
+        async_channel::Receiver<crate::storage::RepositoryEvent>,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = DataPaths::at(
+            directory.path().to_owned(),
+            directory.path().join("generated"),
+        );
+        std::fs::write(&paths.boards_file, serde_json::to_vec(&serde_json::json!([{
+            "id": "board", "title": "Test board", "createdAt": 0,
+            "nodes": [{"id": "node", "prompt": "A long prompt ".repeat(60), "createdAt": 0, "status": "done"}]
+        }])).unwrap()).unwrap();
+        let (sender, _repository_events) = async_channel::unbounded();
+        let engine = GenerationEngine::new(Repository::open_at(paths, sender).unwrap());
+        // These tests drive the view directly. Keep the real writer thread
+        // from waking GPUI's deterministic foreground executor.
+        let (_sender, receiver) = async_channel::unbounded();
+        (directory, engine, receiver)
+    }
+
+    #[gpui::test]
+    fn zoom_preserves_pointer_anchor_and_waits_for_the_last_input(cx: &mut TestAppContext) {
+        let (_directory, engine, receiver) = test_engine();
+        let handle = cx.add_window(move |window, cx| AppView::new(engine, receiver, window, cx));
+        let anchor = point(px(320.), px(240.));
+        handle
+            .update(cx, |view, _, cx| {
+                let world = (
+                    (320. - view.camera_x) / view.zoom,
+                    (240. - view.camera_y) / view.zoom,
+                );
+                view.zoom_at(anchor, 0.5, cx);
+                assert_eq!((320. - view.camera_x) / view.zoom, world.0);
+                assert_eq!((240. - view.camera_y) / view.zoom, world.1);
+                assert!(!view.zoom_settled);
+            })
+            .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        handle
+            .update(cx, |view, _, _| {
+                assert!(!view.canvas_nodes[0].sprite_image_is_initialized(2));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(100));
+        handle
+            .update(cx, |view, _, cx| view.zoom_at(anchor, 0.8, cx))
+            .unwrap();
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        handle
+            .update(cx, |view, _, _| assert!(!view.zoom_settled))
+            .unwrap();
+        cx.executor().advance_clock(Duration::from_millis(50));
+        cx.run_until_parked();
+        handle
+            .update(cx, |view, _, _| assert!(view.zoom_settled))
+            .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        handle
+            .update(cx, |view, _, _| {
+                assert!(view.canvas_nodes[0].sprite_image_is_initialized(2));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn dragging_away_cancels_a_card_click_even_if_the_pointer_returns(cx: &mut TestAppContext) {
+        let (_directory, engine, receiver) = test_engine();
+        let handle = cx.add_window(move |window, cx| AppView::new(engine, receiver, window, cx));
+        handle
+            .update(cx, |view, window, cx| {
+                let origin = view.current_position("node").unwrap();
+                let start = point(
+                    px(view.camera_x + origin.x + 20.),
+                    px(view.camera_y + origin.y + 130.),
+                );
+                let down = MouseDownEvent {
+                    position: start,
+                    button: MouseButton::Left,
+                    ..Default::default()
+                };
+                let up = MouseUpEvent {
+                    position: start,
+                    button: MouseButton::Left,
+                    ..Default::default()
+                };
+                view.canvas_mouse_down(&down, window, cx);
+                assert!(matches!(view.drag, Some(DragState::NodeClick { .. })));
+                view.mouse_move(
+                    &MouseMoveEvent {
+                        position: start + point(px(30.), px(0.)),
+                        pressed_button: Some(MouseButton::Left),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                );
+                view.mouse_up(&up, window, cx);
+                assert!(!view.expanded_prompts.contains("node"));
+                // A stationary click still opens the same disclosure.
+                view.canvas_mouse_down(&down, window, cx);
+                view.mouse_up(&up, window, cx);
+                assert!(view.expanded_prompts.contains("node"));
+            })
+            .unwrap();
     }
 }

@@ -154,7 +154,6 @@ mod tests {
         let mut scene = CardScene {
             height: 510.,
             primitives: Vec::new(),
-            generating_media: None,
             ..Default::default()
         };
         scene.quad(
@@ -189,7 +188,6 @@ mod tests {
         let mut scene = CardScene {
             height: 80.,
             primitives: Vec::new(),
-            generating_media: None,
             ..Default::default()
         };
         scene.quad(
@@ -233,7 +231,6 @@ mod tests {
         let mut scene = CardScene {
             height: CARD_WIDTH,
             primitives: Vec::new(),
-            generating_media: None,
             ..Default::default()
         };
         scene.image(asset(), bounds, CardImageFit::Contain, 0., false);

@@ -53,6 +53,7 @@ windows-sys = { version = "0.61", features = [
 embed-resource = "3"
 
 [dev-dependencies]
+gpui = { git = "https://github.com/zed-industries/zed", rev = "ac099b4a809a564f06907125e7a536c33cb60084", features = ["test-support"] }
 tempfile = "3"
 
 # Replaces GPUI's macOS platform crates with the vendored occlusion patch, which

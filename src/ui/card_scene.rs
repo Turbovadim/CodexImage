@@ -115,9 +115,6 @@ pub enum CardPrimitive {
 pub struct CardScene {
     pub height: f32,
     pub primitives: Vec<CardPrimitive>,
-    /// The media area of a running card, in card-local coordinates. The canvas
-    /// paints the animated generating shimmer over this rectangle.
-    pub generating_media: Option<CardRect>,
     /// Cached scene facts used by every paint. Scanning all primitives per
     /// visible node was measurable during camera movement.
     pub has_blurred_images: bool,
@@ -193,7 +190,6 @@ pub fn build_card_scene(canvas_node: &CanvasNode, expanded: bool) -> CardScene {
             canvas_node.output_layout.height(),
         ),
         primitives: Vec::new(),
-        generating_media: None,
         has_blurred_images: false,
         max_high_resolution_dimension: 0.,
     };
@@ -311,7 +307,6 @@ pub fn build_card_scene(canvas_node: &CanvasNode, expanded: bool) -> CardScene {
     );
     cursor_y += MEDIA_GAP;
 
-    let media_top = cursor_y;
     match &canvas_node.output_layout {
         OutputLayout::None => {}
         OutputLayout::Tiles { height, cells } => {
@@ -428,12 +423,6 @@ pub fn build_card_scene(canvas_node: &CanvasNode, expanded: bool) -> CardScene {
                 );
             }
             cursor_y += *height;
-        }
-    }
-    if running {
-        let media_height = canvas_node.output_layout.height();
-        if media_height > 0. {
-            scene.generating_media = Some(CardRect::new(0., media_top, CARD_WIDTH, media_height));
         }
     }
 

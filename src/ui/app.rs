@@ -232,7 +232,7 @@ pub fn run() -> Result<()> {
 }
 
 impl AppView {
-    fn new(
+    pub(super) fn new(
         engine: GenerationEngine,
         receiver: async_channel::Receiver<RepositoryEvent>,
         window: &mut Window,
@@ -253,10 +253,10 @@ impl AppView {
                 }
             };
         // Activation follows keyboard focus, not visibility. It only controls
-        // animation ticks; true occlusion owns the GPU cache lifetime below.
+        // elapsed-time updates; true occlusion owns the GPU cache lifetime below.
         let activation_subscription = cx.observe_window_activation(window, |view, window, cx| {
             if window.is_window_active() {
-                // Restart a visible running animation after the window becomes
+                // Restart a visible running card's timer after the window becomes
                 // active. `render_canvas` decides whether a tick is needed.
                 cx.notify();
             } else {

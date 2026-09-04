@@ -379,6 +379,20 @@ fn canvas_bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<Pixels> {
     Bounds::new(point(px(x), px(y)), size(px(width), px(height)))
 }
 
+/// Clip before shaping text or decoding images on partly visible cards.
+fn bounds_are_visible(bounds: Bounds<Pixels>, window: &Window) -> bool {
+    let viewport = window.viewport_size();
+    rect_is_visible(
+        f32::from(bounds.left()),
+        f32::from(bounds.top()),
+        f32::from(bounds.size.width),
+        f32::from(bounds.size.height),
+        f32::from(viewport.width),
+        f32::from(viewport.height),
+        0.,
+    )
+}
+
 #[derive(Clone, Copy)]
 struct CanvasTextStyle {
     font_size: f32,
@@ -408,7 +422,7 @@ fn paint_canvas_text(
     // Below ~3 logical px, text is an illegible smear; skipping it spares the
     // shaping pass, which dominates a full direct redraw of a large board at
     // far-out zoom (hundreds of cards, thousands of runs per frame).
-    if text.is_empty() || style.font_size < 3. {
+    if text.is_empty() || style.font_size < 3. || !bounds_are_visible(bounds, window) {
         return;
     }
     let run = TextRun {
@@ -445,6 +459,9 @@ fn paint_canvas_image(
     window: &mut Window,
     cx: &mut App,
 ) {
+    if !bounds_are_visible(bounds, window) {
+        return;
+    }
     let resource = Resource::Path(path.clone());
     let data = if style.blurred {
         let Some(data) =
@@ -500,58 +517,55 @@ pub fn paint_canvas_node(
     let tier = sprite_tier_for_zoom(zoom).filter(|_| !canvas_node.scene.has_blurred_images);
     let mut sprite = None;
     let mut deferred_sprite_source = false;
-    if let Some(tier) = tier {
-        // While the zoom gesture is still moving, keep blitting whichever tier
-        // is already rendered instead of requesting the target tier: every
-        // tier crossing otherwise re-rasterizes each visible card's sprite,
-        // which is the gesture's dominant CPU and I/O cost. The correct tier
-        // is requested once zoom settles.
-        let previous_tier = canvas_node.last_ready_sprite_tier.load(Ordering::Relaxed) as usize;
-        if !zoom_settled && previous_tier < CARD_SPRITE_WIDTHS.len() {
+    let previous_tier = canvas_node.last_ready_sprite_tier.load(Ordering::Relaxed) as usize;
+    if !zoom_settled && !canvas_node.scene.has_blurred_images {
+        sprite = canvas_node
+            .ready_sprite_image(previous_tier)
+            .and_then(|image| sprite_cache.update(cx, |cache, _| cache.ready(image, window)));
+    }
+    // A cold pinch must not enqueue hundreds of SVG raster jobs for tiers
+    // the user is only passing through. The settle task requests one redraw.
+    if let Some(tier) = tier.filter(|_| zoom_settled) {
+        let source = if canvas_node.sprite_image_is_initialized(tier) {
+            canvas_node.sprite_image(tier)
+        } else if *sprite_source_budget > 0 {
+            *sprite_source_budget -= 1;
+            canvas_node.sprite_image(tier)
+        } else {
+            deferred_sprite_source = true;
+            None
+        };
+        sprite = source
+            .and_then(|image| sprite_cache.update(cx, |cache, cx| cache.load(image, window, cx)));
+        if sprite.is_some() {
+            canvas_node
+                .last_ready_sprite_tier
+                .store(tier as u8, Ordering::Relaxed);
+        } else if previous_tier < CARD_SPRITE_WIDTHS.len() && previous_tier != tier {
             sprite = canvas_node
                 .ready_sprite_image(previous_tier)
                 .and_then(|image| sprite_cache.update(cx, |cache, _| cache.ready(image, window)));
-        }
-        if sprite.is_none() {
-            let source = if canvas_node.sprite_image_is_initialized(tier) {
-                canvas_node.sprite_image(tier)
-            } else if *sprite_source_budget > 0 {
-                *sprite_source_budget -= 1;
-                canvas_node.sprite_image(tier)
-            } else {
-                deferred_sprite_source = true;
-                None
-            };
-            sprite = source.and_then(|image| {
-                sprite_cache.update(cx, |cache, cx| cache.load(image, window, cx))
-            });
-            if sprite.is_some() {
-                canvas_node
-                    .last_ready_sprite_tier
-                    .store(tier as u8, Ordering::Relaxed);
-            } else if previous_tier < CARD_SPRITE_WIDTHS.len() && previous_tier != tier {
-                sprite = canvas_node
-                    .ready_sprite_image(previous_tier)
-                    .and_then(|image| {
-                        sprite_cache.update(cx, |cache, _| cache.ready(image, window))
-                    });
-            }
         }
     }
     if let Some(sprite) = sprite {
         let _ = window.paint_image(bounds, bounds, px(20. * zoom).into(), sprite, 0, false);
     } else {
-        paint_card_scene(frame, &canvas_node.scene, zoom, image_cache, window, cx);
+        paint_card_scene(
+            frame,
+            &canvas_node.scene,
+            zoom,
+            zoom_settled || tier.is_none(),
+            image_cache,
+            window,
+            cx,
+        );
     }
 
-    paint_high_resolution_card_images(frame, &canvas_node.scene, zoom, image_cache, window, cx);
+    if zoom_settled {
+        paint_high_resolution_card_images(frame, &canvas_node.scene, zoom, image_cache, window, cx);
+    }
 
     if let Some(status_line) = &frame.status_line {
-        if let Some(media) = canvas_node.scene.generating_media
-            && !cx.reduce_motion()
-        {
-            paint_generating_shimmer(transform_card_rect(media, frame, zoom), window);
-        }
         paint_canvas_text(
             status_line.clone(),
             canvas_bounds(
@@ -594,46 +608,6 @@ fn paint_target_outline(bounds: Bounds<Pixels>, zoom: f32, window: &mut Window) 
         theme::accent(),
         BorderStyle::Solid,
     ));
-}
-
-/// One shimmer cycle across the media area, as in a skeleton placeholder. The
-/// phase comes from wall-clock time, so every running card sweeps in unison.
-fn paint_generating_shimmer(bounds: Bounds<Pixels>, window: &mut Window) {
-    const SWEEP_PERIOD_SECONDS: f32 = 1.8;
-    static SHIMMER_EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
-    let elapsed = SHIMMER_EPOCH
-        .get_or_init(std::time::Instant::now)
-        .elapsed()
-        .as_secs_f32();
-    let phase = (elapsed / SWEEP_PERIOD_SECONDS).fract();
-
-    let width = f32::from(bounds.size.width);
-    let height = f32::from(bounds.size.height);
-    if width <= 0. || height <= 0. {
-        return;
-    }
-    let band_width = width * 0.55;
-    let band_left = f32::from(bounds.left()) + phase * (width + band_width) - band_width;
-    let top = f32::from(bounds.top());
-    let peak = theme::ink().opacity(0.08);
-    let edge = theme::ink().opacity(0.);
-    window.with_content_mask(Some(ContentMask { bounds }), |window| {
-        let half = band_width / 2.;
-        for (offset, from, to) in [(0., edge, peak), (half, peak, edge)] {
-            window.paint_quad(quad(
-                canvas_bounds(band_left + offset, top, half, height),
-                px(0.),
-                gpui::linear_gradient(
-                    90.,
-                    gpui::linear_color_stop(from, 0.),
-                    gpui::linear_color_stop(to, 1.),
-                ),
-                px(0.),
-                gpui::transparent_black(),
-                BorderStyle::Solid,
-            ));
-        }
-    });
 }
 
 pub struct ToolbarButtonPaint {
@@ -686,6 +660,7 @@ fn paint_card_scene(
     frame: &CanvasNodeFrame,
     scene: &CardScene,
     zoom: f32,
+    show_text: bool,
     image_cache: &Entity<DecodedImageCache>,
     window: &mut Window,
     cx: &mut App,
@@ -702,6 +677,11 @@ fn paint_card_scene(
         }),
         |window| {
             for primitive in &scene.primitives {
+                // At overview scale, prioritize image continuity while a cold
+                // gesture moves. Small labels return when zoom settles.
+                if !show_text && matches!(primitive, CardPrimitive::Text { .. }) {
+                    continue;
+                }
                 match primitive {
                     CardPrimitive::Quad {
                         bounds,
