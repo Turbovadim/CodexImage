@@ -42,8 +42,13 @@ impl BoardRow {
         let repository = view.engine.repository();
         let thumbnail = summary.last_image.as_deref().and_then(|url| {
             repository
-                .thumbnail_path(&summary.id, url)
+                .sprite_thumbnail_path(&summary.id, url)
                 .filter(|path| path.exists())
+                .or_else(|| {
+                    repository
+                        .thumbnail_path(&summary.id, url)
+                        .filter(|path| path.exists())
+                })
                 .or_else(|| repository.image_path(&summary.id, url))
         });
         Self {
@@ -56,6 +61,8 @@ impl BoardRow {
 
 struct GalleryImage {
     url: String,
+    /// The 320 px sprite thumbnail: the 148 px tile never needs more, and a
+    /// scroll through hundreds of images stays inside the decode budget.
     thumbnail: PathBuf,
 }
 
@@ -100,7 +107,7 @@ impl GalleryRow {
                         .iter()
                         .map(|url| GalleryImage {
                             url: url.clone(),
-                            thumbnail: view.display_image_path(url, false),
+                            thumbnail: view.sprite_image_path(url),
                         })
                         .collect(),
                 }
@@ -704,7 +711,8 @@ impl AppView {
             .occlude()
             .child(
                 div()
-                    .w(px(560.))
+                    .w(px(760.))
+                    .max_w_full()
                     .rounded_xl()
                     .border_1()
                     .border_color(theme::line())

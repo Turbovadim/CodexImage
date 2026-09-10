@@ -64,7 +64,6 @@ actions!(
 pub enum TextInputMode {
     SingleLine,
     AutoGrow { max_lines: usize },
-    FixedMultiline { lines: usize },
 }
 
 impl TextInputMode {
@@ -76,12 +75,7 @@ impl TextInputMode {
         match self {
             Self::SingleLine => 1,
             Self::AutoGrow { max_lines } => measured_lines.clamp(1, max_lines.max(1)),
-            Self::FixedMultiline { lines } => lines.max(1),
         }
-    }
-
-    pub(super) fn centers_single_line(self) -> bool {
-        !matches!(self, Self::FixedMultiline { .. })
     }
 }
 

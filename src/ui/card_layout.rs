@@ -283,6 +283,7 @@ mod tests {
         BoardNode {
             id: "node".into(),
             parent_id: None,
+            merged_from: Vec::new(),
             prompt: "A concise prompt that should preserve its line shape while zooming".into(),
             aspect: "auto".into(),
             source_images: Vec::new(),

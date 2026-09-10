@@ -926,6 +926,7 @@ mod tests {
                 NewNodesRequest {
                     prompt: "test".into(),
                     parent_id: None,
+                    merged_from: Vec::new(),
                     source_images: None,
                     aspect: "auto".into(),
                     count: 1,

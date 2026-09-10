@@ -117,12 +117,31 @@ pub fn store(source: &Path, max_dimension: Option<u32>, image: &RenderImage) {
     if image.frame_count() != 1 {
         return;
     }
-    let Some(entry) = entry_path(source, max_dimension) else {
-        return;
-    };
     let size = image.size(0);
-    let (width, height) = (size.width.0 as u32, size.height.0 as u32);
-    let Some(pixels) = image.as_bytes(0) else {
+    if let Some(pixels) = image.as_bytes(0) {
+        store_pixels(
+            source,
+            max_dimension,
+            size.width.0 as u32,
+            size.height.0 as u32,
+            pixels,
+        );
+    }
+}
+
+/// Seeds the cache from RGBA pixels that never went through GPUI, such as a
+/// thumbnail at the moment it is created.
+pub fn store_rgba(source: &Path, max_dimension: Option<u32>, image: &image::RgbaImage) {
+    let mut bgra = image.as_raw().clone();
+    for pixel in bgra.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    store_pixels(source, max_dimension, image.width(), image.height(), &bgra);
+}
+
+/// `pixels` are straight-alpha BGRA, the layout GPUI renders from.
+fn store_pixels(source: &Path, max_dimension: Option<u32>, width: u32, height: u32, pixels: &[u8]) {
+    let Some(entry) = entry_path(source, max_dimension) else {
         return;
     };
     if pixels.len() > MAX_DECODED_ENTRY_BYTES || decoded_len(width, height) != Some(pixels.len()) {

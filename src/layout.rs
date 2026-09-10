@@ -335,6 +335,7 @@ mod tests {
         BoardNode {
             id: format!("node-{index:04}"),
             parent_id: parent.map(|parent| format!("node-{parent:04}")),
+            merged_from: Vec::new(),
             prompt: String::new(),
             aspect: "auto".into(),
             source_images: Vec::new(),

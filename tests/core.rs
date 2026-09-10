@@ -10,6 +10,7 @@ fn node(id: &str, parent: Option<&str>, created_at: i64) -> BoardNode {
     BoardNode {
         id: id.into(),
         parent_id: parent.map(str::to_owned),
+        merged_from: vec![],
         prompt: id.into(),
         aspect: "auto".into(),
         source_images: vec![],
@@ -69,6 +70,7 @@ fn repository_persists_and_restores_deleted_subtrees() {
             NewNodesRequest {
                 prompt: "root".into(),
                 parent_id: None,
+                merged_from: vec![],
                 source_images: None,
                 aspect: "auto".into(),
                 count: 1,
@@ -85,6 +87,7 @@ fn repository_persists_and_restores_deleted_subtrees() {
             NewNodesRequest {
                 prompt: "child".into(),
                 parent_id: Some(root.id.clone()),
+                merged_from: vec![],
                 source_images: None,
                 aspect: "1:1".into(),
                 count: 1,

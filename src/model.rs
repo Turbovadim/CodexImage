@@ -29,6 +29,10 @@ pub enum StopReason {
 pub struct BoardNode {
     pub id: String,
     pub parent_id: Option<String>,
+    /// Extra parents whose images are combined with the parent's. Their
+    /// chains are described to Codex alongside the parent's.
+    #[serde(default)]
+    pub merged_from: Vec<String>,
     pub prompt: String,
     #[serde(default = "default_aspect")]
     pub aspect: String,
@@ -106,6 +110,9 @@ pub struct BoardSummary {
 pub struct NewNodesRequest {
     pub prompt: String,
     pub parent_id: Option<String>,
+    /// Extra parents to combine with; ignored without a parent.
+    pub merged_from: Vec<String>,
+    /// The parent's image first, then one image per merged parent.
     pub source_images: Option<Vec<String>>,
     pub aspect: String,
     pub count: usize,

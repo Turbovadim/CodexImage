@@ -172,7 +172,7 @@ impl Element for TextElement {
         let viewport_width = f32::from(bounds.size.width).max(0.);
         let viewport_height = f32::from(bounds.size.height).max(0.);
         let total_height = f32::from(layout.total_height);
-        let vertical_inset = if mode.centers_single_line() && total_height < viewport_height {
+        let vertical_inset = if total_height < viewport_height {
             (viewport_height - total_height) / 2.
         } else {
             0.
@@ -283,7 +283,7 @@ impl Element for TextElement {
                 window.paint_quad(cursor);
             }
         });
-        self.input.update(cx, |input, cx| {
+        let grew = self.input.update(cx, |input, _| {
             let height_changed = input.measured_visual_lines != prepaint.measured_visual_lines;
             input.last_layout = Some(prepaint.layout.clone());
             if input
@@ -301,9 +301,12 @@ impl Element for TextElement {
             input.scroll_x = prepaint.scroll_x;
             input.scroll_y = prepaint.scroll_y;
             input.vertical_inset = prepaint.vertical_inset;
-            if height_changed && matches!(input.mode, TextInputMode::AutoGrow { .. }) {
-                cx.notify();
-            }
+            height_changed && matches!(input.mode, TextInputMode::AutoGrow { .. })
         });
+        // A notify issued mid-paint marks the view dirty without scheduling a
+        // frame, so the new height would wait for the next input event.
+        if grew {
+            window.request_animation_frame();
+        }
     }
 }

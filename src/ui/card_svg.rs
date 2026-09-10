@@ -2,6 +2,7 @@
 //! card instead of replaying every primitive at low zoom.
 
 use super::card_scene::{CardImageFit, CardPrimitive, CardScene};
+use super::theme::{CARD_FONT_ASCENT, CARD_FONT_DESCENT, CARD_FONT_SVG_FAMILIES};
 use crate::layout::CARD_WIDTH;
 use gpui::TextAlign;
 use std::fmt::Write as _;
@@ -66,11 +67,14 @@ pub fn card_scene_svg(scene: &CardScene, rendered_width: f32) -> String {
                     TextAlign::Center => ("middle", bounds.x + bounds.width / 2.),
                     TextAlign::Right => ("end", bounds.x + bounds.width),
                 };
-                let baseline = bounds.y + (line_height - font_size) * 0.5 + font_size * 0.82;
+                // The same baseline placement as GPUI's line painter.
+                let baseline = bounds.y
+                    + (line_height - (CARD_FONT_ASCENT + CARD_FONT_DESCENT) * font_size) * 0.5
+                    + CARD_FONT_ASCENT * font_size;
                 let (fill, opacity) = color.svg();
                 write!(
                     svg,
-                    "<text x=\"{x}\" y=\"{baseline}\" clip-path=\"url(#{clip_id})\" font-family=\"system-ui,sans-serif\" font-size=\"{font_size}\" font-weight=\"400\" text-anchor=\"{anchor}\" fill=\"#{fill:06x}\" fill-opacity=\"{opacity}\">"
+                    "<text x=\"{x}\" y=\"{baseline}\" clip-path=\"url(#{clip_id})\" font-family=\"{CARD_FONT_SVG_FAMILIES}\" font-size=\"{font_size}\" font-weight=\"400\" text-anchor=\"{anchor}\" fill=\"#{fill:06x}\" fill-opacity=\"{opacity}\">"
                 )
                 .expect("writing to a String cannot fail");
                 push_xml_escaped(&mut svg, text);
@@ -218,6 +222,33 @@ mod tests {
         assert_eq!(CardColor::Raised.hsla(), theme::raised());
         assert_eq!(CardColor::Line.hsla(), theme::line());
         assert_eq!(CardColor::Accent45.hsla(), theme::accent().opacity(0.45));
+    }
+
+    /// The sprite face must resolve and actually draw. resvg resolves macOS's
+    /// system font yet renders nothing from it, and an unknown family
+    /// silently becomes a fallback face, so both failure modes are checked.
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn sprite_text_renders_ink_in_a_resolved_face(cx: &mut gpui::TestAppContext) {
+        let renderer = cx.update(|cx| cx.svg_renderer());
+        let render = |family: &str| {
+            let svg = format!(
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"200\" height=\"40\"><text x=\"4\" y=\"28\" font-family=\"{family}\" font-size=\"24\" fill=\"#ffffff\">Wgjq</text></svg>"
+            );
+            let image = renderer
+                .render_single_frame(svg.as_bytes(), 1.)
+                .expect("rendered sprite text");
+            image.as_bytes(0).expect("pixels").to_vec()
+        };
+        let ink = |pixels: &[u8]| pixels.chunks_exact(4).filter(|pixel| pixel[3] > 0).count();
+
+        let sprite = render(crate::ui::theme::CARD_FONT_SVG_FAMILIES);
+        assert!(ink(&sprite) > 0, "the sprite face drew nothing");
+        assert_ne!(
+            sprite,
+            render("'No Such Font'"),
+            "the sprite face did not resolve"
+        );
     }
 
     #[test]

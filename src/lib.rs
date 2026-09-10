@@ -1,3 +1,4 @@
+pub(crate) mod disk_cache;
 pub mod generation;
 pub mod layout;
 pub mod manifest;

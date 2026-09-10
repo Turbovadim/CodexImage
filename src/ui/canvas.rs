@@ -3,11 +3,13 @@
 
 use super::card::{
     CARD_SPRITE_WIDTHS, CanvasNode, CardImageFit, CardPrimitive, CardRect, CardScene,
+    FINEST_SPRITE_TIER,
 };
-use super::image_cache::{CardSpriteCache, DecodedImageCache};
+use super::image_cache::{
+    CardSpriteCache, DECODED_LONG_EDGE_CAP, DecodedImageCache, THUMBNAIL_DECODE_CAP,
+};
 use super::theme;
 use crate::layout::CARD_WIDTH;
-use crate::storage::THUMBNAIL_MAX_DIMENSION;
 use gpui::{
     App, BorderStyle, Bounds, ContentMask, Entity, ObjectFit, PathBuilder, Pixels, Point, Resource,
     SharedString, TextAlign, TextRun, Window, point, px, quad, size,
@@ -18,7 +20,10 @@ use std::sync::{Arc, OnceLock};
 
 const GRID_GAP: f32 = 28.;
 const GRID_DOT_SIZE: f32 = 1.4;
-const GRID_TILE_CELLS: usize = 32;
+/// Eight cells keep the 2x tile texture under the atlas page size, so it
+/// shares a page instead of pinning a dedicated 13 MB texture as a 32-cell
+/// tile did. A viewport then needs a few dozen tile quads, which is nothing.
+const GRID_TILE_CELLS: usize = 8;
 const GRID_TILE_SIZE: f32 = GRID_GAP * GRID_TILE_CELLS as f32;
 const GRID_TEXTURE_SCALE: u32 = 2;
 const GRID_ANTIALIAS_SAMPLES: u32 = 8;
@@ -54,6 +59,8 @@ pub struct CanvasConnector {
     pub from_y: f32,
     pub to_x: f32,
     pub to_y: f32,
+    /// Links a combined image's extra parent; drawn in the accent colour.
+    pub merged: bool,
 }
 
 impl CanvasConnector {
@@ -280,8 +287,10 @@ pub fn paint_connectors(
         return;
     }
     let style = ConnectorStyle::for_zoom(zoom);
-    let mut builder = PathBuilder::stroke(px(style.stroke_width));
-    let mut visible = false;
+    let mut builders = [
+        (PathBuilder::stroke(px(style.stroke_width)), false),
+        (PathBuilder::stroke(px(style.stroke_width)), false),
+    ];
     for edge in edges {
         let (from, to) = edge.screen_points(camera_x, camera_y, zoom);
         if edge_is_visible(
@@ -291,12 +300,17 @@ pub fn paint_connectors(
             viewport_height,
             VIEWPORT_CULL_MARGIN,
         ) {
-            append_dashed_connector(&mut builder, from, to, style);
-            visible = true;
+            let (builder, visible) = &mut builders[usize::from(edge.merged)];
+            append_dashed_connector(builder, from, to, style);
+            *visible = true;
         }
     }
-    if visible && let Ok(path) = builder.build() {
+    let [(parent, parent_visible), (merged, merged_visible)] = builders;
+    if parent_visible && let Ok(path) = parent.build() {
         window.paint_path(path, theme::line());
+    }
+    if merged_visible && let Ok(path) = merged.build() {
+        window.paint_path(path, theme::accent().opacity(0.6));
     }
 }
 
@@ -428,6 +442,7 @@ fn paint_canvas_text(
     let run = TextRun {
         len: text.len(),
         color: style.color,
+        font: gpui::font(theme::CARD_FONT_FAMILY),
         ..Default::default()
     };
     let line = window
@@ -449,6 +464,8 @@ struct CanvasImageStyle {
     fit: ObjectFit,
     corner_radius: f32,
     blurred: bool,
+    /// The largest long edge this paint can need, which picks the decode tier.
+    decode_cap: u32,
 }
 
 fn paint_canvas_image(
@@ -471,8 +488,9 @@ fn paint_canvas_image(
         };
         data
     } else {
-        let Some(Ok(data)) = image_cache.update(cx, |cache, cx| cache.load(&resource, window, cx))
-        else {
+        let Some(Ok(data)) = image_cache.update(cx, |cache, cx| {
+            cache.load(&resource, style.decode_cap, window, cx)
+        }) else {
             return;
         };
         data
@@ -492,12 +510,60 @@ fn paint_canvas_image(
     );
 }
 
+/// How the current frame relates to the zoom gesture, decided once per frame.
+#[derive(Clone, Copy)]
+pub struct ZoomPhase {
+    /// Zoom has held still long enough to rasterize sprites for its tier.
+    pub settled: bool,
+    /// Keep painting card text while the gesture moves. Shaping text for a
+    /// handful of cards is cheap; only a crowded overview skips it.
+    pub gesture_text: bool,
+}
+
+impl ZoomPhase {
+    pub fn new(settled: bool, visible_cards: usize) -> Self {
+        Self {
+            settled,
+            gesture_text: visible_cards <= MAX_TEXT_CARDS_DURING_GESTURE,
+        }
+    }
+}
+
+/// Above this many visible cards, text is dropped while a zoom gesture moves.
+const MAX_TEXT_CARDS_DURING_GESTURE: usize = 48;
+
+/// Which primitives a direct paint of the scene draws.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SceneLayers {
+    All,
+    /// A crowded overview mid-gesture: prioritize image continuity.
+    NoText,
+    /// Crisp display thumbnails laid over a scaled sprite's small copies.
+    ImagesOnly,
+}
+
+/// The best sprite already rasterized for this card: the target tier when it
+/// has been visited before, otherwise whatever tier was painted last. Never
+/// starts new raster work, so it is safe to call every frame of a gesture.
+fn ready_sprite(
+    canvas_node: &CanvasNode,
+    tiers: [usize; 2],
+    sprite_cache: &Entity<CardSpriteCache>,
+    cx: &mut App,
+) -> Option<Arc<gpui::RenderImage>> {
+    tiers.into_iter().find_map(|tier| {
+        canvas_node
+            .ready_sprite_image(tier)
+            .and_then(|image| sprite_cache.update(cx, |cache, _| cache.ready(image)))
+    })
+}
+
 #[expect(clippy::too_many_arguments)]
 pub fn paint_canvas_node(
     frame: &CanvasNodeFrame,
     canvas_node: &CanvasNode,
     zoom: f32,
-    zoom_settled: bool,
+    phase: ZoomPhase,
     image_cache: &Entity<DecodedImageCache>,
     sprite_cache: &Entity<CardSpriteCache>,
     sprite_source_budget: &mut usize,
@@ -514,54 +580,84 @@ pub fn paint_canvas_node(
     // passes, which become visible as contour bands over dark images. Running
     // cards are few and short-lived, so paint their shared CPU-blurred image
     // directly instead of rasterizing the blurred image into a card sprite.
-    let tier = sprite_tier_for_zoom(zoom).filter(|_| !canvas_node.scene.has_blurred_images);
+    let sprites_allowed = !canvas_node.scene.has_blurred_images;
+    let zoom_tier = sprite_tier_for_zoom(zoom);
+    // Above the tiers a card rests as direct paint, but a moving gesture still
+    // scales the finest sprite: a raster scales on the GPU without touching a
+    // glyph, whereas direct paint reshapes and re-rasterizes every line at
+    // its new size on every frame, which reads as text flickering.
+    let raster_tier = sprites_allowed.then(|| zoom_tier.unwrap_or(FINEST_SPRITE_TIER));
     let mut sprite = None;
     let mut deferred_sprite_source = false;
     let previous_tier = canvas_node.last_ready_sprite_tier.load(Ordering::Relaxed) as usize;
-    if !zoom_settled && !canvas_node.scene.has_blurred_images {
-        sprite = canvas_node
-            .ready_sprite_image(previous_tier)
-            .and_then(|image| sprite_cache.update(cx, |cache, _| cache.ready(image, window)));
-    }
-    // A cold pinch must not enqueue hundreds of SVG raster jobs for tiers
-    // the user is only passing through. The settle task requests one redraw.
-    if let Some(tier) = tier.filter(|_| zoom_settled) {
-        let source = if canvas_node.sprite_image_is_initialized(tier) {
-            canvas_node.sprite_image(tier)
-        } else if *sprite_source_budget > 0 {
-            *sprite_source_budget -= 1;
-            canvas_node.sprite_image(tier)
+    if let Some(raster_tier) = raster_tier {
+        let fallback_tiers = [raster_tier, previous_tier];
+        if phase.settled {
+            // A cold pinch must not enqueue hundreds of SVG raster jobs for
+            // tiers the user is only passing through, so rasterization waits
+            // for the settle; the settle task requests one redraw.
+            let source = if canvas_node.sprite_image_is_initialized(raster_tier) {
+                canvas_node.sprite_image(raster_tier)
+            } else if *sprite_source_budget > 0 {
+                *sprite_source_budget -= 1;
+                canvas_node.sprite_image(raster_tier)
+            } else {
+                deferred_sprite_source = true;
+                None
+            };
+            let rendered = source.and_then(|image| {
+                sprite_cache.update(cx, |cache, cx| cache.load(image, window, cx))
+            });
+            if rendered.is_some() {
+                canvas_node
+                    .last_ready_sprite_tier
+                    .store(raster_tier as u8, Ordering::Relaxed);
+            }
+            if zoom_tier.is_some() {
+                sprite = rendered
+                    .or_else(|| ready_sprite(canvas_node, fallback_tiers, sprite_cache, cx));
+            }
         } else {
-            deferred_sprite_source = true;
-            None
-        };
-        sprite = source
-            .and_then(|image| sprite_cache.update(cx, |cache, cx| cache.load(image, window, cx)));
-        if sprite.is_some() {
-            canvas_node
-                .last_ready_sprite_tier
-                .store(tier as u8, Ordering::Relaxed);
-        } else if previous_tier < CARD_SPRITE_WIDTHS.len() && previous_tier != tier {
-            sprite = canvas_node
-                .ready_sprite_image(previous_tier)
-                .and_then(|image| sprite_cache.update(cx, |cache, _| cache.ready(image, window)));
+            sprite = ready_sprite(canvas_node, fallback_tiers, sprite_cache, cx);
         }
     }
-    if let Some(sprite) = sprite {
-        let _ = window.paint_image(bounds, bounds, px(20. * zoom).into(), sprite, 0, false);
-    } else {
-        paint_card_scene(
-            frame,
-            &canvas_node.scene,
-            zoom,
-            zoom_settled || tier.is_none(),
-            image_cache,
-            window,
-            cx,
-        );
+    match sprite {
+        Some(sprite) => {
+            let _ = window.paint_image(bounds, bounds, px(20. * zoom).into(), sprite, 0, false);
+            if zoom_tier.is_none() {
+                // The sprite carries the tiny thumbnails scaled well past
+                // their size. The display thumbnails were decoded at rest,
+                // so lay them over crisp; anything missing shows the sprite's.
+                paint_card_scene(
+                    frame,
+                    &canvas_node.scene,
+                    zoom,
+                    SceneLayers::ImagesOnly,
+                    image_cache,
+                    window,
+                    cx,
+                );
+            }
+        }
+        None => {
+            let layers = if phase.settled || phase.gesture_text || zoom_tier.is_none() {
+                SceneLayers::All
+            } else {
+                SceneLayers::NoText
+            };
+            paint_card_scene(
+                frame,
+                &canvas_node.scene,
+                zoom,
+                layers,
+                image_cache,
+                window,
+                cx,
+            );
+        }
     }
 
-    if zoom_settled {
+    if phase.settled {
         paint_high_resolution_card_images(frame, &canvas_node.scene, zoom, image_cache, window, cx);
     }
 
@@ -660,7 +756,7 @@ fn paint_card_scene(
     frame: &CanvasNodeFrame,
     scene: &CardScene,
     zoom: f32,
-    show_text: bool,
+    layers: SceneLayers,
     image_cache: &Entity<DecodedImageCache>,
     window: &mut Window,
     cx: &mut App,
@@ -677,9 +773,12 @@ fn paint_card_scene(
         }),
         |window| {
             for primitive in &scene.primitives {
-                // At overview scale, prioritize image continuity while a cold
-                // gesture moves. Small labels return when zoom settles.
-                if !show_text && matches!(primitive, CardPrimitive::Text { .. }) {
+                let skipped = match primitive {
+                    CardPrimitive::Text { .. } => layers != SceneLayers::All,
+                    CardPrimitive::Quad { .. } => layers == SceneLayers::ImagesOnly,
+                    CardPrimitive::Image { .. } => false,
+                };
+                if skipped {
                     continue;
                 }
                 match primitive {
@@ -729,12 +828,12 @@ fn paint_card_scene(
                         blurred,
                     } => paint_canvas_image(
                         // Past the sprite tiers this is the card's resting
-                        // look, so it earns the 1080 px thumbnail; the
-                        // original takes over once even that is too small.
-                        // Within the tiers direct painting is a transient
-                        // stand-in until the sprite lands, and the tiny
-                        // thumbnail avoids re-reading hundreds of MB of
-                        // sidecars per tier crossing.
+                        // look, so it earns the thumbnail; the original takes
+                        // over once even that is too small. Within the tiers
+                        // direct painting is a transient stand-in until the
+                        // sprite lands, and the tiny thumbnail avoids
+                        // re-reading hundreds of MB of sidecars per tier
+                        // crossing.
                         if paints_cards_directly(zoom) {
                             &asset.thumbnail
                         } else {
@@ -748,6 +847,7 @@ fn paint_card_scene(
                             },
                             corner_radius: radius * zoom,
                             blurred: *blurred,
+                            decode_cap: THUMBNAIL_DECODE_CAP,
                         },
                         image_cache,
                         window,
@@ -768,7 +868,7 @@ fn paint_high_resolution_card_images(
     cx: &mut App,
 ) {
     let scale_factor = window.scale_factor();
-    if scene.max_high_resolution_dimension * zoom * scale_factor <= THUMBNAIL_MAX_DIMENSION as f32 {
+    if scene.max_high_resolution_dimension * zoom * scale_factor <= THUMBNAIL_DECODE_CAP as f32 {
         return;
     }
     for primitive in &scene.primitives {
@@ -799,6 +899,7 @@ fn paint_high_resolution_card_images(
                 },
                 corner_radius: radius * zoom,
                 blurred: false,
+                decode_cap: DECODED_LONG_EDGE_CAP,
             },
             image_cache,
             window,
@@ -807,8 +908,10 @@ fn paint_high_resolution_card_images(
     }
 }
 
+/// Whether the thumbnail decode would be upscaled on screen, so the original
+/// should be painted over it.
 fn image_needs_high_resolution(bounds: CardRect, zoom: f32, scale_factor: f32) -> bool {
-    bounds.width.max(bounds.height) * zoom * scale_factor > THUMBNAIL_MAX_DIMENSION as f32
+    bounds.width.max(bounds.height) * zoom * scale_factor > THUMBNAIL_DECODE_CAP as f32
 }
 
 fn transform_card_rect(bounds: CardRect, frame: &CanvasNodeFrame, zoom: f32) -> Bounds<Pixels> {
@@ -873,6 +976,7 @@ mod tests {
             from_y: 40.,
             to_x: 100.,
             to_y: 140.,
+            merged: false,
         };
 
         assert_eq!(
@@ -926,15 +1030,15 @@ mod tests {
     #[test]
     fn node_images_promote_to_originals_only_when_thumbnails_are_undersized() {
         let full_card_image = CardRect::new(0., 0., CARD_WIDTH, CARD_WIDTH);
-        assert!(!image_needs_high_resolution(full_card_image, 1.5, 2.));
-        assert!(image_needs_high_resolution(full_card_image, 1.6, 2.));
+        assert!(!image_needs_high_resolution(full_card_image, 1., 2.));
+        assert!(image_needs_high_resolution(full_card_image, 1.05, 2.));
 
         let half_width_tile = CardRect::new(0., 0., 169., 169.);
         assert!(!image_needs_high_resolution(half_width_tile, 2., 2.));
 
         let portrait_hero = CardRect::new(0., 0., CARD_WIDTH, CARD_WIDTH * 2.);
-        assert!(!image_needs_high_resolution(portrait_hero, 0.6, 2.));
-        assert!(image_needs_high_resolution(portrait_hero, 0.8, 2.));
+        assert!(!image_needs_high_resolution(portrait_hero, 0.5, 2.));
+        assert!(image_needs_high_resolution(portrait_hero, 0.55, 2.));
     }
 
     #[test]
@@ -968,9 +1072,9 @@ mod tests {
                 "zoom {zoom} produced a {}px dot spacing",
                 grid.dot_gap
             );
-            // A 1600x1000 viewport never needs more than a handful of tiles.
+            // A 1600x1000 viewport never needs more than a few dozen tiles.
             let tiles = (1600. / grid.tile_size).ceil() * (1000. / grid.tile_size).ceil();
-            assert!(tiles <= 12., "zoom {zoom} needed {tiles} grid tiles");
+            assert!(tiles <= 64., "zoom {zoom} needed {tiles} grid tiles");
             zoom *= 0.75;
         }
     }

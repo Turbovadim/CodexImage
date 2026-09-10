@@ -41,6 +41,8 @@ Defender SmartScreen may require **More info > Run anyway** on first launch.
 - Generates parallel takes from one prompt.
 - Keeps branches visible as a graph instead of flattening them into chat history.
 - Lets you branch, regenerate, edit, duplicate, or delete any result.
+- Combines images from different branches into one generation, with every
+  branch's prompt history passed along.
 - Opens images in a lightbox and collects completed work in a gallery.
 - Saves boards locally and marks interrupted jobs after a restart instead of
   leaving them stuck as running.
@@ -101,10 +103,10 @@ that instead. Set `CODEXIMAGE_DATA` to choose another data directory or
 `CODEX_BIN` to use a specific Codex executable. Windows discovery includes the
 standard npm, pnpm, Bun, Volta, Cargo, and WinGet locations.
 
-The app keeps untouched generations under `generated-originals`. It creates
-conditioned 16-bit copies for the canvas, exports, and later image edits. This
-reduces repeating artifacts that can build up across a chain of edits. Existing
-board images are conditioned once in the background.
+The app stores each generation as a conditioned 16-bit PNG, used by the canvas,
+exports, and later image edits. This reduces repeating artifacts that can build
+up across a chain of edits. Existing board images are conditioned once in the
+background. Codex keeps the raw file in its own generated-images directory.
 
 Set `CODEXIMAGE_REINGEST_CONDITIONING=0` to turn conditioning off. Use a value
 between `0` and `1` to reduce its strength.
@@ -124,6 +126,7 @@ between `0` and `1` to reduce its strength.
 | `G` | Open the gallery |
 | `Esc` | Close or cancel |
 | `B` | Branch from the hovered node |
+| `C` | Combine the hovered node's image with the branching target |
 | `R` | Regenerate the hovered node |
 | `E` | Edit the hovered node |
 | `D` | Duplicate the hovered node |

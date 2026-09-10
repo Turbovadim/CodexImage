@@ -7,15 +7,14 @@ use super::canvas_view::DragState;
 use super::composer::control_button;
 use super::format::image_format_for_path;
 use super::image_cache::DECODED_LONG_EDGE_CAP;
-use super::input::TextInputMode;
-use super::keymap::{Generate, LightboxDown, LightboxLeft, LightboxRight, LightboxUp};
+use super::keymap::{LightboxDown, LightboxLeft, LightboxRight, LightboxUp};
 use super::theme;
 use super::tooltip::tip_with_shortcut;
-use crate::model::{Board, BoardNode, NewNodesRequest};
+use crate::model::{Board, BoardNode};
 use gpui::{
-    AnyElement, ClipboardItem, Context, Focusable, FontWeight, Image, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ObjectFit, PinchEvent, Pixels, Point, Resource, Role,
-    ScrollWheelEvent, StyledImage, Window, div, img, prelude::*, px,
+    AnyElement, ClipboardItem, Context, Image, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ObjectFit, PinchEvent, Pixels, Point, Resource, Role, ScrollWheelEvent,
+    StyledImage, Window, div, img, prelude::*, px,
 };
 use std::collections::VecDeque;
 use std::fs;
@@ -25,6 +24,11 @@ use std::sync::Arc;
 pub(super) const LIGHTBOX_MIN_ZOOM: f32 = 1.;
 
 pub(super) const LIGHTBOX_MAX_ZOOM: f32 = 8.;
+/// The area the image is fitted and panned within.
+fn lightbox_stage_size(window: &Window) -> (f32, f32) {
+    let viewport = window.viewport_size();
+    (f32::from(viewport.width), f32::from(viewport.height))
+}
 
 pub(super) struct Lightbox {
     pub(super) node_id: String,
@@ -190,7 +194,7 @@ pub(super) fn lightbox_target(
                 image: node.images[index as usize].clone(),
             });
         }
-        let parent_id = node.parent_id.as_ref()?;
+        // Siblings share a parent; top-level cards share having none.
         // Horizontal navigation runs during both render and prefetch. Select
         // the neighboring sort key in-place instead of allocating and sorting
         // every sibling on each call.
@@ -202,7 +206,7 @@ pub(super) fn lightbox_target(
                     .nodes
                     .iter()
                     .filter(|candidate| {
-                        candidate.parent_id.as_ref() == Some(parent_id)
+                        candidate.parent_id == node.parent_id
                             && !candidate.images.is_empty()
                             && (candidate.created_at, candidate.id.as_str()) > key
                     })
@@ -212,7 +216,7 @@ pub(super) fn lightbox_target(
                     .nodes
                     .iter()
                     .filter(|candidate| {
-                        candidate.parent_id.as_ref() == Some(parent_id)
+                        candidate.parent_id == node.parent_id
                             && !candidate.images.is_empty()
                             && (candidate.created_at, candidate.id.as_str()) < key
                     })
@@ -233,7 +237,7 @@ pub(super) fn lightbox_target(
         let mut parent_id = node.parent_id.as_deref();
         while let Some(id) = parent_id {
             let parent = board.nodes.iter().find(|candidate| candidate.id == id)?;
-            if let Some(image) = parent.images.last() {
+            if let Some(image) = parent.images.first() {
                 return Some(LightboxLocation {
                     node_id: parent.id.clone(),
                     image: image.clone(),
@@ -250,7 +254,7 @@ pub(super) fn lightbox_target(
         .filter(|candidate| candidate.parent_id.as_deref() == Some(&node.id))
         .collect();
     while let Some(child) = queue.pop_front() {
-        if let Some(image) = child.images.last() {
+        if let Some(image) = child.images.first() {
             return Some(LightboxLocation {
                 node_id: child.id.clone(),
                 image: image.clone(),
@@ -270,50 +274,32 @@ impl AppView {
     pub(super) fn navigate_left(
         &mut self,
         _: &LightboxLeft,
-        window: &mut Window,
+        _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.lightbox_input_focused(window, cx) {
-            self.navigate_lightbox(-1, 0, cx)
-        }
+        self.navigate_lightbox(-1, 0, cx)
     }
 
     pub(super) fn navigate_right(
         &mut self,
         _: &LightboxRight,
-        window: &mut Window,
+        _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.lightbox_input_focused(window, cx) {
-            self.navigate_lightbox(1, 0, cx)
-        }
+        self.navigate_lightbox(1, 0, cx)
     }
 
-    pub(super) fn navigate_up(
-        &mut self,
-        _: &LightboxUp,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.lightbox_input_focused(window, cx) {
-            self.navigate_lightbox(0, -1, cx)
-        }
+    pub(super) fn navigate_up(&mut self, _: &LightboxUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.navigate_lightbox(0, -1, cx)
     }
 
     pub(super) fn navigate_down(
         &mut self,
         _: &LightboxDown,
-        window: &mut Window,
+        _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.lightbox_input_focused(window, cx) {
-            self.navigate_lightbox(0, 1, cx)
-        }
-    }
-
-    fn lightbox_input_focused(&self, window: &Window, cx: &Context<Self>) -> bool {
-        matches!(self.overlay, Overlay::Lightbox(_))
-            && self.modal_input.focus_handle(cx).is_focused(window)
+        self.navigate_lightbox(0, 1, cx)
     }
 
     pub(super) fn open_lightbox(
@@ -323,11 +309,6 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.modal_input.update(cx, |input, cx| {
-            input.set_mode(TextInputMode::SingleLine, cx);
-            input.set_placeholder("Refine this image…", cx);
-            input.clear(cx);
-        });
         self.overlay = Overlay::Lightbox(Lightbox {
             node_id,
             image,
@@ -353,7 +334,6 @@ impl AppView {
             return;
         };
         current.request(target);
-        self.modal_input.update(cx, |input, cx| input.clear(cx));
         cx.notify();
     }
 
@@ -365,10 +345,9 @@ impl AppView {
         let mut load_error = None;
         if let Some(pending) = pending {
             let resource = Resource::Path(Arc::from(self.display_image_path(&pending.image, true)));
-            match self
-                .image_cache
-                .update(cx, |cache, cx| cache.load(&resource, window, cx))
-            {
+            match self.image_cache.update(cx, |cache, cx| {
+                cache.load(&resource, DECODED_LONG_EDGE_CAP, window, cx)
+            }) {
                 Some(Ok(image)) if image.frame_count() > 0 => {
                     if let Overlay::Lightbox(lightbox) = &mut self.overlay {
                         lightbox.commit_pending(&pending);
@@ -435,15 +414,9 @@ impl AppView {
         let Some(image_ratio) = self.lightbox_image_ratio() else {
             return;
         };
-        let viewport = window.viewport_size();
+        let (stage_width, stage_height) = lightbox_stage_size(window);
         if let Overlay::Lightbox(lightbox) = &mut self.overlay {
-            lightbox.zoom_at(
-                factor,
-                focal,
-                f32::from(viewport.width),
-                f32::from(viewport.height),
-                image_ratio,
-            );
+            lightbox.zoom_at(factor, focal, stage_width, stage_height, image_ratio);
             cx.notify();
         }
     }
@@ -465,13 +438,13 @@ impl AppView {
         let Some(image_ratio) = self.lightbox_image_ratio() else {
             return;
         };
-        let viewport = window.viewport_size();
+        let (stage_width, stage_height) = lightbox_stage_size(window);
         if let Overlay::Lightbox(lightbox) = &mut self.overlay {
             lightbox.pan_to(
                 origin.0 + f32::from(event.position.x - start.x),
                 origin.1 + f32::from(event.position.y - start.y),
-                f32::from(viewport.width),
-                f32::from(viewport.height),
+                stage_width,
+                stage_height,
                 image_ratio,
             );
             cx.notify();
@@ -485,78 +458,6 @@ impl AppView {
         }
     }
 
-    pub(super) fn continue_from_lightbox(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.composer_submission_pending {
-            self.show_toast("A generation is already starting".into(), false, None, cx);
-            return;
-        }
-        let Overlay::Lightbox(lightbox) = &self.overlay else {
-            return;
-        };
-        let location = lightbox.displayed_location();
-        let (node_id, image) = (lightbox.node_id.clone(), lightbox.image.clone());
-        let prompt = self.modal_input.read(cx).content().trim().to_owned();
-        if prompt.is_empty() {
-            return;
-        }
-        let board_id = match self.board_id() {
-            Ok(board_id) => board_id.to_owned(),
-            Err(error) => {
-                self.show_error(error, cx);
-                return;
-            }
-        };
-        let submitted_board_id = board_id.clone();
-        let submitted_prompt = prompt.clone();
-        let request = NewNodesRequest {
-            prompt,
-            parent_id: Some(node_id.clone()),
-            source_images: Some(vec![image]),
-            aspect: self
-                .board
-                .as_ref()
-                .and_then(|board| board.nodes.iter().find(|node| node.id == node_id))
-                .map(|node| node.aspect.clone())
-                .unwrap_or_else(|| "auto".into()),
-            count: 1,
-            attachment_paths: Vec::new(),
-            attachment_urls: Vec::new(),
-            position: None,
-        };
-        self.composer_submission_pending = true;
-        cx.notify();
-        let engine = self.engine.clone();
-        let submission = cx
-            .background_spawn(async move { engine.add_and_start(&board_id, request).map(|_| ()) });
-        cx.spawn_in(window, async move |weak, cx| {
-            let result = submission.await;
-            let _ = weak.update_in(cx, |view, window, cx| {
-                view.composer_submission_pending = false;
-                match result {
-                    Ok(()) => {
-                        let still_current = matches!(
-                            &view.overlay,
-                            Overlay::Lightbox(lightbox)
-                                if lightbox.displayed_location() == location
-                        ) && view
-                            .board_id()
-                            .is_ok_and(|board_id| board_id == submitted_board_id);
-                        let prompt_unchanged =
-                            view.modal_input.read(cx).content().trim() == submitted_prompt;
-                        if still_current && prompt_unchanged {
-                            view.modal_input.update(cx, |input, cx| input.clear(cx));
-                            view.overlay = Overlay::None;
-                            window.focus(&view.focus, cx);
-                        }
-                    }
-                    Err(error) => view.show_error(error, cx),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
     pub(super) fn render_lightbox(
         &self,
         lightbox: &Lightbox,
@@ -566,8 +467,7 @@ impl AppView {
         let path = self.display_image_path(&lightbox.image, true);
         let thumbnail_path = self.display_image_path(&lightbox.image, false);
         let resource = Resource::Path(Arc::from(path.clone()));
-        let viewport_width = f32::from(window.viewport_size().width);
-        let viewport_height = f32::from(window.viewport_size().height);
+        let (viewport_width, viewport_height) = lightbox_stage_size(window);
         let image_ratio = normalized_image_ratio(
             self.image_ratios
                 .get(&lightbox.image)
@@ -597,10 +497,9 @@ impl AppView {
         let display_image = if let Some(image) = native {
             img(image)
         } else {
-            match self
-                .image_cache
-                .update(cx, |cache, cx| cache.load(&resource, window, cx))
-            {
+            match self.image_cache.update(cx, |cache, cx| {
+                cache.load(&resource, DECODED_LONG_EDGE_CAP, window, cx)
+            }) {
                 Some(Ok(image)) if image.frame_count() > 0 => img(image),
                 _ => img(thumbnail_path),
             }
@@ -622,13 +521,13 @@ impl AppView {
         let open_path = path.clone();
         let branch_node = lightbox.node_id.clone();
         let branch_image = lightbox.image.clone();
+        let combine_node = lightbox.node_id.clone();
+        let combine_image = lightbox.image.clone();
         let locate_node = lightbox.node_id.clone();
         let (pan_x, pan_y) = lightbox.clamped_pan(viewport_width, viewport_height, image_ratio);
         let image_left = (viewport_width - image_width) / 2. + pan_x;
         let image_top = (viewport_height - image_height) / 2. + pan_y;
         let lightbox_dragging = matches!(&self.drag, Some(DragState::Lightbox { .. }));
-        let continue_ready = !self.composer_submission_pending
-            && !self.modal_input.read(cx).content().trim().is_empty();
         let stage_cursor = if lightbox_dragging {
             gpui::CursorStyle::ClosedHand
         } else if lightbox.zoom > LIGHTBOX_MIN_ZOOM {
@@ -636,7 +535,6 @@ impl AppView {
         } else {
             gpui::CursorStyle::Arrow
         };
-        let continue_width = (viewport_width - 48.).clamp(240., 540.);
         let toolbar = div()
             .absolute()
             .top(px(16.))
@@ -648,7 +546,12 @@ impl AppView {
                 "Branch (B)",
                 cx.listener(move |this, _, window, cx| {
                     this.branch_node(&branch_node, Some(branch_image.clone()), window, cx);
-                    this.overlay = Overlay::None;
+                }),
+            ))
+            .child(control_button(
+                "Combine (C)",
+                cx.listener(move |this, _, window, cx| {
+                    this.combine_node(&combine_node, Some(combine_image.clone()), window, cx);
                 }),
             ))
             .child(control_button(
@@ -665,9 +568,9 @@ impl AppView {
             ))
             .child(control_button(
                 "Open original",
-                cx.listener(move |_, _, _, cx| {
+                cx.listener(move |_, _, _, _| {
                     let path = open_path.clone();
-                    cx.background_spawn(async move {
+                    smol::unblock(move || {
                         let _ = crate::platform::open_path(&path);
                     })
                     .detach();
@@ -742,61 +645,7 @@ impl AppView {
                             .object_fit(ObjectFit::Contain),
                     ),
             )
-            .child(toolbar)
-            .child(
-                div()
-                    .absolute()
-                    .left(px((viewport_width - continue_width) / 2.))
-                    .bottom(px(20.))
-                    .w(px(continue_width))
-                    .rounded_xl()
-                    .border_1()
-                    .border_color(theme::line())
-                    .bg(theme::raised().opacity(0.94))
-                    .occlude()
-                    .p_2()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .px_3()
-                            .child(self.modal_input.clone()),
-                    )
-                    .child(
-                        div()
-                            .id("quick-continue")
-                            .role(Role::Button)
-                            .aria_label(if self.composer_submission_pending {
-                                "Starting generation"
-                            } else {
-                                "Continue from this image"
-                            })
-                            .rounded_lg()
-                            .px_4()
-                            .py_2()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(if self.composer_submission_pending {
-                                "Starting…"
-                            } else {
-                                "Continue ↵"
-                            })
-                            .when(continue_ready, |button| {
-                                button
-                                    .bg(theme::accent_strong())
-                                    .text_color(gpui::white())
-                                    .cursor_pointer()
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.generate(&Generate, window, cx)
-                                    }))
-                            })
-                            .when(!continue_ready, |button| {
-                                button.bg(theme::hover()).text_color(theme::faint())
-                            }),
-                    )
-            );
+            .child(toolbar);
         let location = lightbox.displayed_location();
         for (direction, id, glyph, hint) in [
             (-1, "lightbox-previous", "‹", "Previous image"),
@@ -942,6 +791,7 @@ mod tests {
         BoardNode {
             id: id.into(),
             parent_id: parent_id.map(str::to_owned),
+            merged_from: Vec::new(),
             prompt: "prompt".into(),
             aspect: "auto".into(),
             source_images: Vec::new(),
@@ -1055,11 +905,12 @@ mod tests {
             title: "Board".into(),
             created_at: 0,
             nodes: vec![
-                tree_node("root", None, &["root-0"], 0),
+                tree_node("root", None, &["root-0", "root-1"], 0),
                 tree_node("take-a", Some("root"), &["a-0", "a-1"], 1),
                 tree_node("take-b", Some("root"), &["b-0", "b-1"], 2),
                 tree_node("empty-child", Some("take-a"), &[], 3),
-                tree_node("descendant", Some("empty-child"), &["d-0"], 4),
+                tree_node("descendant", Some("empty-child"), &["d-0", "d-1"], 4),
+                tree_node("other-root", None, &["o-0"], 5),
             ],
         };
         let a0 = LightboxLocation {
@@ -1075,11 +926,20 @@ mod tests {
         assert_eq!(b0.image, "b-0");
         assert_eq!(lightbox_target(&board, &b0, -1, 0), Some(a1.clone()));
 
+        // Vertical moves land on the first image of a multi-image card.
         let parent = lightbox_target(&board, &a0, 0, -1).expect("parent image");
         assert_eq!(parent.node_id, "root");
         assert_eq!(parent.image, "root-0");
         let descendant = lightbox_target(&board, &a0, 0, 1).expect("descendant image");
         assert_eq!(descendant.node_id, "descendant");
         assert_eq!(descendant.image, "d-0");
+
+        // Top-level cards are siblings of each other.
+        let root_1 = lightbox_target(&board, &parent, 1, 0).expect("next root image");
+        assert_eq!(root_1.image, "root-1");
+        let other_root = lightbox_target(&board, &root_1, 1, 0).expect("next root card");
+        assert_eq!(other_root.node_id, "other-root");
+        assert_eq!(other_root.image, "o-0");
+        assert_eq!(lightbox_target(&board, &other_root, -1, 0), Some(root_1));
     }
 }

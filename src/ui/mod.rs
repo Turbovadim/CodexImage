@@ -6,7 +6,6 @@ mod card_layout;
 mod card_scene;
 mod card_svg;
 mod composer;
-mod disk_cache;
 mod format;
 mod image_cache;
 #[cfg(target_os = "macos")]

@@ -221,6 +221,7 @@ mod tests {
         BoardNode {
             id: id.into(),
             parent_id,
+            merged_from: Vec::new(),
             prompt: String::new(),
             aspect: "auto".into(),
             source_images: Vec::new(),

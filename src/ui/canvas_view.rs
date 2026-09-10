@@ -5,8 +5,8 @@ use super::app::AppView;
 use super::app::Overlay;
 use super::canvas::{
     CanvasConnector, CanvasNodeFrame, MAX_SPRITE_SOURCE_BUILDS_PER_FRAME, ToolbarButtonPaint,
-    VIEWPORT_CULL_MARGIN, paint_canvas_node, paint_connectors, paint_dot_grid, paint_node_toolbar,
-    rect_is_visible,
+    VIEWPORT_CULL_MARGIN, ZoomPhase, paint_canvas_node, paint_connectors, paint_dot_grid,
+    paint_node_toolbar, rect_is_visible,
 };
 use super::card::{
     ATTACHMENT_ROW_HEIGHT, COLLAPSED_PROMPT_LINES, CanvasNode, CardRect, EXPANDED_PROMPT_LINES,
@@ -86,6 +86,7 @@ pub(super) enum CanvasClickTarget {
 pub(super) enum ToolbarAction {
     Stop,
     Branch,
+    Combine,
     Edit,
     Retry,
     Copy,
@@ -98,6 +99,7 @@ impl ToolbarAction {
         match self {
             Self::Stop => "Stop",
             Self::Branch => "Branch",
+            Self::Combine => "Mix",
             Self::Edit => "Edit",
             Self::Retry => "Retry",
             Self::Copy => "Copy",
@@ -121,8 +123,9 @@ const RUNNING_TOOLBAR_ACTIONS: [ToolbarAction; 4] = [
     ToolbarAction::Duplicate,
     ToolbarAction::Delete,
 ];
-const IDLE_TOOLBAR_ACTIONS: [ToolbarAction; 6] = [
+const IDLE_TOOLBAR_ACTIONS: [ToolbarAction; 7] = [
     ToolbarAction::Branch,
+    ToolbarAction::Combine,
     ToolbarAction::Edit,
     ToolbarAction::Retry,
     ToolbarAction::Copy,
@@ -253,19 +256,27 @@ impl AppView {
         self.board
             .iter()
             .flat_map(|board| &board.nodes)
-            .filter_map(|node| {
-                let parent = node.parent_id.as_deref()?;
-                let parent_position = self.current_position(parent)?;
-                let node_position = self.current_position(&node.id)?;
-                let parent_height = self.heights.get(parent).copied()?;
-                Some(CanvasConnector {
-                    from_x: parent_position.x + CARD_WIDTH / 2.,
-                    from_y: parent_position.y + parent_height,
-                    to_x: node_position.x + CARD_WIDTH / 2.,
-                    to_y: node_position.y,
-                })
+            .flat_map(|node| {
+                let parent = node.parent_id.iter().map(|parent| (parent, false));
+                let merged = node.merged_from.iter().map(|parent| (parent, true));
+                parent
+                    .chain(merged)
+                    .filter_map(|(parent, merged)| self.connector(parent, &node.id, merged))
             })
             .collect()
+    }
+
+    fn connector(&self, parent: &str, child: &str, merged: bool) -> Option<CanvasConnector> {
+        let parent_position = self.current_position(parent)?;
+        let node_position = self.current_position(child)?;
+        let parent_height = self.heights.get(parent).copied()?;
+        Some(CanvasConnector {
+            from_x: parent_position.x + CARD_WIDTH / 2.,
+            from_y: parent_position.y + parent_height,
+            to_x: node_position.x + CARD_WIDTH / 2.,
+            to_y: node_position.y,
+            merged,
+        })
     }
 
     fn fit_canvas(&mut self, window: &Window, cx: &mut Context<Self>) {
@@ -415,10 +426,7 @@ impl AppView {
                     screen_x,
                     screen_y,
                     height,
-                    targeted: self
-                        .target
-                        .as_ref()
-                        .is_some_and(|target| target.node_id == node.id),
+                    targeted: self.targets.iter().any(|target| target.node_id == node.id),
                     status_line: (node.status == NodeStatus::Running)
                         .then(|| self.running_status_line(node, now)),
                 })
@@ -447,7 +455,7 @@ impl AppView {
         let image_cache = self.image_cache.clone();
         let sprite_cache = self.sprite_cache.clone();
         let zoom = self.zoom;
-        let zoom_settled = self.zoom_settled;
+        let phase = ZoomPhase::new(self.zoom_settled, visible_nodes.len());
         let camera_x = self.camera_x;
         let camera_y = self.camera_y;
         let background = canvas(
@@ -471,7 +479,7 @@ impl AppView {
                             frame,
                             node,
                             zoom,
-                            zoom_settled,
+                            phase,
                             &image_cache,
                             &sprite_cache,
                             &mut sprite_source_budget,
@@ -1132,6 +1140,7 @@ impl AppView {
         match action {
             ToolbarAction::Stop => self.engine.stop_node(node_id),
             ToolbarAction::Branch => self.branch_node(node_id, None, window, cx),
+            ToolbarAction::Combine => self.combine_node(node_id, None, window, cx),
             ToolbarAction::Edit => self.edit_node(node_id, window, cx),
             ToolbarAction::Retry => self.regenerate_node(node_id, cx),
             ToolbarAction::Copy => {
@@ -1188,7 +1197,10 @@ mod tests {
                     (320. - view.camera_x) / view.zoom,
                     (240. - view.camera_y) / view.zoom,
                 );
-                view.zoom_at(anchor, 0.5, cx);
+                // Resting at zoom 1 prepares the finest tier for the next
+                // gesture to scale; the coarser tiers wait for a settle.
+                assert!(view.canvas_nodes[0].sprite_image_is_initialized(2));
+                view.zoom_at(anchor, 0.25, cx);
                 assert_eq!((320. - view.camera_x) / view.zoom, world.0);
                 assert_eq!((240. - view.camera_y) / view.zoom, world.1);
                 assert!(!view.zoom_settled);
@@ -1198,7 +1210,7 @@ mod tests {
             .unwrap();
         handle
             .update(cx, |view, _, _| {
-                assert!(!view.canvas_nodes[0].sprite_image_is_initialized(2));
+                assert!(!view.canvas_nodes[0].sprite_image_is_initialized(1));
             })
             .unwrap();
         cx.run_until_parked();
@@ -1221,7 +1233,7 @@ mod tests {
             .unwrap();
         handle
             .update(cx, |view, _, _| {
-                assert!(view.canvas_nodes[0].sprite_image_is_initialized(2));
+                assert!(view.canvas_nodes[0].sprite_image_is_initialized(1));
             })
             .unwrap();
     }

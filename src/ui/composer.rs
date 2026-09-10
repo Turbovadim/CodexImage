@@ -235,7 +235,7 @@ impl AppView {
             .root
             .join("pending-attachments");
         if path.starts_with(pending) {
-            cx.background_spawn(async move {
+            smol::unblock(move || {
                 let _ = fs::remove_file(path);
             })
             .detach();
@@ -245,7 +245,7 @@ impl AppView {
 
     /// Removes the attachments consumed by one successful submission while
     /// preserving any references the user added as it was starting.
-    fn discard_submitted_attachments(&mut self, submitted: &[PathBuf], cx: &mut Context<Self>) {
+    fn discard_submitted_attachments(&mut self, submitted: &[PathBuf]) {
         let pending = self
             .engine
             .repository()
@@ -263,7 +263,7 @@ impl AppView {
             false
         });
         if !paths.is_empty() {
-            cx.background_spawn(async move {
+            smol::unblock(move || {
                 for path in paths {
                     let _ = fs::remove_file(path);
                 }
@@ -297,15 +297,30 @@ impl AppView {
                 return;
             }
         };
-        let target = self.target.clone();
+        let targets = self.targets.clone();
         let submitted_prompt = prompt.clone();
         let submitted_attachments = self.attachments.clone();
+        // A lone target without a chosen image lets storage pick the parent's
+        // images; combined targets always carry one image each.
+        let source_images = match targets.as_slice() {
+            [] => None,
+            [target] => target.source_image.clone().map(|image| vec![image]),
+            _ => Some(
+                targets
+                    .iter()
+                    .filter_map(|target| target.source_image.clone())
+                    .collect(),
+            ),
+        };
         let request = NewNodesRequest {
             prompt,
-            parent_id: target.as_ref().map(|target| target.node_id.clone()),
-            source_images: target
-                .as_ref()
-                .and_then(|target| target.source_image.clone().map(|image| vec![image])),
+            parent_id: targets.first().map(|target| target.node_id.clone()),
+            merged_from: targets
+                .iter()
+                .skip(1)
+                .map(|target| target.node_id.clone())
+                .collect(),
+            source_images,
             aspect: ASPECTS[self.aspect_index].to_owned(),
             count: self.count,
             attachment_paths: submitted_attachments.clone(),
@@ -315,20 +330,20 @@ impl AppView {
         self.composer_submission_pending = true;
         cx.notify();
         let engine = self.engine.clone();
-        let submission = cx
-            .background_spawn(async move { engine.add_and_start(&board_id, request).map(|_| ()) });
+        let submission =
+            smol::unblock(move || engine.add_and_start(&board_id, request).map(|_| ()));
         cx.spawn_in(window, async move |weak, cx| {
             let result = submission.await;
             let _ = weak.update_in(cx, |view, window, cx| {
                 view.composer_submission_pending = false;
                 match result {
                     Ok(()) => {
-                        view.discard_submitted_attachments(&submitted_attachments, cx);
+                        view.discard_submitted_attachments(&submitted_attachments);
                         if view.prompt.read(cx).content().trim() == submitted_prompt {
                             view.prompt.update(cx, |input, cx| input.clear(cx));
                         }
-                        if view.target == target {
-                            view.target = None;
+                        if view.targets == targets {
+                            view.targets.clear();
                         }
                         window.focus(&view.prompt.focus_handle(cx), cx);
                     }
@@ -366,7 +381,7 @@ impl AppView {
             .bg(theme::raised().opacity(0.97))
             .p_3()
             .occlude();
-        if let Some(target) = &self.target {
+        for (index, target) in self.targets.iter().enumerate() {
             let cancel_id = target.node_id.clone();
             composer = composer.child(
                 div()
@@ -376,19 +391,23 @@ impl AppView {
                     .gap_2()
                     .text_xs()
                     .text_color(theme::dim())
-                    .child(div().text_color(theme::accent()).child("Branching from"))
+                    .child(div().text_color(theme::accent()).child(if index == 0 {
+                        "Branching from"
+                    } else {
+                        "Combined with"
+                    }))
                     .child(target.prompt.chars().take(70).collect::<String>())
                     .child(div().flex_1())
                     .child(
                         div()
                             .id(SharedString::from(format!("cancel-target-{cancel_id}")))
                             .role(Role::Button)
-                            .aria_label("Cancel branching target")
+                            .aria_label("Remove branching target")
                             .cursor_pointer()
                             .text_color(theme::faint())
                             .child("×")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.target = None;
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.targets.remove(index);
                                 cx.notify();
                             })),
                     ),

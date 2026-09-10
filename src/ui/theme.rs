@@ -18,6 +18,33 @@ pub const ACCENT: u32 = 0x7c8cff;
 pub const ACCENT_STRONG: u32 = 0x5666f7;
 pub const DANGER: u32 = 0xff6b6b;
 
+/// The face every card label is set in, by both the direct painter and the
+/// SVG sprite renderer, so a zoom settle never swaps typefaces. macOS's own
+/// UI font is off limits: resvg resolves it but draws no ink from its
+/// outlines, and its other names do not resolve at all. Helvetica Neue is its
+/// near twin and both renderers load it. Windows keeps the system font, which
+/// resvg renders under its real name.
+#[cfg(target_os = "macos")]
+pub const CARD_FONT_FAMILY: &str = "Helvetica Neue";
+#[cfg(target_os = "macos")]
+pub const CARD_FONT_SVG_FAMILIES: &str = "'Helvetica Neue', sans-serif";
+#[cfg(not(target_os = "macos"))]
+pub const CARD_FONT_FAMILY: &str = ".SystemUIFont";
+#[cfg(not(target_os = "macos"))]
+pub const CARD_FONT_SVG_FAMILIES: &str = "'Segoe UI', system-ui, sans-serif";
+
+/// The card face's ascent and descent in em units (hhea). GPUI centres the
+/// ascent-plus-descent box inside the line height and puts the baseline at
+/// the ascent, so the sprite places it the same way or labels shift on swap.
+#[cfg(target_os = "macos")]
+pub const CARD_FONT_ASCENT: f32 = 0.952;
+#[cfg(target_os = "macos")]
+pub const CARD_FONT_DESCENT: f32 = 0.213;
+#[cfg(not(target_os = "macos"))]
+pub const CARD_FONT_ASCENT: f32 = 1.079;
+#[cfg(not(target_os = "macos"))]
+pub const CARD_FONT_DESCENT: f32 = 0.251;
+
 pub fn background() -> Hsla {
     rgb(BACKGROUND).into()
 }

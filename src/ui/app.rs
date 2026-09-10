@@ -11,6 +11,7 @@ use super::composer::ComposerTarget;
 use super::format::read_image_ratio;
 use super::image_cache::{
     CARD_SPRITE_CACHE_BUDGET, CardSpriteCache, DECODED_IMAGE_CACHE_BUDGET, DecodedImageCache,
+    bracket_frame,
 };
 use super::input::TextInput;
 use super::keymap::{Escape, Generate, Quit, bind_keys, configure_menus};
@@ -92,7 +93,9 @@ pub(super) struct AppView {
     pub(super) focus: FocusHandle,
     pub(super) lightbox_focus: FocusHandle,
     pub(super) overlay: Overlay,
-    pub(super) target: Option<ComposerTarget>,
+    /// Cards the next generation branches from: the first is the parent, the
+    /// rest are combined with it.
+    pub(super) targets: Vec<ComposerTarget>,
     pub(super) attachments: Vec<PathBuf>,
     pub(super) pending_attachment_writes: usize,
     pub(super) composer_submission_pending: bool,
@@ -160,7 +163,7 @@ impl Drop for AppView {
 pub fn run() -> Result<()> {
     let (sender, receiver) = async_channel::bounded(1_024);
     let repository = crate::storage::Repository::open(sender)?;
-    super::disk_cache::init(repository.paths().root.join("decoded-cache"));
+    crate::disk_cache::init(repository.paths().root.join("decoded-cache"));
     // One sequential background pass archives and conditions legacy generated
     // images once, then catches up thumbnails created by older versions.
     let sweeper = repository.clone();
@@ -175,8 +178,10 @@ pub fn run() -> Result<()> {
         configure_menus(cx);
         let quit_engine = engine_for_quit.clone();
         cx.on_app_quit(move |_| {
-            let engine = quit_engine.clone();
-            async move { engine.stop_all_for_quit() }
+            // GPUI only gives quit futures 200 ms. Finish the durable flush
+            // before returning a future so shutdown cannot cut it short.
+            quit_engine.stop_all_for_quit();
+            async {}
         })
         .detach();
         #[cfg(not(target_os = "macos"))]
@@ -288,7 +293,7 @@ impl AppView {
             focus: cx.focus_handle(),
             lightbox_focus: cx.focus_handle(),
             overlay: Overlay::None,
-            target: None,
+            targets: Vec::new(),
             attachments: Vec::new(),
             pending_attachment_writes: 0,
             composer_submission_pending: false,
@@ -868,7 +873,7 @@ impl AppView {
         self.board_id = Some(id.clone());
         self.board = self.engine.repository().board_snapshot(&id);
         self.overlay = Overlay::None;
-        self.target = None;
+        self.targets.clear();
         self.expanded_prompts.clear();
         self.transient_positions.clear();
         self.camera_x = 80.;
@@ -889,14 +894,16 @@ impl AppView {
             .update(cx, |cache, cx| cache.clear(window, cx));
     }
 
-    /// Enter submits whichever surface is open: the lightbox's quick-continue
-    /// field, a modal, or the composer.
+    /// Enter submits whichever surface is open: a modal or the composer.
     pub(super) fn generate(&mut self, _: &Generate, window: &mut Window, cx: &mut Context<Self>) {
         match &self.overlay {
-            Overlay::Lightbox(_) => self.continue_from_lightbox(window, cx),
             Overlay::EditNode(_) => self.save_edited_prompt(window, cx),
             Overlay::RenameBoard(_) => self.rename_open_board(window, cx),
-            Overlay::Boards | Overlay::Gallery | Overlay::NodeText(_) | Overlay::QuitConfirm => {}
+            Overlay::Boards
+            | Overlay::Gallery
+            | Overlay::Lightbox(_)
+            | Overlay::NodeText(_)
+            | Overlay::QuitConfirm => {}
             Overlay::None => self.generate_from_composer(window, cx),
         }
     }
@@ -904,8 +911,8 @@ impl AppView {
     fn escape(&mut self, _: &Escape, window: &mut Window, cx: &mut Context<Self>) {
         if !matches!(self.overlay, Overlay::None) {
             self.close_overlay(window, cx);
-        } else if self.target.is_some() {
-            self.target = None;
+        } else if !self.targets.is_empty() {
+            self.targets.clear();
         } else if self.prompt.focus_handle(cx).is_focused(window) {
             window.focus(&self.focus, cx);
         }
@@ -947,16 +954,20 @@ impl AppView {
             .unwrap_or_default()
     }
 
-    fn canvas_image_asset(&self, url: &str) -> CanvasImageAsset {
-        let sprite = self
-            .image_assets
+    /// The tiny `s_` thumbnail, which serves every surface that shows an image
+    /// at 320 physical px or less: card sprites, the gallery, the switcher.
+    pub(super) fn sprite_image_path(&self, url: &str) -> PathBuf {
+        self.image_assets
             .get(url)
             .map(|asset| asset.sprite.clone())
-            .unwrap_or_else(|| self.display_image_path(url, false));
+            .unwrap_or_else(|| self.display_image_path(url, false))
+    }
+
+    fn canvas_image_asset(&self, url: &str) -> CanvasImageAsset {
         CanvasImageAsset {
             original: Arc::from(self.display_image_path(url, true)),
             thumbnail: Arc::from(self.display_image_path(url, false)),
-            sprite: Arc::from(sprite),
+            sprite: Arc::from(self.sprite_image_path(url)),
         }
     }
 }
@@ -969,6 +980,14 @@ impl Focusable for AppView {
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Every image and sprite load happens inside this render.
+        bracket_frame(
+            &self.image_cache,
+            &self.sprite_cache,
+            cx.entity_id(),
+            window,
+            cx,
+        );
         self.prepare_lightbox_assets(window, cx);
         let empty = self
             .board
@@ -999,6 +1018,7 @@ impl Render for AppView {
             .on_action(cx.listener(Self::reset_zoom))
             .on_action(cx.listener(Self::escape))
             .on_action(cx.listener(Self::branch_hovered))
+            .on_action(cx.listener(Self::combine_hovered))
             .on_action(cx.listener(Self::regenerate_hovered))
             .on_action(cx.listener(Self::edit_hovered))
             .on_action(cx.listener(Self::duplicate_hovered))

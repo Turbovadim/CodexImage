@@ -39,41 +39,34 @@ pub fn build_node_prompt(
         .iter()
         .map(|node| (node.id.as_str(), node))
         .collect();
-    let mut ancestors = Vec::new();
-    let mut current = node
-        .parent_id
-        .as_deref()
-        .and_then(|id| by_id.get(id).copied());
-    while let Some(ancestor) = current {
-        let prompt = if ancestor.prompt.chars().count() > 400 {
-            format!("{}…", ancestor.prompt.chars().take(397).collect::<String>())
-        } else {
-            ancestor.prompt.clone()
-        };
-        ancestors.push(prompt);
-        if ancestors.len() == 12 {
-            break;
-        }
-        current = ancestor
-            .parent_id
-            .as_deref()
-            .and_then(|id| by_id.get(id).copied());
-    }
-    ancestors.reverse();
+    let ancestors = prompt_chain(&by_id, node.parent_id.as_deref());
     if !ancestors.is_empty() {
         sections.push(format!(
             "This request continues earlier work on an image. The prompts so far, oldest first:\n{}",
-            ancestors
-                .iter()
-                .enumerate()
-                .map(|(index, prompt)| format!("{}. {prompt}", index + 1))
-                .collect::<Vec<_>>()
-                .join("\n")
+            numbered(&ancestors)
         ));
     }
-    if !source_paths.is_empty() {
+    let merged: Vec<_> = node
+        .merged_from
+        .iter()
+        .filter_map(|id| by_id.get(id.as_str()).copied())
+        .collect();
+    for (index, other) in merged.iter().enumerate() {
+        let chain = prompt_chain(&by_id, Some(&other.id));
+        sections.push(format!(
+            "Image {} below comes from a separate chain of work on the same board. Its prompts so far, oldest first:\n{}",
+            index + 2,
+            numbered(&chain)
+        ));
+    }
+    if !source_paths.is_empty() && merged.is_empty() {
         sections.push(format!(
             "The current image to continue from is saved at:\n{}\nView it first. The request below applies to this image: keep everything it does not ask to change.",
+            bullet_paths(source_paths)
+        ));
+    } else if !source_paths.is_empty() {
+        sections.push(format!(
+            "The images to combine are saved at, image 1 first:\n{}\nView them all first. The request below applies to these images together: carry over the identities, styles, and details it names from each one.",
             bullet_paths(source_paths)
         ));
     }
@@ -173,6 +166,39 @@ pub fn selection_recovery_prompt<'a>(
     lines.join("\n\n")
 }
 
+/// The prompts of `start` and its ancestors, oldest first, trimmed to what a
+/// history section can usefully carry.
+fn prompt_chain(by_id: &HashMap<&str, &BoardNode>, start: Option<&str>) -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut current = start.and_then(|id| by_id.get(id).copied());
+    while let Some(ancestor) = current {
+        let prompt = if ancestor.prompt.chars().count() > 400 {
+            format!("{}…", ancestor.prompt.chars().take(397).collect::<String>())
+        } else {
+            ancestor.prompt.clone()
+        };
+        chain.push(prompt);
+        if chain.len() == 12 {
+            break;
+        }
+        current = ancestor
+            .parent_id
+            .as_deref()
+            .and_then(|id| by_id.get(id).copied());
+    }
+    chain.reverse();
+    chain
+}
+
+fn numbered(prompts: &[String]) -> String {
+    prompts
+        .iter()
+        .enumerate()
+        .map(|(index, prompt)| format!("{}. {prompt}", index + 1))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn bullet_paths(paths: &[PathBuf]) -> String {
     paths
         .iter()
@@ -193,8 +219,90 @@ pub fn tail_chars(value: &str, limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{same_run_conditioning_section, tail_chars};
-    use std::path::Path;
+    use super::{build_node_prompt, same_run_conditioning_section, tail_chars};
+    use crate::model::{Board, BoardNode, NodeStatus};
+    use crate::storage::{DataPaths, Repository};
+    use std::path::{Path, PathBuf};
+
+    fn node(id: &str, parent_id: Option<&str>, merged_from: &[&str]) -> BoardNode {
+        BoardNode {
+            id: id.into(),
+            parent_id: parent_id.map(str::to_owned),
+            merged_from: merged_from.iter().map(|id| (*id).to_owned()).collect(),
+            prompt: format!("prompt {id}"),
+            aspect: "auto".into(),
+            source_images: Vec::new(),
+            attachments: Vec::new(),
+            images: Vec::new(),
+            image_labels: Vec::new(),
+            attempts: Vec::new(),
+            text: String::new(),
+            status: NodeStatus::Done,
+            error: None,
+            stop_reason: None,
+            x: None,
+            y: None,
+            created_at: 0,
+            run_started_at: None,
+            finished_at: None,
+            usage: None,
+        }
+    }
+
+    /// A combined request tells Codex where every image comes from: the
+    /// parent chain as before, plus each merged chain numbered to match the
+    /// order of the image paths.
+    #[test]
+    fn combined_images_carry_every_chain_history() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let (sender, _receiver) = async_channel::unbounded();
+        let repository = Repository::open_at(
+            DataPaths::at(
+                directory.path().join("data"),
+                directory.path().join("generated"),
+            ),
+            sender,
+        )
+        .unwrap();
+        let board = Board {
+            id: "board".into(),
+            title: "Board".into(),
+            created_at: 0,
+            nodes: vec![
+                node("hero", None, &[]),
+                node("hero-armor", Some("hero"), &[]),
+                node("villain", None, &[]),
+                node("crossover", Some("hero-armor"), &["villain", "gone"]),
+            ],
+        };
+        let sources = [
+            PathBuf::from("/img/hero-armor.png"),
+            PathBuf::from("/img/villain.png"),
+        ];
+
+        let prompt = build_node_prompt(&repository, &board, &board.nodes[3], &sources, None, 0, 1);
+
+        assert!(
+            prompt.contains(
+                "The prompts so far, oldest first:\n1. prompt hero\n2. prompt hero-armor"
+            )
+        );
+        assert!(prompt.contains("Image 2 below comes from a separate chain of work on the same board. Its prompts so far, oldest first:\n1. prompt villain"));
+        assert!(!prompt.contains("Image 3 below"));
+        assert!(prompt.contains("The images to combine are saved at, image 1 first:\n- /img/hero-armor.png\n- /img/villain.png"));
+
+        let plain = build_node_prompt(
+            &repository,
+            &board,
+            &board.nodes[1],
+            &sources[..1],
+            None,
+            0,
+            1,
+        );
+        assert!(plain.contains("The current image to continue from is saved at:"));
+        assert!(!plain.contains("separate chain"));
+    }
 
     #[test]
     fn same_run_instructions_force_conditioned_file_handoffs() {

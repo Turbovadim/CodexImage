@@ -1,12 +1,12 @@
-//! Actions that operate on a single board node: branch, edit, regenerate,
-//! duplicate, and delete.
+//! Actions that operate on a single board node: branch, combine, edit,
+//! regenerate, duplicate, and delete.
 
 use super::app::AppView;
 use super::app::Overlay;
 use super::composer::ComposerTarget;
 use super::input::TextInputMode;
 use super::keymap::{
-    BranchHovered, DeleteHovered, DuplicateHovered, EditHovered, RegenerateHovered,
+    BranchHovered, CombineHovered, DeleteHovered, DuplicateHovered, EditHovered, RegenerateHovered,
 };
 use crate::layout::{ESTIMATED_CARD_HEIGHT, free_spot_near};
 use crate::model::NewNodesRequest;
@@ -38,21 +38,10 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Overlay::Lightbox(lightbox) = &self.overlay {
-            self.target = self.node(&lightbox.node_id).map(|node| ComposerTarget {
-                node_id: node.id,
-                prompt: node.prompt,
-                source_image: Some(lightbox.image.clone()),
-            });
-            self.overlay = Overlay::None;
-            window.focus(&self.prompt.focus_handle(cx), cx);
-            cx.notify();
-            return;
-        }
-        let Some(id) = self.hovered_node.clone() else {
+        let Some((id, image)) = self.hovered_or_lightbox_image() else {
             return;
         };
-        self.branch_node(&id, None, window, cx);
+        self.branch_node(&id, image, window, cx);
     }
 
     pub(super) fn branch_node(
@@ -63,14 +52,77 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         if let Some(node) = self.node(id) {
-            self.target = Some(ComposerTarget {
+            self.targets = vec![ComposerTarget {
                 node_id: node.id,
                 prompt: node.prompt,
                 source_image,
-            });
+            }];
+            self.overlay = Overlay::None;
             window.focus(&self.prompt.focus_handle(cx), cx);
             cx.notify();
         }
+    }
+
+    pub(super) fn combine_hovered(
+        &mut self,
+        _: &CombineHovered,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((id, image)) = self.hovered_or_lightbox_image() else {
+            return;
+        };
+        self.combine_node(&id, image, window, cx);
+    }
+
+    /// Adds a card to the composer's targets so the next generation combines
+    /// its image with the others. Every target needs a concrete image, so a
+    /// card without one is skipped.
+    pub(super) fn combine_node(
+        &mut self,
+        id: &str,
+        source_image: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(node) = self.node(id) else { return };
+        let Some(image) = source_image.or_else(|| node.images.first().cloned()) else {
+            self.show_toast("This card has no image to combine".into(), false, None, cx);
+            return;
+        };
+        for target in &mut self.targets {
+            if target.source_image.is_none()
+                && let Some(node) = self
+                    .board
+                    .as_ref()
+                    .and_then(|board| board.nodes.iter().find(|node| node.id == target.node_id))
+            {
+                target.source_image = node.images.first().cloned();
+            }
+        }
+        self.targets.retain(|target| target.source_image.is_some());
+        let already_added = self.targets.iter().any(|target| {
+            target.node_id == node.id && target.source_image.as_deref() == Some(&image)
+        });
+        if !already_added {
+            self.targets.push(ComposerTarget {
+                node_id: node.id,
+                prompt: node.prompt,
+                source_image: Some(image),
+            });
+        }
+        self.overlay = Overlay::None;
+        window.focus(&self.prompt.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    /// The card a keyboard action applies to: the lightbox image when one is
+    /// open, otherwise the hovered card with no particular image.
+    fn hovered_or_lightbox_image(&self) -> Option<(String, Option<String>)> {
+        if let Overlay::Lightbox(lightbox) = &self.overlay {
+            return Some((lightbox.node_id.clone(), Some(lightbox.image.clone())));
+        }
+        self.hovered_node.clone().map(|id| (id, None))
     }
 
     pub(super) fn regenerate_hovered(
@@ -106,7 +158,7 @@ impl AppView {
     pub(super) fn edit_node(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(node) = self.node(id) else { return };
         self.modal_input.update(cx, |input, cx| {
-            input.set_mode(TextInputMode::FixedMultiline { lines: 7 }, cx);
+            input.set_mode(TextInputMode::AutoGrow { max_lines: 24 }, cx);
             input.set_placeholder("Edit prompt…", cx);
             input.set_content(node.prompt, cx);
         });
@@ -150,6 +202,7 @@ impl AppView {
         let request = NewNodesRequest {
             prompt: node.prompt,
             parent_id: node.parent_id,
+            merged_from: node.merged_from,
             source_images: Some(node.source_images),
             aspect: node.aspect,
             count: 1,

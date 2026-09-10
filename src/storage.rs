@@ -16,10 +16,10 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const TRASH_TTL: Duration = Duration::from_secs(5 * 60);
-// Sized so a portrait card at zoom 1 on a retina display (~1020 physical px)
-// is served entirely by its thumbnail; full originals only decode when the
-// user actually zooms in past that.
-pub const THUMBNAIL_MAX_DIMENSION: u32 = 1080;
+// Sized so a full-width card image at zoom 1 on a retina display (680 physical
+// px) is served entirely by its thumbnail, and so the canvas decodes the file's
+// own pixels with no resize. Full originals decode only past that zoom.
+pub const THUMBNAIL_MAX_DIMENSION: u32 = 680;
 // A second, tiny thumbnail (`s_`) embedded by the small card-sprite tiers and
 // painted at far-out zoom, where the media area is at most ~320 physical px.
 // Rasterizing hundreds of cards during a zoom-out then decodes ~40 KB files
@@ -71,7 +71,10 @@ pub struct DataPaths {
     pub root: PathBuf,
     pub boards_file: PathBuf,
     pub images: PathBuf,
-    pub generated_originals: PathBuf,
+    /// Per-image conditioning markers. Older versions also archived the raw
+    /// generation here; the directory keeps its name so their markers stay
+    /// valid.
+    pub conditioning_markers: PathBuf,
     pub workspaces: PathBuf,
     pub logs: PathBuf,
     pub output_schema: PathBuf,
@@ -95,7 +98,7 @@ impl DataPaths {
         Self {
             boards_file: root.join("boards.json"),
             images: root.join("images"),
-            generated_originals: root.join("generated-originals"),
+            conditioning_markers: root.join("generated-originals"),
             workspaces: root.join("workspaces"),
             logs: root.join("logs"),
             output_schema: root.join("output-manifest.schema.json"),
@@ -117,7 +120,7 @@ impl Repository {
         for directory in [
             &paths.root,
             &paths.images,
-            &paths.generated_originals,
+            &paths.conditioning_markers,
             &paths.workspaces,
             &paths.logs,
         ] {
@@ -295,7 +298,7 @@ impl Repository {
         self.persist_and_notify();
         let directories = [
             self.paths.images.join(board_id),
-            self.paths.generated_originals.join(board_id),
+            self.paths.conditioning_markers.join(board_id),
             self.paths.workspaces.join(board_id),
         ];
         let log = self.paths.logs.join(format!("{board_id}.jsonl"));
@@ -332,6 +335,22 @@ impl Repository {
                 })
                 .transpose()?
         };
+        let merged_from: Vec<String> = match &parent {
+            Some(parent) => {
+                let state = self.inner.read();
+                let board = state
+                    .boards
+                    .iter()
+                    .find(|board| board.id == board_id)
+                    .context("Board not found")?;
+                let mut merged_from = request.merged_from;
+                merged_from
+                    .retain(|id| *id != parent.id && board.nodes.iter().any(|node| node.id == *id));
+                merged_from.dedup();
+                merged_from
+            }
+            None => Vec::new(),
+        };
         let source_images = match (&parent, request.source_images) {
             (Some(_), Some(images)) => images,
             (Some(parent), None) => parent.images.clone(),
@@ -354,6 +373,7 @@ impl Repository {
             .map(|index| BoardNode {
                 id: Uuid::new_v4().to_string(),
                 parent_id: parent.as_ref().map(|parent| parent.id.clone()),
+                merged_from: merged_from.clone(),
                 prompt: prompt.clone(),
                 aspect: if request.aspect.is_empty() {
                     "auto".into()
@@ -579,8 +599,8 @@ impl Repository {
         sprite_thumbnail_path_for(&path)
     }
 
-    /// Conditions generated images saved by older app versions. Raw pixels are
-    /// archived first, and a per-image marker makes the sweep a one-time cost.
+    /// Conditions generated images saved by older app versions in place. A
+    /// per-image marker makes the sweep a one-time cost.
     pub fn condition_existing_generated_images(&self) {
         if !crate::generation::conditioner::enabled() {
             return;
@@ -615,15 +635,11 @@ impl Repository {
             .image_path(board_id, url)
             .filter(|path| path.is_file())
             .context("stored generated image was missing")?;
-        let (original, marker) = self.generated_original_paths(board_id, &source)?;
+        let marker = self.conditioning_marker_path(board_id, &source)?;
         if marker.exists() {
             return Ok(false);
         }
 
-        let recovering_interrupted_migration = original.exists();
-        if !recovering_interrupted_migration {
-            atomic_copy(&source, &original)?;
-        }
         let temporary = source.with_file_name(format!(
             ".conditioned-{}-{}",
             Uuid::new_v4(),
@@ -634,13 +650,11 @@ impl Repository {
                 crate::generation::conditioner::condition_generated_image(&source, &temporary)?;
             if applied {
                 crate::platform::replace_file(&temporary, &source)?;
-            }
-            if applied || recovering_interrupted_migration {
                 remove_thumbnails(&source);
                 create_thumbnail(&source)?;
             }
             atomic_write(&marker, b"conditioned-v1\n")?;
-            Ok(applied || recovering_interrupted_migration)
+            Ok(applied)
         })();
         let _ = fs::remove_file(&temporary);
         result.with_context(|| format!("failed to condition {}", source.display()))
@@ -796,9 +810,10 @@ impl Repository {
         fs::create_dir_all(&directory)?;
         let name = fresh_image_name(source);
         let destination = directory.join(&name);
-        let (original, marker) = self.generated_original_paths(board_id, &destination)?;
+        let marker = self.conditioning_marker_path(board_id, &destination)?;
         let result = (|| -> Result<String> {
-            atomic_copy(source, &original)?;
+            // Only the conditioned image is stored; Codex keeps the raw file
+            // in its own generated-images directory.
             let applied =
                 crate::generation::conditioner::condition_generated_image(source, &destination)?;
             if !applied {
@@ -812,22 +827,18 @@ impl Repository {
         })();
         if result.is_err() {
             remove_image_and_thumbnail(&destination);
-            let _ = fs::remove_file(&original);
             let _ = fs::remove_file(&marker);
         }
         result
     }
 
-    fn generated_original_paths(
-        &self,
-        board_id: &str,
-        stored_image: &Path,
-    ) -> Result<(PathBuf, PathBuf)> {
+    fn conditioning_marker_path(&self, board_id: &str, stored_image: &Path) -> Result<PathBuf> {
         let name = stored_image.file_name().context("image had no file name")?;
-        let directory = self.paths.generated_originals.join(board_id);
-        let original = directory.join(name);
-        let marker = directory.join(format!("{}.conditioned-v1", name.to_string_lossy()));
-        Ok((original, marker))
+        Ok(self
+            .paths
+            .conditioning_markers
+            .join(board_id)
+            .join(format!("{}.conditioned-v1", name.to_string_lossy())))
     }
 
     /// Copies `source` into the board's image directory under a fresh name and
@@ -918,35 +929,6 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     result.with_context(|| format!("failed to save {}", path.display()))
 }
 
-fn atomic_copy(source: &Path, destination: &Path) -> Result<()> {
-    let parent = destination
-        .parent()
-        .context("destination has no parent directory")?;
-    fs::create_dir_all(parent)?;
-    let temporary = destination.with_extension(format!("tmp-{}", Uuid::new_v4()));
-    let result = (|| -> Result<()> {
-        fs::copy(source, &temporary)?;
-        // FlushFileBuffers needs write access, so a read-only handle here
-        // fails on Windows with ERROR_ACCESS_DENIED.
-        fs::OpenOptions::new()
-            .write(true)
-            .open(&temporary)?
-            .sync_all()?;
-        crate::platform::replace_file(&temporary, destination)?;
-        crate::platform::sync_directory(parent)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result.with_context(|| {
-        format!(
-            "failed to preserve generated original {}",
-            destination.display()
-        )
-    })
-}
-
 fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
     if fs::read(path).is_ok_and(|current| current == bytes) {
         return Ok(());
@@ -957,46 +939,62 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
 /// Builds both display thumbnails beside `source`: `t_` at
 /// `THUMBNAIL_MAX_DIMENSION` and `s_` at `SPRITE_THUMBNAIL_MAX_DIMENSION`.
 pub fn create_thumbnail(source: &Path) -> Result<()> {
-    let image = image::ImageReader::open(source)?
-        .with_guessed_format()?
-        .decode()
-        .with_context(|| format!("failed to decode {}", source.display()))?;
-    let thumbnail = image.thumbnail(THUMBNAIL_MAX_DIMENSION, THUMBNAIL_MAX_DIMENSION);
-    save_thumbnail(&thumbnail, source, thumbnail_path_for(source))?;
+    let thumbnail = decode(source)?.thumbnail(THUMBNAIL_MAX_DIMENSION, THUMBNAIL_MAX_DIMENSION);
     let sprite = thumbnail.thumbnail(
         SPRITE_THUMBNAIL_MAX_DIMENSION,
         SPRITE_THUMBNAIL_MAX_DIMENSION,
     );
-    save_thumbnail(&sprite, source, sprite_thumbnail_path_for(source))
+    save_thumbnail(thumbnail, source, thumbnail_path_for(source))?;
+    save_thumbnail(sprite, source, sprite_thumbnail_path_for(source))
 }
 
 /// Builds only the `s_` sprite thumbnail, downscaling the existing `t_` file
 /// so a sweep never has to decode the full original twice.
 fn create_sprite_thumbnail(source: &Path) -> Result<()> {
     let thumbnail = thumbnail_path_for(source).context("image had no file name")?;
-    let image = image::ImageReader::open(&thumbnail)?
-        .with_guessed_format()?
-        .decode()
-        .with_context(|| format!("failed to decode {}", thumbnail.display()))?;
-    let sprite = image.thumbnail(
+    let sprite = decode(&thumbnail)?.thumbnail(
         SPRITE_THUMBNAIL_MAX_DIMENSION,
         SPRITE_THUMBNAIL_MAX_DIMENSION,
     );
-    save_thumbnail(&sprite, source, sprite_thumbnail_path_for(source))
+    save_thumbnail(sprite, source, sprite_thumbnail_path_for(source))
 }
 
+fn decode(path: &Path) -> Result<image::DynamicImage> {
+    image::ImageReader::open(path)?
+        .with_guessed_format()?
+        .decode()
+        .with_context(|| format!("failed to decode {}", path.display()))
+}
+
+/// Saves a thumbnail as 8-bit and seeds the decoded cache with its pixels.
+/// Conditioned originals are 16-bit, which would double a thumbnail's bytes
+/// and decode time for no visible gain. Seeding the cache here makes the
+/// first canvas paint of a fresh generation a sidecar hit instead of a decode.
 fn save_thumbnail(
-    image: &image::DynamicImage,
+    image: image::DynamicImage,
     source: &Path,
     destination: Option<PathBuf>,
 ) -> Result<()> {
+    use image::DynamicImage;
+
     let destination = destination.context("image had no file name")?;
+    let image = match image {
+        DynamicImage::ImageRgb8(_) | DynamicImage::ImageRgba8(_) => image,
+        deep if deep.color().has_alpha() => DynamicImage::ImageRgba8(deep.into_rgba8()),
+        deep => DynamicImage::ImageRgb8(deep.into_rgb8()),
+    };
     let result = if is_svg_embeddable_raster(source) {
         image.save(&destination)
     } else {
         image.save_with_format(&destination, image::ImageFormat::Png)
     };
-    result.with_context(|| format!("failed to create thumbnail {}", destination.display()))
+    result.with_context(|| format!("failed to create thumbnail {}", destination.display()))?;
+    crate::disk_cache::store_rgba(
+        &destination,
+        Some(THUMBNAIL_MAX_DIMENSION),
+        &image.into_rgba8(),
+    );
+    Ok(())
 }
 
 fn remove_image_and_thumbnail(source: &Path) {
@@ -1122,6 +1120,7 @@ mod tests {
         BoardNode {
             id: id.into(),
             parent_id,
+            merged_from: Vec::new(),
             prompt: "test".into(),
             aspect: "auto".into(),
             source_images: Vec::new(),
@@ -1243,23 +1242,25 @@ mod tests {
     }
 
     #[test]
-    fn generated_import_archives_raw_bytes_and_stores_the_conditioned_copy() {
+    fn generated_import_conditions_in_place_without_archiving_the_raw_bytes() {
         let directory = TempDir::new().unwrap();
         let (repository, _) = repository(&directory);
         let board = repository.create_board().unwrap();
         let source = directory.path().join("generated/source.png");
         save_patterned_image(&source);
-        let raw_bytes = fs::read(&source).unwrap();
 
         let url = repository.import_generated(&board.id, &source).unwrap();
         let stored = repository.image_path(&board.id, &url).unwrap();
-        let (original, marker) = repository
-            .generated_original_paths(&board.id, &stored)
+        let marker = repository
+            .conditioning_marker_path(&board.id, &stored)
             .unwrap();
 
-        assert_eq!(fs::read(original).unwrap(), raw_bytes);
         assert!(marker.exists());
-        assert_eq!(image::open(stored).unwrap().color(), ColorType::Rgba16);
+        assert!(!marker.with_file_name(stored.file_name().unwrap()).exists());
+        assert_eq!(image::open(&stored).unwrap().color(), ColorType::Rgba16);
+        // Thumbnails stay 8-bit: a 16-bit PNG doubles their decode time.
+        let thumbnail = super::thumbnail_path_for(&stored).unwrap();
+        assert_eq!(image::open(thumbnail).unwrap().color(), ColorType::Rgba8);
     }
 
     #[test]
@@ -1269,7 +1270,6 @@ mod tests {
         let board = repository.create_board().unwrap();
         let source = directory.path().join("legacy.png");
         save_patterned_image(&source);
-        let raw_bytes = fs::read(&source).unwrap();
         let (_, url) = repository.copy_into_board(&board.id, &source).unwrap();
         let node = repository
             .add_nodes(
@@ -1277,6 +1277,7 @@ mod tests {
                 NewNodesRequest {
                     prompt: "legacy".into(),
                     parent_id: None,
+                    merged_from: Vec::new(),
                     source_images: None,
                     aspect: "auto".into(),
                     count: 1,
@@ -1298,11 +1299,11 @@ mod tests {
         repository.condition_existing_generated_images();
 
         let stored = repository.image_path(&board.id, &url).unwrap();
-        let (original, marker) = repository
-            .generated_original_paths(&board.id, &stored)
+        let marker = repository
+            .conditioning_marker_path(&board.id, &stored)
             .unwrap();
-        assert_eq!(fs::read(original).unwrap(), raw_bytes);
         assert!(marker.exists());
+        assert!(!marker.with_file_name(stored.file_name().unwrap()).exists());
         assert_eq!(image::open(stored).unwrap().color(), ColorType::Rgba16);
         assert!(matches!(
             receiver.try_recv(),
@@ -1311,5 +1312,51 @@ mod tests {
 
         repository.condition_existing_generated_images();
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn combined_parents_must_exist_on_the_board_and_differ_from_the_parent() {
+        let directory = TempDir::new().unwrap();
+        let (repository, _receiver) = repository(&directory);
+        let board = repository.create_board().unwrap();
+        let request =
+            |prompt: &str, parent_id: Option<String>, merged_from: Vec<String>| NewNodesRequest {
+                prompt: prompt.into(),
+                parent_id,
+                merged_from,
+                source_images: None,
+                aspect: "auto".into(),
+                count: 1,
+                attachment_paths: Vec::new(),
+                attachment_urls: Vec::new(),
+                position: None,
+            };
+        let a = repository
+            .add_nodes(&board.id, request("a", None, Vec::new()))
+            .unwrap()
+            .remove(0);
+        let b = repository
+            .add_nodes(&board.id, request("b", None, Vec::new()))
+            .unwrap()
+            .remove(0);
+
+        let combined = repository
+            .add_nodes(
+                &board.id,
+                request(
+                    "a with b",
+                    Some(a.id.clone()),
+                    vec![a.id.clone(), b.id.clone(), "missing".into()],
+                ),
+            )
+            .unwrap()
+            .remove(0);
+        assert_eq!(combined.merged_from, vec![b.id.clone()]);
+
+        let root = repository
+            .add_nodes(&board.id, request("root", None, vec![b.id.clone()]))
+            .unwrap()
+            .remove(0);
+        assert!(root.merged_from.is_empty());
     }
 }

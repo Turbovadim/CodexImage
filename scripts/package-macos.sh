@@ -17,7 +17,7 @@ for argument in "$@"; do
       echo "Usage: $(basename "$0") [--dmg] [--install] [--open]"
       echo "  --dmg      Create a versioned disk image in dist"
       echo "  --install  Copy the packaged app to /Applications"
-      echo "  --open     Open the app after packaging"
+      echo "  --open     Open the app after packaging, relaunching a running copy"
       exit 0
       ;;
     *)
@@ -72,5 +72,16 @@ fi
 printf '%s\n' "$TARGET"
 
 if [ "$OPEN" -eq 1 ]; then
+  # A running copy keeps executing the old binary, so ask it to quit first.
+  if pgrep -xq codex-image; then
+    osascript -e 'quit app id "com.yolki.codeximage"' >/dev/null 2>&1 || true
+    for _ in $(seq 1 50); do
+      pgrep -xq codex-image || break
+      sleep 0.2
+    done
+    if pgrep -xq codex-image; then
+      echo "CodexImage did not quit (it may be asking about running jobs); focusing the old copy" >&2
+    fi
+  fi
   open "$TARGET"
 fi

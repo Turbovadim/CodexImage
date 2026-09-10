@@ -25,9 +25,11 @@ pub const EXPANDED_PROMPT_LINES: usize = 18;
 pub const MEDIA_GAP: f32 = 1.;
 /// SVG widths of the far-out sprite tiers; GPUI rasterizes each at 2x. Tier
 /// `i` serves zoom levels up to `width / CARD_WIDTH` (0.125, 0.25, 0.5). Above
-/// the last tier cards are painted directly: few are visible there, and a
-/// sprite for a 340 px card at zoom 1 would cost several megabytes each.
+/// the last tier cards rest as direct paint, since a sprite for a 340 px card
+/// at zoom 1 would cost several megabytes each; a moving gesture up there
+/// scales the finest tier instead, so text never re-rasterizes mid-gesture.
 pub const CARD_SPRITE_WIDTHS: [f32; 3] = [42.5, 85., 170.];
+pub const FINEST_SPRITE_TIER: usize = CARD_SPRITE_WIDTHS.len() - 1;
 pub const NO_SPRITE_TIER: u8 = u8::MAX;
 
 #[derive(Clone)]
@@ -157,6 +159,7 @@ mod tests {
         BoardNode {
             id: "node".into(),
             parent_id: None,
+            merged_from: Vec::new(),
             prompt: "A quiet mountain lake".into(),
             aspect: "auto".into(),
             source_images: Vec::new(),
