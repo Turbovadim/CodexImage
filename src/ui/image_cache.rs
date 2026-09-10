@@ -489,6 +489,9 @@ impl DecodedImageCache {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
+        if matches!(&key.resource, Resource::Path(path) if path.as_os_str().is_empty()) {
+            return None;
+        }
         let last_used = self.record_use(key.clone());
         let target = window.current_view();
 

@@ -93,6 +93,10 @@ pub struct Board {
     pub created_at: i64,
     #[serde(default)]
     pub nodes: Vec<BoardNode>,
+    /// Pixel size of each stored image by URL, recorded at import so opening
+    /// a board never reads image headers to lay its cards out.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub image_sizes: BTreeMap<String, [u32; 2]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

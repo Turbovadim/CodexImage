@@ -6,15 +6,6 @@ use gpui::ImageFormat;
 use std::collections::HashMap;
 use std::path::Path;
 
-pub fn read_image_ratio(path: &Path) -> Option<f32> {
-    let reader = image::ImageReader::open(path)
-        .ok()?
-        .with_guessed_format()
-        .ok()?;
-    let (width, height) = reader.into_dimensions().ok()?;
-    (width > 0 && height > 0).then_some(width as f32 / height as f32)
-}
-
 pub fn format_tokens(tokens: u64) -> String {
     if tokens >= 1_000_000 {
         format!("{:.1}M", tokens as f64 / 1_000_000.)
@@ -263,6 +254,7 @@ mod tests {
             id: "board".into(),
             title: String::new(),
             created_at: 0,
+            image_sizes: Default::default(),
             nodes,
         };
 

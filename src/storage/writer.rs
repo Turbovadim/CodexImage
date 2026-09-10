@@ -234,6 +234,7 @@ mod tests {
                     id: (*title).into(),
                     title: (*title).into(),
                     created_at: 0,
+                    image_sizes: Default::default(),
                     nodes: Vec::new(),
                 })
                 .map(Arc::new)

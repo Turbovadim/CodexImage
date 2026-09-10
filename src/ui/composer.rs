@@ -165,25 +165,52 @@ impl AppView {
                 })
                 .detach();
             }
-            TextInputEvent::PastedPaths(paths) => self.queue_attachments(paths.clone()),
+            TextInputEvent::PastedPaths(paths) => self.queue_attachments(paths.clone(), cx),
         }
         cx.notify();
     }
 
-    pub(super) fn queue_attachments(&mut self, paths: Vec<PathBuf>) {
-        for path in paths {
-            if self.attachments.len() + self.pending_attachment_writes
-                >= crate::model::MAX_ATTACHMENTS
-            {
-                break;
-            }
-            if path.is_file()
-                && image::ImageFormat::from_path(&path).is_ok()
-                && !self.attachments.contains(&path)
-            {
-                self.attachments.push(path);
-            }
+    pub(super) fn queue_attachments(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let slots = crate::model::MAX_ATTACHMENTS
+            .saturating_sub(self.attachments.len() + self.pending_attachment_writes)
+            .min(paths.len());
+        if slots == 0 || paths.is_empty() {
+            return;
         }
+        // Reserve capacity while checking paths so concurrent drops and
+        // clipboard writes cannot overfill the composer or submit early.
+        self.pending_attachment_writes += slots;
+        let existing = self.attachments.clone();
+        cx.spawn(async move |weak, cx| {
+            let valid = smol::unblock(move || {
+                let mut valid = Vec::new();
+                for path in paths {
+                    if image::ImageFormat::from_path(&path).is_ok()
+                        && !existing.contains(&path)
+                        && !valid.contains(&path)
+                        && path.is_file()
+                    {
+                        valid.push(path);
+                        if valid.len() == slots {
+                            break;
+                        }
+                    }
+                }
+                valid
+            })
+            .await;
+            let _ = weak.update(cx, |view, cx| {
+                view.pending_attachment_writes =
+                    view.pending_attachment_writes.saturating_sub(slots);
+                for path in valid {
+                    if !view.attachments.contains(&path) {
+                        view.attachments.push(path);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(super) fn add_attachment(
@@ -216,7 +243,7 @@ impl AppView {
                 return;
             };
             let _ = weak.update(cx, |view, cx| {
-                view.queue_attachments(paths);
+                view.queue_attachments(paths, cx);
                 cx.notify();
             });
         })
@@ -273,13 +300,13 @@ impl AppView {
     }
 
     pub(super) fn generate_from_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.composer_submission_pending {
+        if self.submission_pending {
             self.show_toast("A generation is already starting".into(), false, None, cx);
             return;
         }
         if self.pending_attachment_writes > 0 {
             self.show_toast(
-                "Wait for pasted attachments to finish saving".into(),
+                "Wait for attachments to finish processing".into(),
                 false,
                 None,
                 cx,
@@ -327,7 +354,7 @@ impl AppView {
             attachment_urls: Vec::new(),
             position: None,
         };
-        self.composer_submission_pending = true;
+        self.submission_pending = true;
         cx.notify();
         let engine = self.engine.clone();
         let submission =
@@ -335,7 +362,7 @@ impl AppView {
         cx.spawn_in(window, async move |weak, cx| {
             let result = submission.await;
             let _ = weak.update_in(cx, |view, window, cx| {
-                view.composer_submission_pending = false;
+                view.submission_pending = false;
                 match result {
                     Ok(()) => {
                         view.discard_submitted_attachments(&submitted_attachments);
@@ -367,7 +394,7 @@ impl AppView {
     }
 
     pub(super) fn render_composer(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let submission_pending = self.composer_submission_pending;
+        let submission_pending = self.submission_pending;
         let width = 660_f32.min(f32::from(window.viewport_size().width) - 40.);
         let left = (f32::from(window.viewport_size().width) - width) / 2.;
         let mut composer = div()
@@ -486,7 +513,7 @@ impl AppView {
         let attach_label = if self.pending_attachment_writes == 0 {
             "Attach".into()
         } else {
-            format!("Attach ({} saving)", self.pending_attachment_writes)
+            format!("Attach ({} pending)", self.pending_attachment_writes)
         };
         composer = composer.child(
             div()

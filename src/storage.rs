@@ -7,7 +7,7 @@ use crate::model::{
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use parking_lot::RwLock;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -268,6 +268,7 @@ impl Repository {
             title: "New board".into(),
             created_at: now_ms(),
             nodes: Vec::new(),
+            image_sizes: BTreeMap::new(),
         };
         self.inner.write().boards.push(Arc::new(board.clone()));
         self.persist_and_notify();
@@ -819,11 +820,13 @@ impl Repository {
             if !applied {
                 fs::copy(source, &destination)?;
             }
-            create_thumbnail(&destination)?;
+            let size = create_thumbnail(&destination)?;
             if crate::generation::conditioner::enabled() {
                 atomic_write(&marker, b"conditioned-v1\n")?;
             }
-            Ok(format!("/images/{board_id}/{name}"))
+            let url = format!("/images/{board_id}/{name}");
+            self.record_image_sizes(board_id, [(url.clone(), size)]);
+            Ok(url)
         })();
         if result.is_err() {
             remove_image_and_thumbnail(&destination);
@@ -849,11 +852,32 @@ impl Repository {
         let name = fresh_image_name(source);
         let destination = directory.join(&name);
         fs::copy(source, &destination)?;
-        if let Err(error) = create_thumbnail(&destination) {
-            remove_image_and_thumbnail(&destination);
-            return Err(error);
-        }
-        Ok((destination, format!("/images/{board_id}/{name}")))
+        let size = match create_thumbnail(&destination) {
+            Ok(size) => size,
+            Err(error) => {
+                remove_image_and_thumbnail(&destination);
+                return Err(error);
+            }
+        };
+        let url = format!("/images/{board_id}/{name}");
+        self.record_image_sizes(board_id, [(url.clone(), size)]);
+        Ok((destination, url))
+    }
+
+    /// Remembers image pixel sizes so later opens skip the header reads. Saved
+    /// without an event: nothing a view draws changes, it just loads faster.
+    pub fn record_image_sizes(
+        &self,
+        board_id: &str,
+        sizes: impl IntoIterator<Item = (String, [u32; 2])>,
+    ) {
+        let mut state = self.inner.write();
+        let Ok(board) = board_mut(&mut state, board_id) else {
+            return;
+        };
+        board.image_sizes.extend(sizes);
+        drop(state);
+        self.writer.request();
     }
 
     /// Queues the mutated state for saving and tells open views to re-read it.
@@ -938,14 +962,19 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// Builds both display thumbnails beside `source`: `t_` at
 /// `THUMBNAIL_MAX_DIMENSION` and `s_` at `SPRITE_THUMBNAIL_MAX_DIMENSION`.
-pub fn create_thumbnail(source: &Path) -> Result<()> {
-    let thumbnail = decode(source)?.thumbnail(THUMBNAIL_MAX_DIMENSION, THUMBNAIL_MAX_DIMENSION);
+/// Writes both thumbnail sizes and returns the source's pixel size, which the
+/// full decode here makes free to report.
+pub fn create_thumbnail(source: &Path) -> Result<[u32; 2]> {
+    let image = decode(source)?;
+    let size = [image.width(), image.height()];
+    let thumbnail = image.thumbnail(THUMBNAIL_MAX_DIMENSION, THUMBNAIL_MAX_DIMENSION);
     let sprite = thumbnail.thumbnail(
         SPRITE_THUMBNAIL_MAX_DIMENSION,
         SPRITE_THUMBNAIL_MAX_DIMENSION,
     );
     save_thumbnail(thumbnail, source, thumbnail_path_for(source))?;
-    save_thumbnail(sprite, source, sprite_thumbnail_path_for(source))
+    save_thumbnail(sprite, source, sprite_thumbnail_path_for(source))?;
+    Ok(size)
 }
 
 /// Builds only the `s_` sprite thumbnail, downscaling the existing `t_` file
@@ -1239,6 +1268,42 @@ mod tests {
                 format!("board {index} rev 19")
             );
         }
+    }
+
+    #[test]
+    fn imports_record_image_sizes_that_survive_a_reopen() {
+        let directory = TempDir::new().unwrap();
+        let attachment = directory.path().join("wide.png");
+        DynamicImage::ImageRgba8(RgbaImage::new(48, 32))
+            .save(&attachment)
+            .unwrap();
+        let (open, _receiver) = repository(&directory);
+        let board = open.create_board().unwrap();
+        let node = open
+            .add_nodes(
+                &board.id,
+                NewNodesRequest {
+                    prompt: "wide".into(),
+                    parent_id: None,
+                    merged_from: Vec::new(),
+                    source_images: None,
+                    aspect: "auto".into(),
+                    count: 1,
+                    attachment_paths: vec![attachment],
+                    attachment_urls: Vec::new(),
+                    position: None,
+                },
+            )
+            .unwrap()
+            .remove(0);
+        let imported = node.attachments[0].clone();
+        open.record_image_sizes(&board.id, [("/images/legacy".to_owned(), [7, 9])]);
+        drop(open);
+
+        let (reopened, _) = repository(&directory);
+        let sizes = reopened.board(&board.id).unwrap().image_sizes;
+        assert_eq!(sizes.get(&imported), Some(&[48, 32]));
+        assert_eq!(sizes.get("/images/legacy"), Some(&[7, 9]));
     }
 
     #[test]

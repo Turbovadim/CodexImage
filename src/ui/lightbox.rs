@@ -904,6 +904,7 @@ mod tests {
             id: "board".into(),
             title: "Board".into(),
             created_at: 0,
+            image_sizes: Default::default(),
             nodes: vec![
                 tree_node("root", None, &["root-0", "root-1"], 0),
                 tree_node("take-a", Some("root"), &["a-0", "a-1"], 1),

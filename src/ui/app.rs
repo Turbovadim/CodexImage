@@ -8,7 +8,6 @@ use super::card::{
     output_layout, wrap_prompt,
 };
 use super::composer::ComposerTarget;
-use super::format::read_image_ratio;
 use super::image_cache::{
     CARD_SPRITE_CACHE_BUDGET, CardSpriteCache, DECODED_IMAGE_CACHE_BUDGET, DecodedImageCache,
     bracket_frame,
@@ -61,7 +60,8 @@ struct ResolvedImage {
     url: String,
     thumbnail: Option<PathBuf>,
     sprite: Option<PathBuf>,
-    ratio: Option<f32>,
+    /// Pixel size read for an image the board had not recorded yet.
+    size: Option<[u32; 2]>,
 }
 
 /// Thumbnail encoding and header reads for one image, performed off the render
@@ -71,7 +71,61 @@ struct ImageJob {
     url: String,
     original: PathBuf,
     thumbnail: Option<PathBuf>,
-    read_ratio: bool,
+    read_size: bool,
+}
+
+fn resolve_image_job(job: ImageJob) -> ResolvedImage {
+    let mut thumbnail = job.thumbnail.filter(|path| path.exists());
+    let mut size = None;
+    if thumbnail.is_none()
+        && let Ok(created) = create_thumbnail(&job.original)
+    {
+        thumbnail = thumbnail_path_for(&job.original).filter(|path| path.exists());
+        size = Some(created);
+    }
+    let sprite = sprite_thumbnail_path_for(&job.original).filter(|path| path.exists());
+    if job.read_size && size.is_none() {
+        size = image::image_dimensions(&job.original)
+            .ok()
+            .map(|(width, height)| [width, height]);
+    }
+    ResolvedImage {
+        url: job.url,
+        thumbnail,
+        sprite,
+        size,
+    }
+}
+
+/// A cold board decodes every original here at ~11 ms each, so the batch is
+/// spread over the cores. Bounding the workers by core count also bounds how
+/// many full-resolution decodes are in memory at once.
+fn resolve_image_jobs(batch: Vec<ImageJob>) -> Vec<ResolvedImage> {
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |count| count.get())
+        .min(batch.len());
+    let jobs = std::sync::Mutex::new(batch.into_iter());
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut resolved = Vec::new();
+                    while let Some(job) = jobs.lock().unwrap().next() {
+                        resolved.push(resolve_image_job(job));
+                    }
+                    resolved
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap_or_default())
+            .collect()
+    })
+}
+
+fn ratio_of([width, height]: [u32; 2]) -> Option<f32> {
+    (width > 0 && height > 0).then(|| width as f32 / height as f32)
 }
 
 fn board_snapshots_equal(left: Option<&Arc<Board>>, right: Option<&Arc<Board>>) -> bool {
@@ -98,7 +152,7 @@ pub(super) struct AppView {
     pub(super) targets: Vec<ComposerTarget>,
     pub(super) attachments: Vec<PathBuf>,
     pub(super) pending_attachment_writes: usize,
-    pub(super) composer_submission_pending: bool,
+    pub(super) submission_pending: bool,
     pub(super) aspect_index: usize,
     pub(super) count: usize,
     pub(super) activity: HashMap<String, String>,
@@ -116,8 +170,9 @@ pub(super) struct AppView {
     pub(super) minimap_scene: Option<MinimapScene>,
     /// Rows for whichever overlay is open. Building them walks every node of
     /// every board, so they are derived when the data changes rather than on
-    /// every frame; a closed overlay's rows are stale and unread until it opens.
+    /// every frame. The board switcher keeps its last rows while refreshing.
     pub(super) board_rows: Arc<Vec<BoardRow>>,
+    board_rows_task: Option<Task<()>>,
     pub(super) gallery_rows: Arc<Vec<GalleryRow>>,
     pub(super) image_cache: Entity<DecodedImageCache>,
     pub(super) sprite_cache: Entity<CardSpriteCache>,
@@ -152,7 +207,9 @@ impl Drop for AppView {
             .paths()
             .root
             .join("pending-attachments");
-        for path in &self.attachments {
+        // Synchronous on purpose: the view drops during quit, and a detached
+        // task started here would race process exit and leak the files.
+        for path in self.attachments.drain(..) {
             if path.starts_with(&pending) {
                 let _ = std::fs::remove_file(path);
             }
@@ -296,7 +353,7 @@ impl AppView {
             targets: Vec::new(),
             attachments: Vec::new(),
             pending_attachment_writes: 0,
-            composer_submission_pending: false,
+            submission_pending: false,
             aspect_index: 0,
             count: 1,
             activity: HashMap::new(),
@@ -313,6 +370,7 @@ impl AppView {
             canvas_connectors: Arc::new(Vec::new()),
             minimap_scene: None,
             board_rows: Arc::new(Vec::new()),
+            board_rows_task: None,
             gallery_rows: Arc::new(Vec::new()),
             image_cache,
             sprite_cache,
@@ -343,7 +401,7 @@ impl AppView {
             drag: None,
         };
         view.refresh_image_metadata(cx);
-        view.refresh_layout();
+        view.refresh_layout(cx);
         let receiver = view.receiver.clone();
         let window_handle = window.window_handle();
         view.repository_task = Some(cx.spawn(async move |weak, cx| {
@@ -462,12 +520,12 @@ impl AppView {
             if board_changed || images_rewritten {
                 self.board = next_board;
                 self.refresh_image_metadata(cx);
-                self.refresh_layout();
+                self.refresh_layout(cx);
                 visual_change = true;
             } else if matches!(self.overlay, Overlay::Boards) {
                 // A different board changed. Only the switcher's summaries can
                 // have changed; the open canvas remains byte-for-byte equal.
-                self.refresh_overlay_data();
+                self.refresh_overlay_data(cx);
                 visual_change = true;
             }
         }
@@ -481,7 +539,7 @@ impl AppView {
     /// Rebuilds the derived board state. Cards whose node, layout, and images
     /// are all unchanged are carried over wholesale, so a single finished
     /// generation no longer re-wraps every prompt or re-encodes every sprite.
-    pub(super) fn refresh_layout(&mut self) {
+    pub(super) fn refresh_layout(&mut self, cx: &mut Context<Self>) {
         let previous = std::mem::take(&mut self.canvas_nodes);
         let cached: HashMap<&str, &Arc<CanvasNode>> = previous
             .iter()
@@ -557,23 +615,33 @@ impl AppView {
             self.canvas_nodes = Arc::new(Vec::new());
         }
         self.refresh_canvas_scene();
-        self.refresh_overlay_data();
+        self.refresh_overlay_data(cx);
     }
 
     /// Rebuilds the rows the open overlay renders from. Called whenever the
     /// derived board state changes and whenever an overlay opens, so the
     /// render pass itself stays a read of already-built rows.
-    pub(super) fn refresh_overlay_data(&mut self) {
+    pub(super) fn refresh_overlay_data(&mut self, cx: &mut Context<Self>) {
+        self.board_rows_task.take();
         match self.overlay {
             Overlay::Boards => {
-                self.board_rows = Arc::new(
-                    self.engine
-                        .repository()
-                        .summaries()
-                        .into_iter()
-                        .map(|summary| BoardRow::new(summary, self))
-                        .collect(),
-                );
+                let repository = self.engine.repository();
+                self.board_rows_task = Some(cx.spawn(async move |weak, cx| {
+                    let rows = smol::unblock(move || {
+                        repository
+                            .summaries()
+                            .into_iter()
+                            .map(|summary| BoardRow::new(summary, &repository))
+                            .collect()
+                    })
+                    .await;
+                    let _ = weak.update(cx, |view, cx| {
+                        if matches!(view.overlay, Overlay::Boards) {
+                            view.board_rows = Arc::new(rows);
+                            cx.notify();
+                        }
+                    });
+                }));
             }
             Overlay::Gallery => {
                 self.gallery_rows = Arc::new(GalleryRow::rows_for(self));
@@ -631,6 +699,9 @@ impl AppView {
             let Some(original) = repository.image_path(board_id, url) else {
                 continue;
             };
+            // Existing sidecars resolve here so the first frame already draws
+            // them; the stats are cheap next to a blank pass that would make
+            // every sprite rasterize twice.
             let thumbnail_path = repository.thumbnail_path(board_id, url);
             let ready_thumbnail = thumbnail_path
                 .as_ref()
@@ -639,17 +710,22 @@ impl AppView {
             let ready_sprite = repository
                 .sprite_thumbnail_path(board_id, url)
                 .filter(|path| path.exists());
-            let read_ratio = !self.image_ratios.contains_key(url);
-            if (ready_thumbnail.is_none() || read_ratio) && !self.pending_image_jobs.contains(url) {
+            if let Some(ratio) = board.image_sizes.get(url).and_then(|size| ratio_of(*size)) {
+                self.image_ratios.insert(url.clone(), ratio);
+            }
+            let read_size = !self.image_ratios.contains_key(url);
+            if (ready_thumbnail.is_none() || read_size) && !self.pending_image_jobs.contains(url) {
                 self.pending_image_jobs.insert(url.clone());
                 jobs.push(ImageJob {
                     url: url.clone(),
                     original: original.clone(),
                     thumbnail: thumbnail_path,
-                    read_ratio,
+                    read_size,
                 });
             }
-            let thumbnail = ready_thumbnail.unwrap_or_else(|| original.clone());
+            // A missing thumbnail stays empty until the job builds it rather
+            // than falling back to a full decode of the original.
+            let thumbnail = ready_thumbnail.unwrap_or_default();
             self.image_assets.insert(
                 url.clone(),
                 ImageAsset {
@@ -680,33 +756,7 @@ impl AppView {
         let task = cx.spawn(async move |weak, cx| {
             for batch in jobs.chunks(BATCH) {
                 let batch = batch.to_vec();
-                let resolved = smol::unblock(move || {
-                    batch
-                        .into_iter()
-                        .map(|job| {
-                            let mut thumbnail = job.thumbnail.filter(|path| path.exists());
-                            if thumbnail.is_none() && create_thumbnail(&job.original).is_ok() {
-                                thumbnail =
-                                    thumbnail_path_for(&job.original).filter(|path| path.exists());
-                            }
-                            let sprite = sprite_thumbnail_path_for(&job.original)
-                                .filter(|path| path.exists());
-                            let ratio = job
-                                .read_ratio
-                                .then(|| {
-                                    read_image_ratio(thumbnail.as_deref().unwrap_or(&job.original))
-                                })
-                                .flatten();
-                            ResolvedImage {
-                                url: job.url,
-                                thumbnail,
-                                sprite,
-                                ratio,
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .await;
+                let resolved = smol::unblock(move || resolve_image_jobs(batch)).await;
                 if weak
                     .update(cx, |view, cx| {
                         view.apply_image_metadata(&board_id, resolved, cx)
@@ -731,6 +781,7 @@ impl AppView {
         }
         let mut assets_changed = false;
         let mut layout_changed = false;
+        let mut learned_sizes = Vec::new();
         for image in resolved {
             self.pending_image_jobs.remove(&image.url);
             let Some(asset) = self.image_assets.get_mut(&image.url) else {
@@ -738,9 +789,8 @@ impl AppView {
                 // Do not resurrect stale ratios or paths into the open board.
                 continue;
             };
-            if let Some(thumbnail) = image.thumbnail
-                && asset.thumbnail != thumbnail
-            {
+            let thumbnail = image.thumbnail.unwrap_or_else(|| asset.original.clone());
+            if asset.thumbnail != thumbnail {
                 asset.thumbnail = thumbnail;
                 assets_changed = true;
             }
@@ -749,17 +799,26 @@ impl AppView {
                 asset.sprite = sprite;
                 assets_changed = true;
             }
-            if let Some(ratio) = image.ratio
-                && self.image_ratios.insert(image.url, ratio) != Some(ratio)
+            let Some(size) = image.size else { continue };
+            if let Some(ratio) = ratio_of(size)
+                && self.image_ratios.insert(image.url.clone(), ratio) != Some(ratio)
             {
                 layout_changed = true;
             }
+            learned_sizes.push((image.url, size));
+        }
+        if !learned_sizes.is_empty() {
+            // Older boards predate stored sizes; teach them once so the next
+            // open skips these header reads entirely.
+            self.engine
+                .repository()
+                .record_image_sizes(board_id, learned_sizes);
         }
         if layout_changed {
-            self.refresh_layout();
+            self.refresh_layout(cx);
             cx.notify();
         } else if assets_changed {
-            self.refresh_canvas_assets();
+            self.refresh_canvas_assets(cx);
             cx.notify();
         }
     }
@@ -767,7 +826,7 @@ impl AppView {
     /// Rebuilds only cards whose resolved file paths changed. Thumbnail and
     /// sprite arrivals do not affect card heights or tree placement, so a full
     /// layout/minimap/connector pass here only multiplied startup work.
-    fn refresh_canvas_assets(&mut self) {
+    fn refresh_canvas_assets(&mut self, cx: &mut Context<Self>) {
         let Some(board) = &self.board else { return };
         let previous = std::mem::take(&mut self.canvas_nodes);
         let cached: HashMap<&str, &Arc<CanvasNode>> = previous
@@ -806,7 +865,7 @@ impl AppView {
             })
             .collect();
         self.canvas_nodes = Arc::new(canvas_nodes);
-        self.refresh_overlay_data();
+        self.refresh_overlay_data(cx);
     }
 
     /// Whether a cached card still points at the files the app would resolve
@@ -882,7 +941,7 @@ impl AppView {
         self.zoom_settled = true;
         self.zoom_settle_task.take();
         self.refresh_image_metadata(cx);
-        self.refresh_layout();
+        self.refresh_layout(cx);
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -1037,7 +1096,7 @@ impl Render for AppView {
                 style.border_2().border_color(theme::accent())
             })
             .on_drop(cx.listener(|this, dropped: &ExternalPaths, _, cx| {
-                this.queue_attachments(dropped.paths().to_vec());
+                this.queue_attachments(dropped.paths().to_vec(), cx);
                 cx.notify();
             }));
 

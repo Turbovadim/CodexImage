@@ -14,6 +14,44 @@ use anyhow::Result;
 use gpui::{Context, Focusable, Window};
 
 impl AppView {
+    /// Submission can wait on another import's mutex, so `action` runs off
+    /// the UI thread. `on_success` runs back on it once the engine accepted
+    /// the work; failures surface as a toast.
+    pub(super) fn submit_node_action(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        action: impl FnOnce(crate::generation::GenerationEngine, String) -> Result<()> + Send + 'static,
+        on_success: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        if self.submission_pending {
+            self.show_toast("A generation is already starting".into(), false, None, cx);
+            return;
+        }
+        let board_id = match self.board_id() {
+            Ok(id) => id.to_owned(),
+            Err(error) => {
+                self.show_error(error, cx);
+                return;
+            }
+        };
+        self.submission_pending = true;
+        cx.notify();
+        let engine = self.engine.clone();
+        cx.spawn_in(window, async move |weak, cx| {
+            let result = smol::unblock(move || action(engine, board_id)).await;
+            let _ = weak.update_in(cx, |view, window, cx| {
+                view.submission_pending = false;
+                match result {
+                    Ok(()) => on_success(view, window, cx),
+                    Err(error) => view.show_error(error, cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Runs `action` against the open board, reporting any failure as a toast.
     pub(super) fn on_board(
         &mut self,
@@ -128,19 +166,28 @@ impl AppView {
     pub(super) fn regenerate_hovered(
         &mut self,
         _: &RegenerateHovered,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(id) = self.hovered_node.clone() else {
             return;
         };
-        self.regenerate_node(&id, cx);
+        self.regenerate_node(&id, window, cx);
     }
 
-    pub(super) fn regenerate_node(&mut self, id: &str, cx: &mut Context<Self>) {
-        self.on_board(cx, |this, board_id, _| {
-            this.engine.regenerate(board_id, id, None, None)
-        });
+    pub(super) fn regenerate_node(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = id.to_owned();
+        self.submit_node_action(
+            window,
+            cx,
+            move |engine, board_id| engine.regenerate(&board_id, &id, None, None),
+            |_, _, _| {},
+        );
     }
 
     pub(super) fn edit_hovered(
@@ -170,16 +217,16 @@ impl AppView {
     pub(super) fn duplicate_hovered(
         &mut self,
         _: &DuplicateHovered,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(id) = self.hovered_node.clone() else {
             return;
         };
-        self.duplicate_node(&id, cx);
+        self.duplicate_node(&id, window, cx);
     }
 
-    pub(super) fn duplicate_node(&mut self, id: &str, cx: &mut Context<Self>) {
+    pub(super) fn duplicate_node(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(node) = self.node(id) else { return };
         // Pin the copy to the nearest free column beside the original; left to
         // the tree layout it would land at the far end of the sibling row.
@@ -210,9 +257,12 @@ impl AppView {
             attachment_urls: node.attachments,
             position,
         };
-        self.on_board(cx, |this, board_id, _| {
-            this.engine.add_and_start(board_id, request).map(|_| ())
-        });
+        self.submit_node_action(
+            window,
+            cx,
+            move |engine, board_id| engine.add_and_start(&board_id, request).map(|_| ()),
+            |_, _, _| {},
+        );
     }
 
     pub(super) fn delete_hovered(
@@ -246,5 +296,68 @@ impl AppView {
             }
             Err(error) => self.show_error(error, cx),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        generation::GenerationEngine,
+        storage::{DataPaths, Repository},
+    };
+    use gpui::TestAppContext;
+    use std::time::Duration;
+
+    #[gpui::test]
+    async fn pending_submission_leaves_ui_available_and_reports_failure(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().unwrap();
+        let paths = DataPaths::at(
+            directory.path().to_owned(),
+            directory.path().join("generated"),
+        );
+        let (events, _events) = async_channel::unbounded();
+        let repository = Repository::open_at(paths, events).unwrap();
+        repository.create_board().unwrap();
+        let engine = GenerationEngine::new(repository);
+        let (_events, receiver) = async_channel::unbounded();
+        let handle = cx.add_window(move |window, cx| AppView::new(engine, receiver, window, cx));
+        let (release, blocked) = std::sync::mpsc::channel();
+        handle
+            .update(cx, |view, window, cx| {
+                view.submit_node_action(
+                    window,
+                    cx,
+                    move |_, _| {
+                        blocked
+                            .recv_timeout(Duration::from_secs(2))
+                            .expect("UI can release waiting work");
+                        anyhow::bail!("Submission failed");
+                    },
+                    |_, _, _| panic!("failed submission reported success"),
+                );
+                assert!(view.submission_pending);
+                view.submit_node_action(
+                    window,
+                    cx,
+                    |_, _| panic!("duplicate submission was accepted"),
+                    |_, _, _| {},
+                );
+                release.send(()).unwrap();
+            })
+            .unwrap();
+        cx.condition(&handle.entity(cx).unwrap(), |view, _| {
+            !view.submission_pending
+        })
+        .await;
+        handle
+            .update(cx, |view, _, _| {
+                assert_eq!(
+                    view.toast.as_ref().unwrap().text.as_ref(),
+                    "Submission failed"
+                );
+            })
+            .unwrap();
     }
 }

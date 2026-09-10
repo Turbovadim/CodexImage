@@ -1071,7 +1071,7 @@ impl AppView {
         let drag = self.drag.take();
         if let Some(DragState::Node { id, .. }) = drag {
             if let Some(position) = self.transient_positions.remove(&id) {
-                self.on_board(cx, |this, board_id, _cx| {
+                self.on_board(cx, |this, board_id, cx| {
                     // Pin every still-automatic card where it stands, not just
                     // the dragged one. Otherwise the tree layout re-centres the
                     // remaining cards and they flow into the space the user
@@ -1092,7 +1092,7 @@ impl AppView {
                     // card falls back to its pre-drag slot while the async
                     // repository event is still queued.
                     this.board = this.engine.repository().board_snapshot(board_id);
-                    this.refresh_layout();
+                    this.refresh_layout(cx);
                     Ok(())
                 });
             }
@@ -1116,9 +1116,9 @@ impl AppView {
                     if !self.expanded_prompts.remove(&node_id) {
                         self.expanded_prompts.insert(node_id);
                     }
-                    self.refresh_layout();
+                    self.refresh_layout(cx);
                 }
-                CanvasClickTarget::Retry(node_id) => self.regenerate_node(&node_id, cx),
+                CanvasClickTarget::Retry(node_id) => self.regenerate_node(&node_id, window, cx),
                 CanvasClickTarget::NodeText(node_id) => {
                     self.overlay = Overlay::NodeText(node_id);
                 }
@@ -1142,14 +1142,14 @@ impl AppView {
             ToolbarAction::Branch => self.branch_node(node_id, None, window, cx),
             ToolbarAction::Combine => self.combine_node(node_id, None, window, cx),
             ToolbarAction::Edit => self.edit_node(node_id, window, cx),
-            ToolbarAction::Retry => self.regenerate_node(node_id, cx),
+            ToolbarAction::Retry => self.regenerate_node(node_id, window, cx),
             ToolbarAction::Copy => {
                 if let Some(node) = self.node(node_id) {
                     cx.write_to_clipboard(ClipboardItem::new_string(node.prompt));
                     self.show_toast("Prompt copied".into(), false, None, cx);
                 }
             }
-            ToolbarAction::Duplicate => self.duplicate_node(node_id, cx),
+            ToolbarAction::Duplicate => self.duplicate_node(node_id, window, cx),
             ToolbarAction::Delete => self.delete_node(node_id, cx),
         }
     }
@@ -1276,6 +1276,45 @@ mod tests {
                 view.canvas_mouse_down(&down, window, cx);
                 view.mouse_up(&up, window, cx);
                 assert!(view.expanded_prompts.contains("node"));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn attachment_checks_reserve_slots_and_reject_invalid_paths(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let (directory, engine, receiver) = test_engine();
+        let valid = directory.path().join("valid.png");
+        std::fs::write(&valid, b"checked at import").unwrap();
+        let folder = directory.path().join("folder.png");
+        std::fs::create_dir(&folder).unwrap();
+        let handle = cx.add_window(move |window, cx| AppView::new(engine, receiver, window, cx));
+        handle
+            .update(cx, |view, _, cx| {
+                // Leave two slots, then submit overlapping batches before either
+                // completion can update the composer.
+                view.attachments = (0..crate::model::MAX_ATTACHMENTS - 2)
+                    .map(|index| directory.path().join(format!("existing-{index}.png")))
+                    .collect();
+                view.queue_attachments(vec![folder, valid.clone(), valid.clone()], cx);
+                view.queue_attachments(vec![valid.clone()], cx);
+                assert_eq!(view.pending_attachment_writes, 2);
+            })
+            .unwrap();
+        cx.condition(&handle.entity(cx).unwrap(), |view, _| {
+            view.pending_attachment_writes == 0
+        })
+        .await;
+        handle
+            .update(cx, |view, _, _| {
+                assert_eq!(view.attachments.len(), crate::model::MAX_ATTACHMENTS - 1);
+                assert_eq!(
+                    view.attachments
+                        .iter()
+                        .filter(|path| **path == valid)
+                        .count(),
+                    1
+                );
             })
             .unwrap();
     }

@@ -268,6 +268,7 @@ mod tests {
             id: "board".into(),
             title: "Board".into(),
             created_at: 0,
+            image_sizes: Default::default(),
             nodes: vec![
                 node("hero", None, &[]),
                 node("hero-armor", Some("hero"), &[]),

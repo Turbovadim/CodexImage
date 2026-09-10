@@ -35,11 +35,10 @@ pub(super) struct BoardRow {
 }
 
 impl BoardRow {
-    pub(super) fn new(summary: BoardSummary, view: &AppView) -> Self {
+    pub(super) fn new(summary: BoardSummary, repository: &crate::storage::Repository) -> Self {
         // Resolved against the summary's own board. The switcher lists boards
         // that are not open, and the view's image assets only cover the open
         // one, so asking it would leave every other row's thumbnail blank.
-        let repository = view.engine.repository();
         let thumbnail = summary.last_image.as_deref().and_then(|url| {
             repository
                 .sprite_thumbnail_path(&summary.id, url)
@@ -300,7 +299,7 @@ impl AppView {
         };
         self.armed_board_delete = None;
         self.search_input.update(cx, |input, cx| input.clear(cx));
-        self.refresh_overlay_data();
+        self.refresh_overlay_data(cx);
         if matches!(self.overlay, Overlay::Boards) {
             window.focus(&self.search_input.focus_handle(cx), cx);
         } else {
@@ -330,7 +329,7 @@ impl AppView {
         } else {
             Overlay::Gallery
         };
-        self.refresh_overlay_data();
+        self.refresh_overlay_data(cx);
         cx.notify();
     }
 
@@ -343,16 +342,25 @@ impl AppView {
         if prompt.is_empty() {
             return;
         }
-        match self.board_id().map(str::to_owned).and_then(|board_id| {
-            self.engine
-                .regenerate(&board_id, &node_id, Some(prompt), None)
-        }) {
-            Ok(()) => {
-                self.overlay = Overlay::None;
-                window.focus(&self.focus, cx);
-            }
-            Err(error) => self.show_error(error, cx),
-        }
+        let submitted_prompt = prompt.clone();
+        let submitted_node = node_id.clone();
+        let submitted_board = self.board_id.clone();
+        self.submit_node_action(
+            window,
+            cx,
+            move |engine, board_id| engine.regenerate(&board_id, &node_id, Some(prompt), None),
+            move |view, window, cx| {
+                // Close the editor only if it still shows the prompt that was
+                // submitted; the user may have moved on while it ran.
+                if view.board_id == submitted_board
+                    && matches!(&view.overlay, Overlay::EditNode(id) if *id == submitted_node)
+                    && view.modal_input.read(cx).content().trim() == submitted_prompt
+                {
+                    view.overlay = Overlay::None;
+                    window.focus(&view.focus, cx);
+                }
+            },
+        );
         cx.notify();
     }
 
@@ -365,7 +373,7 @@ impl AppView {
         match self.engine.repository().rename_board(&board_id, &title) {
             Ok(()) => {
                 self.overlay = Overlay::Boards;
-                self.refresh_overlay_data();
+                self.refresh_overlay_data(cx);
                 window.focus(&self.search_input.focus_handle(cx), cx);
             }
             Err(error) => self.show_error(error, cx),
@@ -530,7 +538,7 @@ impl AppView {
                                             // same Arc and skip a refresh.
                                             this.reset_image_metadata();
                                             this.refresh_image_metadata(cx);
-                                            this.refresh_layout();
+                                            this.refresh_layout(cx);
                                         }
                                         Err(error) => this.show_error(error, cx),
                                     }
