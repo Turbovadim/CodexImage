@@ -3,8 +3,8 @@
 1 ICON "resources/windows/CodexImage.ico"
 
 1 VERSIONINFO
-FILEVERSION 0,1,0,0
-PRODUCTVERSION 0,1,0,0
+FILEVERSION 0,2,0,0
+PRODUCTVERSION 0,2,0,0
 FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
 FILEFLAGS 0
 FILEOS VOS_NT_WINDOWS32
@@ -17,11 +17,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "CodexImage contributors\0"
             VALUE "FileDescription", "CodexImage image-generation studio\0"
-            VALUE "FileVersion", "0.1.0\0"
+            VALUE "FileVersion", "0.2.0\0"
             VALUE "InternalName", "CodexImage\0"
             VALUE "OriginalFilename", "CodexImage.exe\0"
             VALUE "ProductName", "CodexImage\0"
-            VALUE "ProductVersion", "0.1.0\0"
+            VALUE "ProductVersion", "0.2.0\0"
         END
     END
     BLOCK "VarFileInfo"
