@@ -5,6 +5,9 @@ pub const MAX_ATTACHMENTS: usize = 8;
 pub const MAX_ATTACHMENT_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_ATTACHMENT_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
 pub const MAX_ACTIVE_PER_BOARD: usize = 20;
+pub const MAX_CHAT_MESSAGES: usize = 200;
+/// Turns of a card's conversation replayed to Codex on the next chat turn.
+pub const CHAT_CONTEXT_TURNS: usize = 16;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -14,6 +17,24 @@ pub enum NodeStatus {
     Done,
     Error,
     Stopped,
+}
+
+/// Who wrote one line of a card's conversation. `Error` carries a failed turn
+/// so the transcript keeps showing why it stopped.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatRole {
+    User,
+    Agent,
+    Error,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatMessage {
+    pub role: ChatRole,
+    pub text: String,
+    pub at: i64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -58,6 +79,9 @@ pub struct BoardNode {
     pub run_started_at: Option<i64>,
     pub finished_at: Option<i64>,
     pub usage: Option<BTreeMap<String, u64>>,
+    /// The side conversation held about this card, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chat: Vec<ChatMessage>,
 }
 
 fn default_aspect() -> String {

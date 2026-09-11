@@ -657,15 +657,13 @@ impl AppView {
             .map(|board| board.title.as_str())
             .unwrap_or(APP_NAME);
         let generating = self.engine.active_count() > 0;
-        let mut header = div()
+        let settings = self.engine.settings().get();
+        let mut switcher = div()
             .id("board-switcher")
             .accessibility_id("codex-image.board-switcher")
             .role(Role::Button)
             .aria_label(format!("Switch board. Current board: {title}"))
             .aria_keyshortcuts(platform_shortcut("Meta+K", "Control+K"))
-            .absolute()
-            .top(px(14.))
-            .left(px(if cfg!(target_os = "macos") { 78. } else { 18. }))
             .flex()
             .items_center()
             .gap_2()
@@ -676,7 +674,6 @@ impl AppView {
             .px_3()
             .py_2()
             .cursor_pointer()
-            .occlude()
             .hover(|style| style.border_color(theme::faint()).bg(theme::hover()))
             .tooltip(tip_with_shortcut(
                 "Switch board",
@@ -693,10 +690,46 @@ impl AppView {
                     .child(title.to_owned()),
             );
         if generating {
-            header = header.child(div().size(px(8.)).rounded_full().bg(theme::accent()));
+            switcher = switcher.child(div().size(px(8.)).rounded_full().bg(theme::accent()));
         }
-        header
-            .child(div().text_xs().text_color(theme::faint()).child("⌄"))
+        switcher = switcher.child(div().text_xs().text_color(theme::faint()).child("⌄"));
+        div()
+            .absolute()
+            .top(px(14.))
+            .left(px(if cfg!(target_os = "macos") { 78. } else { 18. }))
+            .flex()
+            .items_center()
+            .gap_2()
+            .occlude()
+            .child(switcher)
+            .child(
+                div()
+                    .id("model-switch")
+                    .role(Role::Button)
+                    .aria_label(format!("Codex settings. Model: {}", settings.model_label()))
+                    .aria_keyshortcuts(platform_shortcut("Meta+Comma", "Control+Comma"))
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(theme::line())
+                    .bg(theme::raised().opacity(0.96))
+                    .px_3()
+                    .py_2()
+                    .text_xs()
+                    .text_color(theme::dim())
+                    .cursor_pointer()
+                    .hover(|style| {
+                        style
+                            .border_color(theme::faint())
+                            .bg(theme::hover())
+                            .text_color(theme::ink())
+                    })
+                    .tooltip(tip_with_shortcut(
+                        "Model this app asks Codex for",
+                        Some(platform_shortcut("⌘,", "Ctrl+,")),
+                    ))
+                    .child(settings.model_label().to_owned())
+                    .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx))),
+            )
             .into_any_element()
     }
 

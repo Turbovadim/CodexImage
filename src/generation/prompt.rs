@@ -1,7 +1,7 @@
 //! The instructions handed to Codex: the standing image-generation contract,
 //! the per-node request, and the recovery prompt used to salvage a run.
 
-use crate::model::{Board, BoardNode};
+use crate::model::{Board, BoardNode, CHAT_CONTEXT_TURNS, ChatRole, NodeStatus};
 use crate::storage::Repository;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -24,14 +24,23 @@ Prompting the image tool:
 - When image files are provided, treat each by its stated role. For compositing, match lighting, perspective, and scale.
 - For edits, state invariants explicitly. Preserve identity aggressively when people are involved and preserve everything the request does not ask to change."#;
 
+/// The knobs of one generation run that the board itself does not carry.
+pub struct RunOptions<'a> {
+    /// Conditioning executable and directory, when same-run conditioning is on.
+    pub conditioner: Option<(&'a Path, &'a Path)>,
+    /// How many earlier images of the card's chain travel as reference.
+    pub lineage_refs: usize,
+    /// This take's index among `takes` parallel takes of the same request.
+    pub take: usize,
+    pub takes: usize,
+}
+
 pub fn build_node_prompt(
     repository: &Repository,
     board: &Board,
     node: &BoardNode,
     source_paths: &[PathBuf],
-    same_run_conditioner: Option<(&Path, &Path)>,
-    index: usize,
-    count: usize,
+    options: RunOptions<'_>,
 ) -> String {
     let mut sections = vec![PREAMBLE.to_owned()];
     let by_id: HashMap<_, _> = board
@@ -70,6 +79,12 @@ pub fn build_node_prompt(
             bullet_paths(source_paths)
         ));
     }
+    if !source_paths.is_empty()
+        && let Some(section) =
+            lineage_reference_section(repository, board, &by_id, node, options.lineage_refs)
+    {
+        sections.push(section);
+    }
     let attachments: Vec<_> = node
         .attachments
         .iter()
@@ -82,7 +97,7 @@ pub fn build_node_prompt(
             bullet_paths(&attachments)
         ));
     }
-    if let Some((executable, directory)) = same_run_conditioner {
+    if let Some((executable, directory)) = options.conditioner {
         sections.push(same_run_conditioning_section(executable, directory));
     }
     sections.push(format!("Request: {}", node.prompt));
@@ -90,15 +105,144 @@ pub fn build_node_prompt(
     if node.aspect != "auto" {
         extras.push(format!("Aspect ratio: {}.", node.aspect));
     }
-    if count > 1 {
+    if options.takes > 1 {
         extras.push(format!(
-            "{count} independent takes of this entire request are generated in parallel; this is take {}. Give this take its own distinct interpretation while still producing every final deliverable implied by the request.",
-            index + 1
+            "{} independent takes of this entire request are generated in parallel; this is take {}. Give this take its own distinct interpretation while still producing every final deliverable implied by the request.",
+            options.takes,
+            options.take + 1
         ));
     }
     if !extras.is_empty() {
         sections.push(extras.join(" "));
     }
+    sections.join("\n\n")
+}
+
+/// Images from earlier steps of the same chain. A branch taken from a close-up
+/// leaves Codex guessing at everything the crop hides, so the steps that did
+/// show it come along as identity reference.
+fn lineage_reference_section(
+    repository: &Repository,
+    board: &Board,
+    by_id: &HashMap<&str, &BoardNode>,
+    node: &BoardNode,
+    limit: usize,
+) -> Option<String> {
+    if limit == 0 {
+        return None;
+    }
+    let mut lines = Vec::new();
+    let mut current = node
+        .parent_id
+        .as_deref()
+        .and_then(|id| by_id.get(id).copied());
+    while let Some(ancestor) = current {
+        if lines.len() == limit {
+            break;
+        }
+        if let Some(url) = ancestor.images.first()
+            && !node.source_images.contains(url)
+            && let Some(path) = repository
+                .image_path(&board.id, url)
+                .filter(|path| path.exists())
+        {
+            lines.push(format!(
+                "- {} — produced by the earlier step: {}",
+                path.display(),
+                excerpt(&ancestor.prompt, 160)
+            ));
+        }
+        current = ancestor
+            .parent_id
+            .as_deref()
+            .and_then(|id| by_id.get(id).copied());
+    }
+    (!lines.is_empty()).then(|| {
+        format!(
+            "Earlier images from this same chain, nearest step first. They show the same subject and world before the current image was cropped, reframed, or changed:\n{}\nView them too. Use them only to keep identity, anatomy, proportions, wardrobe, and style consistent when the image being continued does not show those details. Do not copy their framing and do not treat them as images to edit.",
+            lines.join("\n")
+        )
+    })
+}
+
+const CHAT_PREAMBLE: &str = r#"You are discussing one card on the user's image-generation board. This is a conversation, not a generation run.
+
+Hard rules:
+- Never call the image generation tool. Do not create, edit, copy, move, or delete any file.
+- You may view the image files listed below, and you should before saying anything about what they show.
+- Reply in plain text: no JSON, no markdown headings, no preamble such as "Certainly".
+- Be concrete and brief. For ideas, give a short numbered list of distinct one-line options. For a result that came out wrong, name the likely cause and the prompt change that fixes it. When the user asks for a prompt, write the prompt itself, ready to paste."#;
+
+/// The conversation about one card, with everything the card is made of so
+/// Codex can answer about this specific result rather than in the abstract.
+pub fn build_chat_prompt(repository: &Repository, board: &Board, node: &BoardNode) -> String {
+    let mut sections = vec![CHAT_PREAMBLE.to_owned()];
+    let by_id: HashMap<_, _> = board
+        .nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node))
+        .collect();
+    sections.push(format!("Board: {}", board.title));
+    let ancestors = prompt_chain(&by_id, node.parent_id.as_deref());
+    if !ancestors.is_empty() {
+        sections.push(format!(
+            "This card continues earlier work. The prompts leading to it, oldest first:\n{}",
+            numbered(&ancestors)
+        ));
+    }
+    sections.push(format!("This card's request: {}", node.prompt));
+    let mut facts = vec![format!(
+        "Status: {}",
+        match node.status {
+            NodeStatus::Running => "still generating",
+            NodeStatus::Done => "finished",
+            NodeStatus::Error => "failed",
+            NodeStatus::Stopped => "stopped by the user",
+        }
+    )];
+    if node.aspect != "auto" {
+        facts.push(format!("Aspect ratio: {}", node.aspect));
+    }
+    if !node.text.is_empty() {
+        facts.push(format!("Codex's summary of the run: {}", node.text));
+    }
+    if let Some(error) = node.error.as_deref().filter(|error| !error.is_empty()) {
+        facts.push(format!("Recorded failure: {error}"));
+    }
+    sections.push(facts.join("\n"));
+    let paths = |urls: &[String]| -> Vec<PathBuf> {
+        urls.iter()
+            .filter_map(|url| repository.image_path(&board.id, url))
+            .filter(|path| path.exists())
+            .collect()
+    };
+    for (label, urls) in [
+        ("The images this card produced", &node.images),
+        ("The images it was generated from", &node.source_images),
+        ("Reference images the user attached", &node.attachments),
+    ] {
+        let files = paths(urls);
+        if !files.is_empty() {
+            sections.push(format!("{label}:\n{}", bullet_paths(&files)));
+        }
+    }
+    let transcript: Vec<_> = node
+        .chat
+        .iter()
+        .rev()
+        .take(CHAT_CONTEXT_TURNS)
+        .rev()
+        .map(|message| {
+            let speaker = match message.role {
+                ChatRole::User => "User",
+                ChatRole::Agent => "You",
+                ChatRole::Error => "System",
+            };
+            format!("{speaker}: {}", message.text)
+        })
+        .collect();
+    sections.push(format!("Conversation so far:\n{}", transcript.join("\n\n")));
+    sections.push("Reply to the last user message.".to_owned());
     sections.join("\n\n")
 }
 
@@ -172,12 +316,7 @@ fn prompt_chain(by_id: &HashMap<&str, &BoardNode>, start: Option<&str>) -> Vec<S
     let mut chain = Vec::new();
     let mut current = start.and_then(|id| by_id.get(id).copied());
     while let Some(ancestor) = current {
-        let prompt = if ancestor.prompt.chars().count() > 400 {
-            format!("{}…", ancestor.prompt.chars().take(397).collect::<String>())
-        } else {
-            ancestor.prompt.clone()
-        };
-        chain.push(prompt);
+        chain.push(excerpt(&ancestor.prompt, 400));
         if chain.len() == 12 {
             break;
         }
@@ -188,6 +327,20 @@ fn prompt_chain(by_id: &HashMap<&str, &BoardNode>, start: Option<&str>) -> Vec<S
     }
     chain.reverse();
     chain
+}
+
+fn excerpt(prompt: &str, limit: usize) -> String {
+    if prompt.chars().count() > limit {
+        format!(
+            "{}…",
+            prompt
+                .chars()
+                .take(limit.saturating_sub(3))
+                .collect::<String>()
+        )
+    } else {
+        prompt.to_owned()
+    }
 }
 
 fn numbered(prompts: &[String]) -> String {
@@ -219,8 +372,19 @@ pub fn tail_chars(value: &str, limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_node_prompt, same_run_conditioning_section, tail_chars};
-    use crate::model::{Board, BoardNode, NodeStatus};
+    use super::{
+        RunOptions, build_chat_prompt, build_node_prompt, same_run_conditioning_section, tail_chars,
+    };
+
+    fn options(lineage_refs: usize) -> RunOptions<'static> {
+        RunOptions {
+            conditioner: None,
+            lineage_refs,
+            take: 0,
+            takes: 1,
+        }
+    }
+    use crate::model::{Board, BoardNode, ChatMessage, ChatRole, NodeStatus};
     use crate::storage::{DataPaths, Repository};
     use std::path::{Path, PathBuf};
 
@@ -246,6 +410,7 @@ mod tests {
             run_started_at: None,
             finished_at: None,
             usage: None,
+            chat: Vec::new(),
         }
     }
 
@@ -281,7 +446,7 @@ mod tests {
             PathBuf::from("/img/villain.png"),
         ];
 
-        let prompt = build_node_prompt(&repository, &board, &board.nodes[3], &sources, None, 0, 1);
+        let prompt = build_node_prompt(&repository, &board, &board.nodes[3], &sources, options(0));
 
         assert!(
             prompt.contains(
@@ -297,9 +462,7 @@ mod tests {
             &board,
             &board.nodes[1],
             &sources[..1],
-            None,
-            0,
-            1,
+            options(0),
         );
         assert!(plain.contains("The current image to continue from is saved at:"));
         assert!(!plain.contains("separate chain"));
@@ -332,6 +495,90 @@ mod tests {
             assert!(instructions.contains("& 'C:\\Program Files\\CodexImage\\CodexImage.exe'"));
             assert!(instructions.contains("'C:\\Temp\\work space\\same-run\\step-N.png'"));
         }
+    }
+
+    fn board_with(nodes: Vec<BoardNode>) -> Board {
+        Board {
+            id: "board".into(),
+            title: "Board".into(),
+            created_at: 0,
+            image_sizes: Default::default(),
+            nodes,
+        }
+    }
+
+    /// A branch taken from a close-up carries the earlier full shots of its own
+    /// chain as reference, and never re-lists the image it is already editing.
+    #[test]
+    fn chain_references_carry_earlier_images_but_not_the_source() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let (sender, _receiver) = async_channel::unbounded();
+        let repository = Repository::open_at(
+            DataPaths::at(
+                directory.path().join("data"),
+                directory.path().join("generated"),
+            ),
+            sender,
+        )
+        .unwrap();
+        let images = repository.paths().images.join("board");
+        std::fs::create_dir_all(&images).unwrap();
+        for name in ["full.png", "face.png"] {
+            std::fs::write(images.join(name), b"x").unwrap();
+        }
+        let mut full = node("full", None, &[]);
+        full.images = vec!["/images/board/full.png".to_owned()];
+        let mut face = node("face", Some("full"), &[]);
+        face.images = vec!["/images/board/face.png".to_owned()];
+        let mut child = node("child", Some("face"), &[]);
+        child.source_images = face.images.clone();
+        let board = board_with(vec![full, face, child]);
+        let sources = [images.join("face.png")];
+
+        let prompt = build_node_prompt(&repository, &board, &board.nodes[2], &sources, options(3));
+
+        assert!(prompt.contains("Earlier images from this same chain"));
+        assert!(prompt.contains("full.png — produced by the earlier step: prompt full"));
+        // The image being continued is named once, by the section that owns it.
+        assert_eq!(prompt.matches("face.png").count(), 1);
+
+        let off = build_node_prompt(&repository, &board, &board.nodes[2], &sources, options(0));
+        assert!(!off.contains("Earlier images from this same chain"));
+    }
+
+    #[test]
+    fn chat_prompt_carries_the_transcript_and_bans_generating() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let (sender, _receiver) = async_channel::unbounded();
+        let repository = Repository::open_at(
+            DataPaths::at(
+                directory.path().join("data"),
+                directory.path().join("generated"),
+            ),
+            sender,
+        )
+        .unwrap();
+        let mut card = node("card", None, &[]);
+        card.chat = vec![
+            ChatMessage {
+                role: ChatRole::User,
+                text: "why is the body wrong".into(),
+                at: 0,
+            },
+            ChatMessage {
+                role: ChatRole::Agent,
+                text: "the crop hides it".into(),
+                at: 1,
+            },
+        ];
+        let board = board_with(vec![card]);
+
+        let prompt = build_chat_prompt(&repository, &board, &board.nodes[0]);
+
+        assert!(prompt.contains("Never call the image generation tool"));
+        assert!(prompt.contains("User: why is the body wrong"));
+        assert!(prompt.contains("You: the crop hides it"));
+        assert!(prompt.ends_with("Reply to the last user message."));
     }
 
     #[test]

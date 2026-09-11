@@ -4,6 +4,7 @@ pub mod layout;
 pub mod manifest;
 pub mod model;
 pub(crate) mod platform;
+pub mod settings;
 pub mod storage;
 pub mod ui;
 

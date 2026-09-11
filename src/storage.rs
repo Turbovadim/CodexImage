@@ -1,8 +1,9 @@
 mod writer;
 
 use crate::model::{
-    Board, BoardNode, BoardSummary, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_TOTAL_BYTES,
-    MAX_ATTACHMENTS, NewNodesRequest, NodeStatus, StopReason,
+    Board, BoardNode, BoardSummary, ChatMessage, ChatRole, MAX_ATTACHMENT_BYTES,
+    MAX_ATTACHMENT_TOTAL_BYTES, MAX_ATTACHMENTS, MAX_CHAT_MESSAGES, NewNodesRequest, NodeStatus,
+    StopReason,
 };
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -396,6 +397,7 @@ impl Repository {
                 run_started_at: Some(run_started_at),
                 finished_at: None,
                 usage: None,
+                chat: Vec::new(),
             })
             .collect();
         let mut state = self.inner.write();
@@ -577,6 +579,26 @@ impl Repository {
             }
         })?;
         Ok(())
+    }
+
+    /// Appends one line to a card's side conversation, keeping the stored
+    /// transcript bounded; the prompt only ever carries its tail.
+    pub fn append_chat(
+        &self,
+        board_id: &str,
+        node_id: &str,
+        role: ChatRole,
+        text: String,
+    ) -> Result<()> {
+        self.mutate_node(board_id, node_id, |node| {
+            node.chat.push(ChatMessage {
+                role,
+                text,
+                at: now_ms(),
+            });
+            let excess = node.chat.len().saturating_sub(MAX_CHAT_MESSAGES);
+            node.chat.drain(..excess);
+        })
     }
 
     pub fn image_path(&self, board_id: &str, url: &str) -> Option<PathBuf> {
@@ -935,7 +957,7 @@ fn purge_expired_trash(state: &mut RepositoryState) {
     state.trash.retain(|_, entry| entry.expires_at > now);
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().context("file has no parent directory")?;
     fs::create_dir_all(parent)?;
     let temporary = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
@@ -1167,6 +1189,7 @@ mod tests {
             run_started_at: None,
             finished_at: None,
             usage: None,
+            chat: Vec::new(),
         }
     }
 

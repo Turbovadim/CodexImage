@@ -43,6 +43,10 @@ Defender SmartScreen may require **More info > Run anyway** on first launch.
 - Lets you branch, regenerate, edit, duplicate, or delete any result.
 - Combines images from different branches into one generation, with every
   branch's prompt history passed along.
+- Sends earlier images from a card's own chain along as reference, so a branch
+  taken from a close-up still knows what the full shot looked like.
+- Opens a conversation about any card, with that card's chain, images, summary,
+  and failure already in the prompt.
 - Opens images in a lightbox and collects completed work in a gallery.
 - Saves boards locally and marks interrupted jobs after a restart instead of
   leaving them stuck as running.
@@ -93,6 +97,15 @@ to launch the packaged application:
 .\scripts\package-windows.ps1 -Install -Open
 ```
 
+## Model and reasoning effort
+
+`⌘,` / `Ctrl+,` opens settings, also reachable from the model pill next to the
+board name. The model and reasoning effort chosen there are passed to each
+`codex exec` run, so they never change what your Codex CLI does elsewhere.
+The same panel sets how many earlier images from a card's chain travel with a
+generation as reference; three by default, `Off` to send only the image being
+edited. Settings live in `settings.json` beside the boards.
+
 ## Data and generated images
 
 CodexImage keeps boards under
@@ -130,4 +143,6 @@ between `0` and `1` to reduce its strength.
 | `R` | Regenerate the hovered node |
 | `E` | Edit the hovered node |
 | `D` | Duplicate the hovered node |
+| `T` | Chat about the hovered node |
+| `⌘,` / `Ctrl+,` | Open settings |
 | `Delete` | Delete the hovered node |

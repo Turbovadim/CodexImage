@@ -6,7 +6,8 @@ use super::app::Overlay;
 use super::composer::ComposerTarget;
 use super::input::TextInputMode;
 use super::keymap::{
-    BranchHovered, CombineHovered, DeleteHovered, DuplicateHovered, EditHovered, RegenerateHovered,
+    BranchHovered, ChatHovered, CombineHovered, DeleteHovered, DuplicateHovered, EditHovered,
+    OpenSettings, RegenerateHovered,
 };
 use crate::layout::{ESTIMATED_CARD_HEIGHT, free_spot_near};
 use crate::model::NewNodesRequest;
@@ -263,6 +264,27 @@ impl AppView {
             move |engine, board_id| engine.add_and_start(&board_id, request).map(|_| ()),
             |_, _, _| {},
         );
+    }
+
+    pub(super) fn chat_hovered(
+        &mut self,
+        _: &ChatHovered,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.hovered_node.clone() else {
+            return;
+        };
+        self.open_chat(&id, window, cx);
+    }
+
+    pub(super) fn open_settings_action(
+        &mut self,
+        _: &OpenSettings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_settings(window, cx);
     }
 
     pub(super) fn delete_hovered(

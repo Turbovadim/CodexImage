@@ -28,6 +28,7 @@ fn node(id: &str, parent: Option<&str>, created_at: i64) -> BoardNode {
         run_started_at: None,
         finished_at: None,
         usage: Some(BTreeMap::new()),
+        chat: vec![],
     }
 }
 

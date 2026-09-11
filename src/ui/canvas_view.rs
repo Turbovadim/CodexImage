@@ -87,6 +87,7 @@ pub(super) enum ToolbarAction {
     Stop,
     Branch,
     Combine,
+    Chat,
     Edit,
     Retry,
     Copy,
@@ -100,6 +101,7 @@ impl ToolbarAction {
             Self::Stop => "Stop",
             Self::Branch => "Branch",
             Self::Combine => "Mix",
+            Self::Chat => "Chat",
             Self::Edit => "Edit",
             Self::Retry => "Retry",
             Self::Copy => "Copy",
@@ -117,15 +119,17 @@ impl ToolbarAction {
     }
 }
 
-const RUNNING_TOOLBAR_ACTIONS: [ToolbarAction; 4] = [
+const RUNNING_TOOLBAR_ACTIONS: [ToolbarAction; 5] = [
     ToolbarAction::Stop,
+    ToolbarAction::Chat,
     ToolbarAction::Copy,
     ToolbarAction::Duplicate,
     ToolbarAction::Delete,
 ];
-const IDLE_TOOLBAR_ACTIONS: [ToolbarAction; 7] = [
+const IDLE_TOOLBAR_ACTIONS: [ToolbarAction; 8] = [
     ToolbarAction::Branch,
     ToolbarAction::Combine,
+    ToolbarAction::Chat,
     ToolbarAction::Edit,
     ToolbarAction::Retry,
     ToolbarAction::Copy,
@@ -1141,6 +1145,7 @@ impl AppView {
             ToolbarAction::Stop => self.engine.stop_node(node_id),
             ToolbarAction::Branch => self.branch_node(node_id, None, window, cx),
             ToolbarAction::Combine => self.combine_node(node_id, None, window, cx),
+            ToolbarAction::Chat => self.open_chat(node_id, window, cx),
             ToolbarAction::Edit => self.edit_node(node_id, window, cx),
             ToolbarAction::Retry => self.regenerate_node(node_id, window, cx),
             ToolbarAction::Copy => {

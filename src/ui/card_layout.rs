@@ -301,6 +301,7 @@ mod tests {
             run_started_at: None,
             finished_at: None,
             usage: None,
+            chat: Vec::new(),
         }
     }
 

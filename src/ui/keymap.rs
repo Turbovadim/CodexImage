@@ -45,6 +45,8 @@ actions!(
         LightboxUp,
         LightboxDown,
         AddAttachment,
+        ChatHovered,
+        OpenSettings,
         Quit,
     ]
 );
@@ -75,6 +77,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("r", RegenerateHovered, Some(CANVAS_CONTEXT)),
         KeyBinding::new("e", EditHovered, Some(CANVAS_CONTEXT)),
         KeyBinding::new("d", DuplicateHovered, Some(CANVAS_CONTEXT)),
+        KeyBinding::new("t", ChatHovered, Some(CANVAS_CONTEXT)),
         KeyBinding::new("backspace", DeleteHovered, Some(CANVAS_CONTEXT)),
         KeyBinding::new("delete", DeleteHovered, Some(CANVAS_CONTEXT)),
         KeyBinding::new("left", LightboxLeft, Some(CANVAS_CONTEXT)),
@@ -108,6 +111,7 @@ fn bind_platform_keys(cx: &mut App) {
         KeyBinding::new("cmd--", ZoomOut, None),
         KeyBinding::new("cmd-0", ResetZoom, None),
         KeyBinding::new("cmd-o", AddAttachment, None),
+        KeyBinding::new("cmd-,", OpenSettings, None),
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("ctrl-h", InputBackspace, Some("CodexImageInput")),
         KeyBinding::new("ctrl-d", InputDelete, Some("CodexImageInput")),
@@ -187,6 +191,7 @@ fn bind_platform_keys(cx: &mut App) {
         KeyBinding::new("ctrl--", ZoomOut, None),
         KeyBinding::new("ctrl-0", ResetZoom, None),
         KeyBinding::new("ctrl-o", AddAttachment, None),
+        KeyBinding::new("ctrl-,", OpenSettings, None),
         KeyBinding::new("ctrl-q", Quit, None),
         KeyBinding::new("ctrl-left", InputWordLeft, Some("CodexImageInput")),
         KeyBinding::new("ctrl-right", InputWordRight, Some("CodexImageInput")),
@@ -236,6 +241,8 @@ pub fn configure_menus(cx: &mut App) {
     #[cfg(target_os = "macos")]
     cx.set_menus([
         Menu::new(APP_NAME).items([
+            MenuItem::action("Settings…", OpenSettings),
+            MenuItem::separator(),
             MenuItem::os_submenu("Services", SystemMenuType::Services),
             MenuItem::separator(),
             MenuItem::action(format!("Quit {APP_NAME}"), Quit),
@@ -265,6 +272,7 @@ pub fn configure_menus(cx: &mut App) {
     cx.set_menus([
         Menu::new("File").items([
             MenuItem::action("Attach Images…", AddAttachment),
+            MenuItem::action("Settings…", OpenSettings),
             MenuItem::separator(),
             MenuItem::action(format!("Exit {APP_NAME}"), Quit),
         ]),

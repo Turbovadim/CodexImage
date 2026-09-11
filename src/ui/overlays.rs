@@ -320,6 +320,8 @@ impl AppView {
                 | Overlay::EditNode(_)
                 | Overlay::RenameBoard(_)
                 | Overlay::NodeText(_)
+                | Overlay::Chat(_)
+                | Overlay::Settings
                 | Overlay::QuitConfirm
         ) {
             return;

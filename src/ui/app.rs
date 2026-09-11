@@ -22,7 +22,7 @@ use super::window_memory::{VisibilityChange, WindowMemoryState, WindowOcclusionO
 use crate::APP_NAME;
 use crate::generation::GenerationEngine;
 use crate::layout::{Position, compute_layout};
-use crate::model::{Board, BoardNode};
+use crate::model::{Board, BoardNode, ChatMessage};
 use crate::storage::{
     RepositoryEvent, create_thumbnail, sprite_thumbnail_path_for, thumbnail_path_for,
 };
@@ -45,6 +45,9 @@ pub(super) enum Overlay {
     EditNode(String),
     RenameBoard(String),
     NodeText(String),
+    /// The conversation about one card, by node id.
+    Chat(String),
+    Settings,
     QuitConfirm,
 }
 
@@ -144,6 +147,7 @@ pub(super) struct AppView {
     pub(super) prompt: Entity<TextInput>,
     pub(super) modal_input: Entity<TextInput>,
     pub(super) search_input: Entity<TextInput>,
+    pub(super) chat_input: Entity<TextInput>,
     pub(super) focus: FocusHandle,
     pub(super) lightbox_focus: FocusHandle,
     pub(super) overlay: Overlay,
@@ -174,9 +178,13 @@ pub(super) struct AppView {
     pub(super) board_rows: Arc<Vec<BoardRow>>,
     board_rows_task: Option<Task<()>>,
     pub(super) gallery_rows: Arc<Vec<GalleryRow>>,
+    /// The open card conversation, derived like the other overlay rows so the
+    /// render pass never walks the board for it.
+    pub(super) chat_rows: Arc<Vec<ChatMessage>>,
     pub(super) image_cache: Entity<DecodedImageCache>,
     pub(super) sprite_cache: Entity<CardSpriteCache>,
     pub(super) gallery_list_state: ListState,
+    pub(super) chat_list_state: ListState,
     pub(super) image_ratios: HashMap<String, f32>,
     pub(super) image_assets: HashMap<String, ImageAsset>,
     pending_image_jobs: HashSet<String>,
@@ -303,6 +311,7 @@ impl AppView {
         let prompt = cx.new(|cx| TextInput::auto_growing("Describe the image you want…", 7, cx));
         let modal_input = cx.new(|cx| TextInput::single_line("Type here…", cx));
         let search_input = cx.new(|cx| TextInput::single_line("Search boards…", cx));
+        let chat_input = cx.new(|cx| TextInput::auto_growing("Ask about this card…", 6, cx));
         let image_cache = cx.new(|cx| DecodedImageCache::new(DECODED_IMAGE_CACHE_BUDGET, cx));
         let sprite_cache = cx.new(|cx| CardSpriteCache::new(CARD_SPRITE_CACHE_BUDGET, cx));
         #[cfg(target_os = "macos")]
@@ -339,6 +348,8 @@ impl AppView {
             ListAlignment::Top,
             px(600.),
         );
+        // Bottom-aligned so a conversation always opens on its latest turn.
+        let chat_list_state = ListState::new(0, ListAlignment::Bottom, px(400.));
         let mut view = Self {
             engine,
             receiver,
@@ -347,6 +358,7 @@ impl AppView {
             prompt,
             modal_input,
             search_input,
+            chat_input,
             focus: cx.focus_handle(),
             lightbox_focus: cx.focus_handle(),
             overlay: Overlay::None,
@@ -372,9 +384,11 @@ impl AppView {
             board_rows: Arc::new(Vec::new()),
             board_rows_task: None,
             gallery_rows: Arc::new(Vec::new()),
+            chat_rows: Arc::new(Vec::new()),
             image_cache,
             sprite_cache,
             gallery_list_state,
+            chat_list_state,
             image_ratios: HashMap::new(),
             image_assets: HashMap::new(),
             pending_image_jobs: HashSet::new(),
@@ -623,6 +637,23 @@ impl AppView {
     /// render pass itself stays a read of already-built rows.
     pub(super) fn refresh_overlay_data(&mut self, cx: &mut Context<Self>) {
         self.board_rows_task.take();
+        if let Overlay::Chat(node_id) = &self.overlay {
+            let messages = self
+                .board
+                .as_ref()
+                .and_then(|board| board.nodes.iter().find(|node| node.id == *node_id))
+                .map(|node| node.chat.clone())
+                .unwrap_or_default();
+            self.chat_rows = Arc::new(messages);
+            // The list indexes straight into these rows, so its item count may
+            // only ever change together with them.
+            if self.chat_list_state.item_count() == self.chat_rows.len() {
+                self.chat_list_state.remeasure();
+            } else {
+                self.chat_list_state.reset(self.chat_rows.len());
+            }
+            return;
+        }
         match self.overlay {
             Overlay::Boards => {
                 let repository = self.engine.repository();
@@ -958,6 +989,8 @@ impl AppView {
         match &self.overlay {
             Overlay::EditNode(_) => self.save_edited_prompt(window, cx),
             Overlay::RenameBoard(_) => self.rename_open_board(window, cx),
+            Overlay::Chat(_) => self.send_chat_message(cx),
+            Overlay::Settings => self.save_model(window, cx),
             Overlay::Boards
             | Overlay::Gallery
             | Overlay::Lightbox(_)
@@ -1087,6 +1120,8 @@ impl Render for AppView {
             .on_action(cx.listener(Self::navigate_up))
             .on_action(cx.listener(Self::navigate_down))
             .on_action(cx.listener(Self::add_attachment))
+            .on_action(cx.listener(Self::chat_hovered))
+            .on_action(cx.listener(Self::open_settings_action))
             .on_action(cx.listener(Self::quit))
             .on_mouse_move(cx.listener(Self::mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
@@ -1133,6 +1168,11 @@ impl Render for AppView {
                 let node_id = node_id.clone();
                 root.child(self.render_node_text(&node_id, cx))
             }
+            Overlay::Chat(node_id) => {
+                let node_id = node_id.clone();
+                root.child(self.render_chat(&node_id, window, cx))
+            }
+            Overlay::Settings => root.child(self.render_settings(cx)),
             Overlay::QuitConfirm => root.child(self.render_quit_confirm(cx)),
         };
         if let Some(toast) = &self.toast {

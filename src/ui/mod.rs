@@ -5,6 +5,7 @@ mod card;
 mod card_layout;
 mod card_scene;
 mod card_svg;
+mod chat;
 mod composer;
 mod format;
 mod image_cache;
@@ -19,6 +20,7 @@ mod keymap;
 mod lightbox;
 mod node_actions;
 mod overlays;
+mod settings_panel;
 mod theme;
 mod tooltip;
 #[cfg(target_os = "macos")]

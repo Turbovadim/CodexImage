@@ -6,13 +6,16 @@ pub use conditioner::{condition_image_for_reingestion, run_condition_image_cli};
 
 use crate::manifest::{OutputManifest, absolute_file_path, is_canonical_path_inside};
 use crate::model::{
-    Board, BoardNode, MAX_ACTIVE_PER_BOARD, NewNodesRequest, NodeStatus, StopReason,
+    Board, BoardNode, ChatRole, MAX_ACTIVE_PER_BOARD, NewNodesRequest, NodeStatus, StopReason,
 };
+use crate::settings::Settings;
 use crate::storage::{Repository, now_ms};
 use anyhow::{Context, Result, bail};
 use codex::{CodexInvocation, configure_process_group, kill_process_group, read_tail};
 use parking_lot::Mutex;
-use prompt::{build_node_prompt, selection_recovery_prompt, tail_chars};
+use prompt::{
+    RunOptions, build_chat_prompt, build_node_prompt, selection_recovery_prompt, tail_chars,
+};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
@@ -44,7 +47,12 @@ pub struct GenerationEngine {
 
 struct EngineInner {
     repository: Repository,
+    settings: Settings,
     jobs: Mutex<HashMap<String, Arc<JobControl>>>,
+    /// Card conversations, keyed by node id like `jobs`, but separate so a
+    /// chat never counts against the board's generation limit or gets stopped
+    /// along with the generation it is about.
+    chats: Mutex<HashMap<String, Arc<JobControl>>>,
     submission_lock: Mutex<()>,
     codex: OnceLock<CodexInvocation>,
 }
@@ -77,6 +85,14 @@ impl Termination {
             Self::Timeout | Self::Replaced => None,
         }
     }
+}
+
+/// Whether a run must answer with the output manifest. Card conversations
+/// answer in prose, so forcing the schema on them would be nonsense.
+#[derive(Clone, Copy)]
+enum Manifest {
+    Required,
+    Free,
 }
 
 #[derive(Clone, Copy)]
@@ -122,14 +138,21 @@ impl Runtime {
 
 impl GenerationEngine {
     pub fn new(repository: Repository) -> Self {
+        let settings = Settings::load(repository.paths().root.join("settings.json"));
         Self {
             inner: Arc::new(EngineInner {
                 repository,
+                settings,
                 jobs: Mutex::new(HashMap::new()),
+                chats: Mutex::new(HashMap::new()),
                 submission_lock: Mutex::new(()),
                 codex: OnceLock::new(),
             }),
         }
+    }
+
+    pub fn settings(&self) -> Settings {
+        self.inner.settings.clone()
     }
 
     fn codex_invocation(&self) -> &CodexInvocation {
@@ -203,10 +226,182 @@ impl GenerationEngine {
         self.stop(node_id, Termination::User, GRACEFUL_TERMINATION_SIGNAL);
     }
 
+    pub fn is_chatting(&self, node_id: &str) -> bool {
+        self.inner.chats.lock().contains_key(node_id)
+    }
+
+    /// Sends one message in a card's conversation. The user's line is stored
+    /// before the worker starts, so the transcript shows it immediately and
+    /// survives a crash; Codex's reply lands on the node when the turn ends.
+    pub fn send_chat(&self, board_id: &str, node_id: &str, message: String) -> Result<()> {
+        let message = message.trim().to_owned();
+        if message.is_empty() {
+            bail!("Empty message");
+        }
+        if self.inner.chats.lock().contains_key(node_id) {
+            bail!("This card is still answering");
+        }
+        self.inner
+            .repository
+            .append_chat(board_id, node_id, ChatRole::User, message)?;
+        let control = Arc::new(JobControl {
+            board_id: board_id.to_owned(),
+            node_id: node_id.to_owned(),
+            pid: AtomicU32::new(0),
+            termination: Mutex::new(None),
+        });
+        self.inner
+            .chats
+            .lock()
+            .insert(node_id.to_owned(), Arc::clone(&control));
+        let engine = self.clone();
+        let worker_control = Arc::clone(&control);
+        if let Err(error) = thread::Builder::new()
+            .name(format!("codex-chat-{}", &node_id[..node_id.len().min(8)]))
+            .spawn(move || engine.run_chat(worker_control))
+        {
+            self.inner.chats.lock().remove(node_id);
+            return Err(error).context("failed to start the chat worker");
+        }
+        Ok(())
+    }
+
+    pub fn stop_chat(&self, node_id: &str) {
+        let control = self.inner.chats.lock().get(node_id).cloned();
+        let Some(control) = control else { return };
+        *control.termination.lock() = Some(Termination::User);
+        kill_process_group(control.pid.load(Ordering::Acquire), FORCE_KILL_SIGNAL);
+    }
+
+    fn run_chat(&self, control: Arc<JobControl>) {
+        let outcome = self.run_chat_turn(&control);
+        let stopped = control.termination.lock().is_some();
+        let reply = match outcome {
+            Ok(Some(reply)) => Some((ChatRole::Agent, reply)),
+            Ok(None) if stopped => None,
+            Ok(None) => Some((
+                ChatRole::Error,
+                "Codex ended the turn without answering.".to_owned(),
+            )),
+            Err(error) => Some((ChatRole::Error, format!("{error:#}"))),
+        };
+        if let Some((role, text)) = reply {
+            let _ =
+                self.inner
+                    .repository
+                    .append_chat(&control.board_id, &control.node_id, role, text);
+        }
+        self.inner
+            .repository
+            .emit_activity(chat_activity_key(&control.node_id), String::new());
+        let mut chats = self.inner.chats.lock();
+        if chats
+            .get(&control.node_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &control))
+        {
+            chats.remove(&control.node_id);
+        }
+    }
+
+    /// Runs one read-only Codex turn over the card's context and transcript,
+    /// returning the agent's prose answer.
+    fn run_chat_turn(&self, control: &Arc<JobControl>) -> Result<Option<String>> {
+        let board = self
+            .inner
+            .repository
+            .board_snapshot(&control.board_id)
+            .context("Board not found")?;
+        let node = board
+            .nodes
+            .iter()
+            .find(|node| node.id == control.node_id)
+            .context("Card not found")?;
+        let workspace = self.inner.repository.paths().workspaces.join(&board.id);
+        fs::create_dir_all(&workspace)?;
+        let prompt = build_chat_prompt(&self.inner.repository, &board, node);
+        let mut child = self
+            .codex_exec(Sandbox::ReadOnly, &workspace, prompt, Manifest::Free)
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "Failed to launch {}",
+                    self.codex_invocation().executable.display()
+                )
+            })?;
+        control.pid.store(child.id(), Ordering::Release);
+        if control.termination.lock().is_some() {
+            kill_process_group(child.id(), FORCE_KILL_SIGNAL);
+        }
+        let stdout = child
+            .stdout
+            .take()
+            .context("Codex stdout was unavailable")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("Codex stderr was unavailable")?;
+        let stderr_thread = thread::spawn(move || read_tail(stderr, 4 * 1024));
+        let mut reply = None;
+        let mut failure = None;
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let Ok(event) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            match event.get("type").and_then(Value::as_str) {
+                Some("item.completed") => match event.pointer("/item/type").and_then(Value::as_str)
+                {
+                    Some("agent_message") => {
+                        reply = event
+                            .pointer("/item/text")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned);
+                    }
+                    Some("reasoning") => {
+                        if let Some(text) = event.pointer("/item/text").and_then(Value::as_str) {
+                            self.inner.repository.emit_activity(
+                                chat_activity_key(&control.node_id),
+                                tail_chars(text.lines().next().unwrap_or_default(), 140),
+                            );
+                        }
+                    }
+                    _ => {}
+                },
+                Some("turn.failed") | Some("error") => {
+                    failure = event
+                        .pointer("/error/message")
+                        .or_else(|| event.get("message"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                }
+                _ => {}
+            }
+        }
+        let status = child.wait()?;
+        let stderr_tail = stderr_thread.join().unwrap_or_default();
+        if control.termination.lock().is_some() {
+            return Ok(None);
+        }
+        if let Some(reply) = reply.filter(|reply| !reply.trim().is_empty()) {
+            return Ok(Some(reply.trim().to_owned()));
+        }
+        if let Some(failure) = failure {
+            bail!(failure);
+        }
+        if !status.success() {
+            bail!(if stderr_tail.trim().is_empty() {
+                format!("codex exited with {status}")
+            } else {
+                tail_chars(stderr_tail.trim(), 1_000)
+            });
+        }
+        Ok(None)
+    }
+
     pub fn delete_subtree(&self, board_id: &str, node_id: &str) -> Result<(Vec<String>, String)> {
         let (ids, undo_id) = self.inner.repository.delete_subtree(board_id, node_id)?;
         for id in &ids {
             self.stop(id, Termination::Deleted, FORCE_KILL_SIGNAL);
+            self.stop_chat(id);
         }
         Ok((ids, undo_id))
     }
@@ -217,11 +412,13 @@ impl GenerationEngine {
             .jobs
             .lock()
             .values()
+            .chain(self.inner.chats.lock().values())
             .filter(|job| job.board_id == board_id)
             .map(|job| job.node_id.clone())
             .collect();
         for id in ids {
             self.stop(&id, Termination::Deleted, FORCE_KILL_SIGNAL);
+            self.stop_chat(&id);
         }
         self.inner.repository.delete_board(board_id)
     }
@@ -230,6 +427,10 @@ impl GenerationEngine {
         let ids: Vec<_> = self.inner.jobs.lock().keys().cloned().collect();
         for id in ids {
             self.stop(&id, Termination::AppQuit, FORCE_KILL_SIGNAL);
+        }
+        let chats: Vec<_> = self.inner.chats.lock().keys().cloned().collect();
+        for id in chats {
+            self.stop_chat(&id);
         }
         self.inner.repository.flush();
     }
@@ -335,14 +536,22 @@ impl GenerationEngine {
             board,
             node,
             &source_paths,
-            same_run_conditioner
-                .as_ref()
-                .map(|(executable, directory)| (executable.as_path(), directory.as_path())),
-            index,
-            count,
+            RunOptions {
+                conditioner: same_run_conditioner
+                    .as_ref()
+                    .map(|(executable, directory)| (executable.as_path(), directory.as_path())),
+                lineage_refs: self.inner.settings.get().lineage_refs,
+                take: index,
+                takes: count,
+            },
         );
         let mut child = self
-            .codex_exec(Sandbox::WorkspaceWrite, &workspace, prompt)
+            .codex_exec(
+                Sandbox::WorkspaceWrite,
+                &workspace,
+                prompt,
+                Manifest::Required,
+            )
             .spawn()
             .with_context(|| {
                 format!(
@@ -788,7 +997,7 @@ impl GenerationEngine {
         let workspace = self.inner.repository.paths().workspaces.join(&board.id);
         let prompt = selection_recovery_prompt(node, runtime.artifacts.keys(), failure);
         let child = self
-            .codex_exec(Sandbox::ReadOnly, &workspace, prompt)
+            .codex_exec(Sandbox::ReadOnly, &workspace, prompt, Manifest::Required)
             .spawn()?;
         control.pid.store(child.id(), Ordering::Release);
         let output = child.wait_with_output()?;
@@ -825,8 +1034,16 @@ impl GenerationEngine {
 
     /// Builds a `codex exec` invocation that streams JSON events for `prompt`
     /// from within `workspace`, in its own process group so the whole job tree
-    /// can be signalled at once.
-    fn codex_exec(&self, sandbox: Sandbox, workspace: &Path, prompt: String) -> Command {
+    /// can be signalled at once. The model and reasoning effort come from the
+    /// app's own settings, so they never depend on the user's CLI config.
+    fn codex_exec(
+        &self,
+        sandbox: Sandbox,
+        workspace: &Path,
+        prompt: String,
+        manifest: Manifest,
+    ) -> Command {
+        let settings = self.inner.settings.get();
         let mut command = self.codex_invocation().command();
         command
             .arg("exec")
@@ -834,9 +1051,22 @@ impl GenerationEngine {
             .arg(sandbox.as_arg())
             .arg("-C")
             .arg(workspace)
-            .arg("--json")
-            .arg("--output-schema")
-            .arg(&self.inner.repository.paths().output_schema)
+            .arg("--json");
+        if !settings.model.is_empty() {
+            command.arg("-m").arg(&settings.model);
+        }
+        if !settings.reasoning_effort.is_empty() {
+            command.arg("-c").arg(format!(
+                "model_reasoning_effort=\"{}\"",
+                settings.reasoning_effort
+            ));
+        }
+        if matches!(manifest, Manifest::Required) {
+            command
+                .arg("--output-schema")
+                .arg(&self.inner.repository.paths().output_schema);
+        }
+        command
             .arg("--skip-git-repo-check")
             .arg(prompt)
             .current_dir(workspace)
@@ -882,6 +1112,12 @@ impl GenerationEngine {
             });
         }
     }
+}
+
+/// Chat progress is reported under its own activity key so a card's running
+/// status line never shows what a conversation about it is thinking.
+pub fn chat_activity_key(node_id: &str) -> String {
+    format!("chat:{node_id}")
 }
 
 /// Binary that Codex shells out to for same-run conditioning. Windows cannot
