@@ -169,13 +169,12 @@ impl AppView {
                                 "Close",
                                 cx.listener(|this, _, window, cx| {
                                     this.close_overlay(window, cx);
-                                    cx.notify();
                                 }),
                             )),
                     )
                     .child(div().mt_3().flex_1().min_h_0().flex().child(transcript))
                     .when(thinking, |panel| {
-                        let stop_node = chat_node.clone();
+                        let stop_node = chat_node;
                         panel.child(
                             div()
                                 .flex_none()

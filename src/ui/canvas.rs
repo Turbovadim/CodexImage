@@ -11,8 +11,8 @@ use super::image_cache::{
 use super::theme;
 use crate::layout::CARD_WIDTH;
 use gpui::{
-    App, BorderStyle, Bounds, ContentMask, Entity, ObjectFit, PathBuilder, Pixels, Point, Resource,
-    SharedString, TextAlign, TextRun, Window, point, px, quad, size,
+    App, BorderStyle, Bounds, ContentMask, Entity, ObjectFit, Pixels, Point, Resource,
+    SharedString, TextAlign, TextRun, Window, fill, point, px, quad, size,
 };
 use std::path::Path;
 use std::sync::atomic::Ordering;
@@ -41,7 +41,15 @@ const CONNECTOR_STROKE_WIDTH: f32 = 1.6;
 const CONNECTOR_DASH_LENGTH: f32 = 7.;
 const CONNECTOR_GAP_LENGTH: f32 = 5.;
 
-#[derive(Clone)]
+impl From<CardImageFit> for ObjectFit {
+    fn from(fit: CardImageFit) -> Self {
+        match fit {
+            CardImageFit::Contain => Self::Contain,
+            CardImageFit::Cover => Self::Cover,
+        }
+    }
+}
+
 pub struct CanvasNodeFrame {
     pub node_index: usize,
     pub screen_x: f32,
@@ -189,8 +197,7 @@ pub fn paint_dot_grid(
     let image = dot_grid_image();
     let metrics = dot_grid_metrics(camera_x, camera_y, zoom);
     let tile_size = px(metrics.tile_size);
-    // paint_image clips each tile to `bounds` via its image_bounds intersection,
-    // replacing the content mask that used to wrap this loop.
+    // paint_image clips each tile to `bounds`, so the loop needs no content mask.
     let mut y = bounds.top() + px(metrics.origin_y);
     while y < bounds.bottom() {
         let mut x = bounds.left() + px(metrics.origin_x);
@@ -250,12 +257,6 @@ pub fn edge_is_visible(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum DashCommand {
-    MoveTo(Point<Pixels>),
-    LineTo(Point<Pixels>),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
 struct ConnectorStyle {
     stroke_width: f32,
     dash_length: f32,
@@ -273,7 +274,9 @@ impl ConnectorStyle {
     }
 }
 
-/// Transforms, culls, and strokes every visible parent-to-child connector.
+/// Transforms, culls, and dashes every visible parent-to-child connector.
+/// Connectors are axis-aligned, so each dash is a plain quad: no tessellation
+/// and no separate path render pass.
 pub fn paint_connectors(
     edges: &[CanvasConnector],
     camera_x: f32,
@@ -287,10 +290,8 @@ pub fn paint_connectors(
         return;
     }
     let style = ConnectorStyle::for_zoom(zoom);
-    let mut builders = [
-        (PathBuilder::stroke(px(style.stroke_width)), false),
-        (PathBuilder::stroke(px(style.stroke_width)), false),
-    ];
+    let parent_color = theme::line();
+    let merged_color = theme::accent().opacity(0.6);
     for edge in edges {
         let (from, to) = edge.screen_points(camera_x, camera_y, zoom);
         if edge_is_visible(
@@ -300,91 +301,85 @@ pub fn paint_connectors(
             viewport_height,
             VIEWPORT_CULL_MARGIN,
         ) {
-            let (builder, visible) = &mut builders[usize::from(edge.merged)];
-            append_dashed_connector(builder, from, to, style);
-            *visible = true;
+            let color = if edge.merged {
+                merged_color
+            } else {
+                parent_color
+            };
+            trace_connector_dashes(from, to, style, viewport_width, viewport_height, |dash| {
+                window.paint_quad(fill(dash, color));
+            });
         }
-    }
-    let [(parent, parent_visible), (merged, merged_visible)] = builders;
-    if parent_visible && let Ok(path) = parent.build() {
-        window.paint_path(path, theme::line());
-    }
-    if merged_visible && let Ok(path) = merged.build() {
-        window.paint_path(path, theme::accent().opacity(0.6));
     }
 }
 
-fn append_dashed_connector(
-    path: &mut PathBuilder,
+/// Emits the on-screen dashes of the elbow connector `from` -> `to`. The dash
+/// pattern runs continuously along the whole polyline, so it stays anchored to
+/// the connector while only the visible part is walked.
+fn trace_connector_dashes(
     from: Point<Pixels>,
     to: Point<Pixels>,
     style: ConnectorStyle,
+    viewport_width: f32,
+    viewport_height: f32,
+    mut emit: impl FnMut(Bounds<Pixels>),
 ) {
-    let middle_y = px((f32::from(from.y) + f32::from(to.y)) / 2.);
-    let points = [from, point(from.x, middle_y), point(to.x, middle_y), to];
-    trace_dashed_polyline(
-        &points,
-        style.dash_length,
-        style.gap_length,
-        |command| match command {
-            DashCommand::MoveTo(point) => path.move_to(point),
-            DashCommand::LineTo(point) => path.line_to(point),
-        },
-    );
-}
-
-fn trace_dashed_polyline(
-    points: &[Point<Pixels>],
-    dash_length: f32,
-    gap_length: f32,
-    mut emit: impl FnMut(DashCommand),
-) {
-    debug_assert!(dash_length > 0. && gap_length > 0.);
-    let mut drawing = true;
-    let mut remaining = dash_length;
-    let mut dash_open = false;
-
-    for segment in points.windows(2) {
-        let start_x = f32::from(segment[0].x);
-        let start_y = f32::from(segment[0].y);
-        let delta_x = f32::from(segment[1].x) - start_x;
-        let delta_y = f32::from(segment[1].y) - start_y;
-        let length = delta_x.hypot(delta_y);
-        if length <= f32::EPSILON {
+    debug_assert!(style.dash_length > 0. && style.gap_length > 0.);
+    let (from_x, from_y) = (f32::from(from.x), f32::from(from.y));
+    let (to_x, to_y) = (f32::from(to.x), f32::from(to.y));
+    let middle_y = (from_y + to_y) / 2.;
+    let half_stroke = style.stroke_width / 2.;
+    let period = style.dash_length + style.gap_length;
+    // (vertical, fixed coordinate, start, end) along the moving axis.
+    let segments = [
+        (true, from_x, from_y, middle_y),
+        (false, middle_y, from_x, to_x),
+        (true, to_x, middle_y, to_y),
+    ];
+    let mut offset = 0.;
+    for (vertical, fixed, start, end) in segments {
+        let length = (end - start).abs();
+        let segment_offset = offset;
+        offset += length;
+        let (fixed_limit, moving_limit) = if vertical {
+            (viewport_width, viewport_height)
+        } else {
+            (viewport_height, viewport_width)
+        };
+        if length <= f32::EPSILON || fixed + half_stroke < 0. || fixed - half_stroke > fixed_limit {
             continue;
         }
-        let direction_x = delta_x / length;
-        let direction_y = delta_y / length;
-        let mut traveled = 0.;
-
-        while traveled < length {
-            let step = remaining.min(length - traveled);
-            let fragment_start = point(
-                px(start_x + direction_x * traveled),
-                px(start_y + direction_y * traveled),
-            );
-            traveled += step;
-            let fragment_end = point(
-                px(start_x + direction_x * traveled),
-                px(start_y + direction_y * traveled),
-            );
-
-            if drawing {
-                if !dash_open {
-                    emit(DashCommand::MoveTo(fragment_start));
-                    dash_open = true;
-                }
-                emit(DashCommand::LineTo(fragment_end));
+        let direction = (end - start).signum();
+        // The stretch of the segment, as distance from `start`, that is on screen.
+        let (enter, exit) = if direction > 0. {
+            (-start, moving_limit - start)
+        } else {
+            (start - moving_limit, start)
+        };
+        let visible_start = enter.max(0.);
+        let visible_end = exit.min(length);
+        if visible_start >= visible_end {
+            continue;
+        }
+        let mut dash_index = ((segment_offset + visible_start) / period).floor();
+        loop {
+            let dash_start = dash_index * period - segment_offset;
+            if dash_start >= visible_end {
+                break;
             }
-
-            remaining -= step;
-            if remaining <= f32::EPSILON {
-                if drawing {
-                    dash_open = false;
-                }
-                drawing = !drawing;
-                remaining = if drawing { dash_length } else { gap_length };
+            let dash_end = (dash_start + style.dash_length).min(length);
+            let dash_start = dash_start.max(0.);
+            dash_index += 1.;
+            if dash_end <= dash_start {
+                continue;
             }
+            let near = start + direction * if direction > 0. { dash_start } else { dash_end };
+            let extent = dash_end - dash_start;
+            emit(if vertical {
+                canvas_bounds(fixed - half_stroke, near, style.stroke_width, extent)
+            } else {
+                canvas_bounds(near, fixed - half_stroke, extent, style.stroke_width)
+            });
         }
     }
 }
@@ -445,9 +440,12 @@ fn paint_canvas_text(
         font: gpui::font(theme::CARD_FONT_FAMILY),
         ..Default::default()
     };
+    // Zoom is continuous, and GPUI keys shaped lines and atlas glyphs on the
+    // exact font size, so quarter-pixel steps keep both caches hitting.
+    let font_size = (style.font_size * 4.).round() / 4.;
     let line = window
         .text_system()
-        .shape_line(text, px(style.font_size), &[run], None);
+        .shape_line(text, px(font_size), &[run], None);
     window.with_content_mask(Some(ContentMask { bounds }), |window| {
         let _ = line.paint(
             bounds.origin,
@@ -499,7 +497,7 @@ fn paint_canvas_image(
         return;
     }
     let image_bounds = style.fit.get_bounds(bounds, data.size(0));
-    // paint_image now clips to bounds ∩ image_bounds itself, so no content mask needed.
+    // paint_image clips to bounds ∩ image_bounds itself, so no content mask is needed.
     let _ = window.paint_image(
         bounds,
         image_bounds,
@@ -690,11 +688,6 @@ fn sprite_tier_for_zoom(zoom: f32) -> Option<usize> {
         .position(|width| zoom * CARD_WIDTH <= *width)
 }
 
-/// Whether the canvas is zoomed in past every sprite tier.
-fn paints_cards_directly(zoom: f32) -> bool {
-    sprite_tier_for_zoom(zoom).is_none()
-}
-
 fn paint_target_outline(bounds: Bounds<Pixels>, zoom: f32, window: &mut Window) {
     window.paint_quad(quad(
         bounds,
@@ -767,6 +760,8 @@ fn paint_card_scene(
         CARD_WIDTH * zoom,
         frame.height,
     );
+    let past_sprite_tiers = sprite_tier_for_zoom(zoom).is_none();
+    let scale_factor = window.scale_factor();
     window.with_content_mask(
         Some(ContentMask {
             bounds: card_bounds,
@@ -833,18 +828,19 @@ fn paint_card_scene(
                         // direct painting is a transient stand-in until the
                         // sprite lands, and the tiny thumbnail avoids
                         // re-reading hundreds of MB of sidecars per tier
-                        // crossing.
-                        if paints_cards_directly(zoom) {
+                        // crossing. Small frames (attachment rows, grid
+                        // cells) never outgrow the tiny thumbnail at all.
+                        if past_sprite_tiers
+                            && (*blurred
+                                || !sprite_thumbnail_suffices(*bounds, *fit, zoom, scale_factor))
+                        {
                             &asset.thumbnail
                         } else {
                             &asset.sprite
                         },
                         transform_card_rect(*bounds, frame, zoom),
                         CanvasImageStyle {
-                            fit: match fit {
-                                CardImageFit::Contain => ObjectFit::Contain,
-                                CardImageFit::Cover => ObjectFit::Cover,
-                            },
+                            fit: (*fit).into(),
                             corner_radius: radius * zoom,
                             blurred: *blurred,
                             decode_cap: THUMBNAIL_DECODE_CAP,
@@ -893,10 +889,7 @@ fn paint_high_resolution_card_images(
             &asset.original,
             transform_card_rect(*bounds, frame, zoom),
             CanvasImageStyle {
-                fit: match fit {
-                    CardImageFit::Contain => ObjectFit::Contain,
-                    CardImageFit::Cover => ObjectFit::Cover,
-                },
+                fit: (*fit).into(),
                 corner_radius: radius * zoom,
                 blurred: false,
                 decode_cap: DECODED_LONG_EDGE_CAP,
@@ -906,6 +899,24 @@ fn paint_high_resolution_card_images(
             cx,
         );
     }
+}
+
+/// Whether the tiny `s_` thumbnail already holds every pixel this frame shows,
+/// which makes the display thumbnail's four-times-larger decode pure waste.
+fn sprite_thumbnail_suffices(
+    bounds: CardRect,
+    fit: CardImageFit,
+    zoom: f32,
+    scale_factor: f32,
+) -> bool {
+    // A cover-fit image overflows its frame along one axis; this leaves room
+    // for a 2:1 source before it would be upscaled.
+    let overflow = match fit {
+        CardImageFit::Contain => 1.,
+        CardImageFit::Cover => 2.,
+    };
+    bounds.width.max(bounds.height) * zoom * scale_factor * overflow
+        <= crate::storage::SPRITE_THUMBNAIL_MAX_DIMENSION as f32
 }
 
 /// Whether the thumbnail decode would be upscaled on screen, so the original
@@ -926,10 +937,10 @@ fn transform_card_rect(bounds: CardRect, frame: &CanvasNodeFrame, zoom: f32) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        CARD_WIDTH, CanvasConnector, CardRect, ConnectorStyle, DashCommand, GRID_COLOR_BGRA,
-        GRID_GAP, GRID_MIN_SCREEN_GAP, GRID_TEXTURE_SCALE, GRID_TILE_SIZE, dot_grid_metrics,
+        CARD_WIDTH, CanvasConnector, CardRect, ConnectorStyle, GRID_COLOR_BGRA, GRID_GAP,
+        GRID_MIN_SCREEN_GAP, GRID_TEXTURE_SCALE, GRID_TILE_SIZE, canvas_bounds, dot_grid_metrics,
         dot_grid_texture_pixels, edge_is_visible, image_needs_high_resolution, rect_is_visible,
-        sprite_tier_for_zoom, trace_dashed_polyline,
+        sprite_tier_for_zoom, trace_connector_dashes,
     };
     use gpui::{point, px};
 
@@ -1007,26 +1018,48 @@ mod tests {
 
     #[test]
     fn connector_dash_remains_continuous_around_elbows() {
-        let points = [
-            point(px(0.), px(0.)),
-            point(px(0.), px(4.)),
-            point(px(4.), px(4.)),
-        ];
-        let mut commands = Vec::new();
         let style = ConnectorStyle::for_zoom(1.);
-        trace_dashed_polyline(&points, style.dash_length, style.gap_length, |command| {
-            commands.push(command)
-        });
+        let mut dashes = Vec::new();
+        trace_connector_dashes(
+            point(px(10.), px(10.)),
+            point(px(14.), px(18.)),
+            style,
+            800.,
+            600.,
+            |dash| dashes.push(dash),
+        );
 
+        // The 7px dash covers the 4px first leg and 3px of the elbow; the
+        // 5px gap swallows the rest.
         assert_eq!(
-            commands,
+            dashes,
             vec![
-                DashCommand::MoveTo(point(px(0.), px(0.))),
-                DashCommand::LineTo(point(px(0.), px(4.))),
-                DashCommand::LineTo(point(px(3.), px(4.))),
+                canvas_bounds(9.2, 10., 1.6, 4.),
+                canvas_bounds(10., 13.2, 3., 1.6),
             ]
         );
     }
+
+    #[test]
+    fn connector_dashes_are_only_walked_on_screen() {
+        let style = ConnectorStyle::for_zoom(1.);
+        let mut dashes = Vec::new();
+        trace_connector_dashes(
+            point(px(400.), px(-100_000.)),
+            point(px(400.), px(100_000.)),
+            style,
+            800.,
+            600.,
+            |dash| dashes.push(dash),
+        );
+
+        assert!(dashes.len() <= 52, "walked {} dashes", dashes.len());
+        // Clipping does not shift the pattern: dashes still start on the 12px
+        // period measured from the connector's origin.
+        let top = f32::from(dashes[1].origin.y);
+        assert!(((top + 100_000.) % 12.).abs() < 0.05);
+    }
+
     #[test]
     fn node_images_promote_to_originals_only_when_thumbnails_are_undersized() {
         let full_card_image = CardRect::new(0., 0., CARD_WIDTH, CARD_WIDTH);

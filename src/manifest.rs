@@ -98,13 +98,6 @@ fn file_url_path(mut value: String) -> PathBuf {
     PathBuf::from(value)
 }
 
-pub fn is_path_inside(root: &Path, candidate: &Path) -> bool {
-    let (Ok(root), Ok(candidate)) = (root.canonicalize(), candidate.canonicalize()) else {
-        return false;
-    };
-    is_canonical_path_inside(&root, &candidate)
-}
-
 /// Checks two paths that the caller has already canonicalized. Generation
 /// polling uses this to avoid repeating filesystem lookups for every image.
 pub(crate) fn is_canonical_path_inside(root: &Path, candidate: &Path) -> bool {

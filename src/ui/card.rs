@@ -59,8 +59,8 @@ pub struct CanvasNode {
     pub attached_text: SharedString,
     pub scene: CardScene,
     /// SVG sources are created only for tiers that actually become visible.
-    /// Eagerly encoding all four tiers for every node caused a large transient
-    /// allocator peak and populated GPUI's asset cache with unused images.
+    /// Eagerly encoding every tier for every node causes a large transient
+    /// allocator peak and fills GPUI's asset cache with unused images.
     sprite_images: [OnceLock<Arc<Image>>; CARD_SPRITE_WIDTHS.len()],
     pub last_ready_sprite_tier: AtomicU8,
 }
@@ -102,7 +102,7 @@ impl CanvasNode {
             sprite_images: std::array::from_fn(|_| OnceLock::new()),
             last_ready_sprite_tier: AtomicU8::new(NO_SPRITE_TIER),
         };
-        card.scene = build_card_scene(&card, expanded);
+        card.scene = build_card_scene(&card);
         card
     }
 

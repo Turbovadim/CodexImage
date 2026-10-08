@@ -2,12 +2,12 @@
 //!
 //! GPUI's default asset cache has no size limit. That is unsafe for an image
 //! browser because each compressed file becomes a full BGRA buffer after it is
-//! decoded. This cache owns the GPUI asset entries and releases both their CPU
+//! decoded. This cache owns its decode tasks and releases both their CPU
 //! buffers and GPU atlas entries when the decoded-byte budget is exceeded.
 
 use gpui::{
-    App, Asset, Context, Entity, EntityId, Image, ImageCache, ImageCacheError, ImageCacheItem,
-    ImgResourceLoader, RenderImage, Resource, Task, WeakEntity, Window,
+    App, Asset, Context, Entity, EntityId, Image, ImageCache, ImageCacheError, ImgResourceLoader,
+    RenderImage, Resource, Task, WeakEntity, Window,
 };
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -24,8 +24,7 @@ const DECODED_IMAGE_CACHE_MAX_ITEMS: usize = 1_024;
 // smallest tier costs ~75 KB per 800 px card, so this holds roughly 600 of them.
 pub const CARD_SPRITE_CACHE_BUDGET: usize = 48 * 1024 * 1024;
 // Two full 424-card tiers fit, including the previous tier used while a new
-// zoom level rasterizes. A higher cap retained completed-but-not-yet-observed
-// GPUI assets whose decoded bytes could not be accounted here.
+// zoom level rasterizes.
 const CARD_SPRITE_CACHE_MAX_ITEMS: usize = 1_024;
 
 /// The largest decode any consumer asks for: the lightbox at its fitted size
@@ -42,8 +41,10 @@ pub const THUMBNAIL_DECODE_CAP: u32 = crate::storage::THUMBNAIL_MAX_DIMENSION;
 
 /// Each first paint copies a whole decoded buffer into the atlas on the main
 /// thread. A burst of landed decodes is spread over a few frames rather than
-/// stalling one; the rest paint on the frames right after.
-const MAX_FIRST_PAINTS_PER_FRAME: usize = 8;
+/// stalling one; the rest paint on the frames right after. The limit is in
+/// bytes because the copy is: a frame takes dozens of sprite thumbnails but
+/// only one or two capped originals.
+const FIRST_PAINT_BYTES_PER_FRAME: usize = 16 * 1024 * 1024;
 
 /// One cache entry per (file, resolution tier). Both tiers of the same file
 /// can coexist while a zoomed lightbox sharpens on top of the capped decode.
@@ -53,85 +54,91 @@ struct DecodeKey {
     max_dimension: Option<u32>,
 }
 
+type DecodeResult = Result<Arc<RenderImage>, ImageCacheError>;
+
 /// GPUI's stock loader decodes files at native size. This wrapper downscales
 /// oversized decodes so a huge attachment costs display-sized memory instead
 /// of native-sized memory. ImageIO avoids the native buffer for oversized
 /// static images on macOS; other formats only retain the capped copy.
-enum CappedImageLoader {}
+fn load_capped(
+    source: DecodeKey,
+    cx: &mut App,
+) -> impl Future<Output = DecodeResult> + Send + 'static {
+    let load = ImgResourceLoader::load(source.resource.clone(), cx);
+    let file_backed = matches!(&source.resource, Resource::Path(_));
+    let decode = async move {
+        // Decoded pixels are cached on disk as LZ4-compressed BGRA, which
+        // reads back about five times faster than re-decoding the PNG.
+        if let Resource::Path(path) = &source.resource
+            && let Some(image) = crate::disk_cache::load(path, source.max_dimension)
+        {
+            return Ok(Arc::new(image));
+        }
 
-impl Asset for CappedImageLoader {
-    type Source = DecodeKey;
-    type Output = Result<Arc<RenderImage>, ImageCacheError>;
+        // ImageIO can create a capped thumbnail without materializing the
+        // native pixel buffer. Pure-Rust decode remains faster for images
+        // near the target size, but an 8K source otherwise peaks at its
+        // full hundreds-of-megabytes buffer plus the resized output.
+        #[cfg(target_os = "macos")]
+        if let Resource::Path(path) = &source.resource
+            && prefers_direct_imageio(path, source.max_dimension)
+            && let Ok(bytes) = std::fs::read(path)
+            && let Some(image) = super::imageio::decode_render_image(bytes, source.max_dimension)
+        {
+            let image = Arc::new(image);
+            store_sidecar_in_background(path.clone(), source.max_dimension, image.clone());
+            return Ok(image);
+        }
 
-    fn load(
-        source: Self::Source,
-        cx: &mut App,
-    ) -> impl Future<Output = Self::Output> + Send + 'static {
-        let load = ImgResourceLoader::load(source.resource.clone(), cx);
-        let file_backed = matches!(&source.resource, Resource::Path(_));
-        let decode = async move {
-            // Decoded pixels are cached on disk as LZ4-compressed BGRA, which
-            // reads back about five times faster than re-decoding the PNG.
-            if let Resource::Path(path) = &source.resource
-                && let Some(image) = crate::disk_cache::load(path, source.max_dimension)
-            {
-                return Ok(Arc::new(image));
-            }
-
-            // ImageIO can create a capped thumbnail without materializing the
-            // native pixel buffer. Pure-Rust decode remains faster for images
-            // near the target size, but an 8K source otherwise peaks at its
-            // full hundreds-of-megabytes buffer plus the resized output.
-            #[cfg(target_os = "macos")]
-            if let Resource::Path(path) = &source.resource
-                && prefers_direct_imageio(path, source.max_dimension)
-                && let Ok(bytes) = std::fs::read(path)
-                && let Some(image) =
-                    super::imageio::decode_render_image(bytes, source.max_dimension)
-            {
-                let image = Arc::new(image);
-                store_sidecar_in_background(path.clone(), source.max_dimension, image.clone());
-                return Ok(image);
-            }
-
-            let decoded = match load.await {
-                Ok(image) => Ok(match source.max_dimension {
-                    Some(max_dimension) => downscale_to_fit(image, max_dimension),
-                    None => image,
-                }),
-                // The pure-Rust decoders measure faster than ImageIO for every
-                // format they support, so ImageIO only rescues the ones they
-                // lack entirely (HEIC photo attachments, most notably).
-                Err(error) => {
-                    #[cfg(target_os = "macos")]
-                    if let Resource::Path(path) = &source.resource
-                        && let Ok(bytes) = std::fs::read(path)
-                        && let Some(image) =
-                            super::imageio::decode_render_image(bytes, source.max_dimension)
-                    {
-                        Ok(Arc::new(image))
-                    } else {
-                        Err(error)
-                    }
-                    #[cfg(not(target_os = "macos"))]
+        let decoded = match load.await {
+            Ok(image) => Ok(match source.max_dimension {
+                Some(max_dimension) => downscale_to_fit(image, max_dimension),
+                None => image,
+            }),
+            // The pure-Rust decoders measure faster than ImageIO for every
+            // format they support, so ImageIO only rescues the ones they
+            // lack entirely (HEIC photo attachments, most notably).
+            Err(error) => {
+                #[cfg(target_os = "macos")]
+                if let Resource::Path(path) = &source.resource
+                    && let Ok(bytes) = std::fs::read(path)
+                    && let Some(image) =
+                        super::imageio::decode_render_image(bytes, source.max_dimension)
+                {
+                    Ok(Arc::new(image))
+                } else {
                     Err(error)
                 }
-            };
-            if let (Ok(image), Resource::Path(path)) = (&decoded, &source.resource) {
-                store_sidecar_in_background(path.clone(), source.max_dimension, image.clone());
+                #[cfg(not(target_os = "macos"))]
+                Err(error)
             }
-            decoded
         };
-        async move {
-            if file_backed {
-                // GPUI's file loader also uses synchronous reads. Poll the
-                // entire file decode on the blocking pool, including cache I/O.
-                smol::unblock(move || smol::block_on(decode)).await
-            } else {
-                decode.await
-            }
+        if let (Ok(image), Resource::Path(path)) = (&decoded, &source.resource) {
+            store_sidecar_in_background(path.clone(), source.max_dimension, image.clone());
+        }
+        decoded
+    };
+    async move {
+        if file_backed {
+            // The blocking pool grows to hundreds of threads, so a cold board
+            // would otherwise decode everything at once and starve the UI
+            // thread. A dropped load leaves the queue without ever decoding.
+            let _permit = decode_permits().acquire().await;
+            // GPUI's file loader also uses synchronous reads. Poll the
+            // entire file decode on the blocking pool, including cache I/O.
+            smol::unblock(move || smol::block_on(decode)).await
+        } else {
+            decode.await
         }
     }
+}
+
+fn decode_permits() -> &'static smol::lock::Semaphore {
+    static PERMITS: std::sync::OnceLock<smol::lock::Semaphore> = std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(4, usize::from);
+        smol::lock::Semaphore::new(cores.saturating_sub(1).max(2))
+    })
 }
 
 /// The sidecar only speeds up the next load, so it must not delay this one:
@@ -217,14 +224,16 @@ fn downscale_to_fit(image: Arc<RenderImage>, max: u32) -> Arc<RenderImage> {
 }
 
 struct CacheEntry {
-    image: ImageCacheItem,
+    /// `None` while the decode is still running.
+    image: Option<DecodeResult>,
     decoded_bytes: usize,
     last_used: u64,
     load_serial: u64,
     notify_targets: Vec<EntityId>,
     /// Decoded but not yet handed to a paint, so its atlas upload is pending.
     unpainted: bool,
-    _notification: Option<Task<()>>,
+    /// Dropping the task on eviction cancels a decode nobody needs anymore.
+    _load: Option<Task<()>>,
 }
 
 /// The accounting both caches keep: an LRU clock, a decoded-byte total against
@@ -282,7 +291,9 @@ trait Weighted: 'static + Sized {
     fn item_count(&self) -> usize;
     /// Every unprotected key, ordered least-recently-used first.
     fn eviction_candidates(&self, protected: &HashSet<Self::Key>) -> Vec<Self::Key>;
-    fn release(&mut self, key: &Self::Key, window: Option<&mut Window>, cx: &mut App);
+    /// Returns whether the entry had been painted, so a scene may still hold
+    /// its atlas tile.
+    fn release(&mut self, key: &Self::Key, window: Option<&mut Window>, cx: &mut App) -> bool;
 
     fn over_limit(&self) -> bool {
         let budget = self.budget_ref();
@@ -301,8 +312,8 @@ trait Weighted: 'static + Sized {
     }
 
     /// Releases least-recently-used entries the frame did not touch until the
-    /// cache fits its limits again. Returns whether anything was released, in
-    /// which case the caller must redraw the view that painted them.
+    /// cache fits its limits again. Returns whether anything painted was
+    /// released, in which case the caller must redraw the view that painted it.
     fn finish_frame(&mut self, mut window: Option<&mut Window>, cx: &mut App) -> bool {
         if !self.over_limit() {
             return false;
@@ -315,8 +326,7 @@ trait Weighted: 'static + Sized {
             if !self.over_limit() {
                 break;
             }
-            self.release(&oldest, window.as_deref_mut(), cx);
-            evicted = true;
+            evicted |= self.release(&oldest, window.as_deref_mut(), cx);
         }
         self.budget().used_this_frame = protected;
         evicted
@@ -363,7 +373,7 @@ pub(super) struct DecodedImageCache {
     blurred: HashMap<DecodeKey, Blurred>,
     budget: Budget<DecodeKey>,
     next_load_serial: u64,
-    first_paints_this_frame: usize,
+    first_paint_bytes_this_frame: usize,
     weak_self: WeakEntity<Self>,
 }
 
@@ -376,7 +386,7 @@ impl Weighted for DecodedImageCache {
 
     fn begin_frame(&mut self) {
         self.budget.used_this_frame.clear();
-        self.first_paints_this_frame = 0;
+        self.first_paint_bytes_this_frame = 0;
     }
 
     fn budget_ref(&self) -> &Budget<DecodeKey> {
@@ -398,19 +408,22 @@ impl Weighted for DecodedImageCache {
         candidates.into_iter().map(|(_, key)| key).collect()
     }
 
-    fn release(&mut self, key: &DecodeKey, mut window: Option<&mut Window>, cx: &mut App) {
+    fn release(&mut self, key: &DecodeKey, mut window: Option<&mut Window>, cx: &mut App) -> bool {
         if let Some(Blurred::Ready(blurred)) = self.blurred.remove(key) {
             self.budget.remove_bytes(decoded_image_bytes(&blurred));
             cx.drop_image(blurred, window.as_deref_mut());
         }
-        let Some(mut entry) = self.entries.remove(key) else {
-            return;
+        let Some(entry) = self.entries.remove(key) else {
+            return false;
         };
         self.budget.remove_bytes(entry.decoded_bytes);
-        cx.remove_asset::<CappedImageLoader>(key);
-        if let Some(Ok(image)) = entry.image.get() {
-            cx.drop_image(image, window);
-        }
+        let Some(Ok(image)) = entry.image else {
+            return false;
+        };
+        cx.drop_image(image, window);
+        // A prefetched neighbour that never reached a paint has no atlas tile,
+        // and redrawing for it would only prefetch and evict it again.
+        !entry.unpainted
     }
 }
 
@@ -426,7 +439,7 @@ impl DecodedImageCache {
             blurred: HashMap::new(),
             budget: Budget::new(byte_budget, DECODED_IMAGE_CACHE_MAX_ITEMS),
             next_load_serial: 0,
-            first_paints_this_frame: 0,
+            first_paint_bytes_this_frame: 0,
             weak_self: cx.weak_entity(),
         }
     }
@@ -440,7 +453,7 @@ impl DecodedImageCache {
         max_dimension: u32,
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
+    ) -> Option<DecodeResult> {
         self.load_key(
             DecodeKey {
                 resource: resource.clone(),
@@ -472,7 +485,7 @@ impl DecodedImageCache {
         resource: &Resource,
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
+    ) -> Option<DecodeResult> {
         self.load_key(
             DecodeKey {
                 resource: resource.clone(),
@@ -488,7 +501,7 @@ impl DecodedImageCache {
         key: DecodeKey,
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
+    ) -> Option<DecodeResult> {
         if matches!(&key.resource, Resource::Path(path) if path.as_os_str().is_empty()) {
             return None;
         }
@@ -497,33 +510,25 @@ impl DecodedImageCache {
 
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.last_used = last_used;
-            let was_loading = matches!(entry.image, ImageCacheItem::Loading(_));
-            if was_loading && !entry.notify_targets.contains(&target) {
-                entry.notify_targets.push(target);
-            }
-            let result = entry.image.get();
-            if was_loading && result.is_some() {
-                let added_bytes = result
-                    .as_ref()
-                    .and_then(|result| result.as_ref().ok())
-                    .map(|image| decoded_image_bytes(image))
-                    .unwrap_or(0);
-                entry.decoded_bytes = added_bytes;
-                entry.unpainted = added_bytes > 0;
-                // This render observed the result directly, so the waiter
-                // does not need to invalidate it again.
-                entry.notify_targets.clear();
-                self.budget.add_bytes(added_bytes);
-            }
+            let Some(result) = entry.image.clone() else {
+                if !entry.notify_targets.contains(&target) {
+                    entry.notify_targets.push(target);
+                }
+                return None;
+            };
             if entry.unpainted {
-                if self.first_paints_this_frame >= MAX_FIRST_PAINTS_PER_FRAME {
+                // The first image of a frame always paints, however large.
+                if self.first_paint_bytes_this_frame > 0
+                    && self.first_paint_bytes_this_frame + entry.decoded_bytes
+                        > FIRST_PAINT_BYTES_PER_FRAME
+                {
                     window.request_animation_frame();
                     return None;
                 }
-                self.first_paints_this_frame += 1;
+                self.first_paint_bytes_this_frame += entry.decoded_bytes;
                 entry.unpainted = false;
             }
-            return result;
+            return Some(result);
         }
 
         self.start_load(key, last_used, Some(target), window, cx);
@@ -538,27 +543,27 @@ impl DecodedImageCache {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let (task, _) = cx.fetch_asset::<CappedImageLoader>(&key);
+        let load = load_capped(key.clone(), cx);
+        let load = cx.background_executor().spawn(load);
         self.next_load_serial = self.next_load_serial.wrapping_add(1);
         let load_serial = self.next_load_serial;
         self.entries.insert(
             key.clone(),
             CacheEntry {
-                image: ImageCacheItem::Loading(task.clone()),
+                image: None,
                 decoded_bytes: 0,
                 last_used,
                 load_serial,
                 notify_targets: target.into_iter().collect(),
                 unpainted: false,
-                _notification: None,
+                _load: None,
             },
         );
 
-        let notification_task = task.clone();
         let cache = self.weak_self.clone();
         let completed_key = key.clone();
-        let notification = window.spawn(cx, async move |cx| {
-            let result = notification_task.await;
+        let task = window.spawn(cx, async move |cx| {
+            let result = load.await;
             let _ = cx.update(|_, app| {
                 let Ok(Some(targets)) = cache.update(app, |cache, _| {
                     cache.complete_load(&completed_key, load_serial, result)
@@ -575,7 +580,7 @@ impl DecodedImageCache {
         if let Some(entry) = self.entries.get_mut(&key)
             && entry.load_serial == load_serial
         {
-            entry._notification = Some(notification);
+            entry._load = Some(task);
         }
     }
 
@@ -586,10 +591,10 @@ impl DecodedImageCache {
         &mut self,
         key: &DecodeKey,
         load_serial: u64,
-        result: Result<Arc<RenderImage>, ImageCacheError>,
+        result: DecodeResult,
     ) -> Option<Vec<EntityId>> {
         let entry = self.entries.get_mut(key)?;
-        if entry.load_serial != load_serial || !matches!(entry.image, ImageCacheItem::Loading(_)) {
+        if entry.load_serial != load_serial || entry.image.is_some() {
             return None;
         }
         let decoded_bytes = result
@@ -597,7 +602,7 @@ impl DecodedImageCache {
             .ok()
             .map(|image| decoded_image_bytes(image))
             .unwrap_or(0);
-        entry.image = ImageCacheItem::Loaded(result);
+        entry.image = Some(result);
         entry.decoded_bytes = decoded_bytes;
         entry.unpainted = decoded_bytes > 0;
         let targets = std::mem::take(&mut entry.notify_targets);
@@ -612,7 +617,7 @@ impl DecodedImageCache {
     /// The convolution costs about 8 ms per image — half a frame, and a branch
     /// off four source images would blur all four in the same one — so it runs
     /// on the background executor. Until it lands this returns `None` and the
-    /// caller simply skips that image, which the shimmer already covers.
+    /// caller simply skips that image.
     pub fn load_blurred(
         &mut self,
         resource: &Resource,
@@ -682,9 +687,8 @@ impl DecodedImageCache {
                 cx.drop_image(image, window.as_deref_mut());
             }
         }
-        for (key, mut entry) in entries {
-            cx.remove_asset::<CappedImageLoader>(&key);
-            if let Some(Ok(image)) = entry.image.get() {
+        for (_, entry) in entries {
+            if let Some(Ok(image)) = entry.image {
                 cx.drop_image(image, window.as_deref_mut());
             }
         }
@@ -793,7 +797,7 @@ impl ImageCache for DecodedImageCache {
         resource: &Resource,
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
+    ) -> Option<DecodeResult> {
         DecodedImageCache::load(self, resource, THUMBNAIL_DECODE_CAP, window, cx)
     }
 }
@@ -845,15 +849,17 @@ impl Weighted for CardSpriteCache {
             .collect()
     }
 
-    fn release(&mut self, image_id: &u64, window: Option<&mut Window>, cx: &mut App) {
+    fn release(&mut self, image_id: &u64, window: Option<&mut Window>, cx: &mut App) -> bool {
         let Some(entry) = self.entries.remove(image_id) else {
-            return;
+            return false;
         };
         self.budget.remove_bytes(entry.decoded_bytes);
         entry.source.remove_asset(cx);
-        if let Some(rendered) = entry.rendered {
-            cx.drop_image(rendered, window);
-        }
+        let Some(rendered) = entry.rendered else {
+            return false;
+        };
+        cx.drop_image(rendered, window);
+        true
     }
 }
 
@@ -947,10 +953,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     use super::prefers_direct_imageio;
     use super::{
-        Budget, CappedImageLoader, DecodeKey, Weighted, blur_render_image, decoded_image_bytes,
-        downscale_to_fit,
+        Budget, DecodeKey, Weighted, blur_render_image, decoded_image_bytes, downscale_to_fit,
+        load_capped,
     };
-    use gpui::{App, Asset, RenderImage, Resource, TestAppContext, Window};
+    use gpui::{App, RenderImage, Resource, TestAppContext, Window};
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
@@ -962,7 +968,7 @@ mod tests {
             .save(&path)
             .expect("write png");
         let image = cx.update(|cx| {
-            smol::block_on(CappedImageLoader::load(
+            smol::block_on(load_capped(
                 DecodeKey {
                     resource: Resource::Path(path.clone().into()),
                     max_dimension: Some(16),
@@ -981,7 +987,7 @@ mod tests {
         );
 
         let missing = cx.update(|cx| {
-            smol::block_on(CappedImageLoader::load(
+            smol::block_on(load_capped(
                 DecodeKey {
                     resource: Resource::Path(directory.path().join("missing.png").into()),
                     max_dimension: None,
@@ -1033,10 +1039,11 @@ mod tests {
             candidates.into_iter().map(|(_, key)| key).collect()
         }
 
-        fn release(&mut self, key: &u32, _: Option<&mut Window>, _: &mut App) {
+        fn release(&mut self, key: &u32, _: Option<&mut Window>, _: &mut App) -> bool {
             let (bytes, _) = self.entries.remove(key).expect("released key exists");
             self.budget.remove_bytes(bytes);
             self.released.push(*key);
+            true
         }
     }
 
@@ -1126,7 +1133,7 @@ mod tests {
 
         let size = blurred.size(0);
         assert_eq!((size.width.0, size.height.0), (48, 24));
-        for pixel in blurred.as_bytes(0).expect("frame").chunks_exact(4) {
+        for pixel in blurred.as_bytes(0).expect("frame").as_chunks::<4>().0 {
             if pixel[3] > 8 {
                 assert!((pixel[0] as i16 - pixel[1] as i16).abs() <= 1);
                 assert!((pixel[1] as i16 - pixel[2] as i16).abs() <= 1);

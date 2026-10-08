@@ -2,7 +2,7 @@
 //! element tree that hosts the painted canvas.
 
 use super::canvas::CanvasConnector;
-use super::canvas_view::{DragState, MinimapScene};
+use super::canvas_view::{CameraGlide, DragState, MinimapScene};
 use super::card::{
     CanvasImageAsset, CanvasNode, PROMPT_WRAP_COLUMNS, card_height, card_height_from_metadata,
     output_layout, wrap_prompt,
@@ -17,8 +17,6 @@ use super::keymap::{Escape, Generate, Quit, bind_keys, configure_menus};
 use super::lightbox::Lightbox;
 use super::overlays::{BoardRow, GalleryRow, Toast};
 use super::theme;
-#[cfg(target_os = "macos")]
-use super::window_memory::{VisibilityChange, WindowMemoryState, WindowOcclusionObserver};
 use crate::APP_NAME;
 use crate::generation::GenerationEngine;
 use crate::layout::{Position, compute_layout};
@@ -30,25 +28,38 @@ use anyhow::{Context as _, Result};
 use gpui::{
     App, AppContext, Bounds, Context, Entity, ExternalPaths, FocusHandle, Focusable, ListAlignment,
     ListState, MouseButton, Render, Role, SharedString, Subscription, Task, TitlebarOptions,
-    Window, WindowBounds, WindowOptions, div, point, prelude::*, px, size,
+    Window, WindowBounds, WindowOptions, WindowVisibility, div, point, prelude::*, px, size,
 };
 use gpui_platform::application;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// How long the window stays hidden before its decoded images and card
+/// sprites are dropped.
+const HIDDEN_RELEASE_DELAY: Duration = Duration::from_secs(5);
 
 pub(super) enum Overlay {
     None,
     Boards,
     Gallery,
     Lightbox(Lightbox),
-    EditNode(String),
+    EditNode(NodeEdit),
     RenameBoard(String),
     NodeText(String),
     /// The conversation about one card, by node id.
     Chat(String),
     Settings,
     QuitConfirm,
+}
+
+/// The open prompt editor and the reference images it will save: the node's
+/// stored ones still kept, then files added while editing.
+pub(super) struct NodeEdit {
+    pub(super) node_id: String,
+    pub(super) kept: Vec<String>,
+    pub(super) added: Vec<PathBuf>,
 }
 
 pub(super) struct ImageAsset {
@@ -69,7 +80,6 @@ struct ResolvedImage {
 
 /// Thumbnail encoding and header reads for one image, performed off the render
 /// thread so a finished generation never stalls the canvas.
-#[derive(Clone)]
 struct ImageJob {
     url: String,
     original: PathBuf,
@@ -141,7 +151,6 @@ fn board_snapshots_equal(left: Option<&Arc<Board>>, right: Option<&Arc<Board>>) 
 
 pub(super) struct AppView {
     pub(super) engine: GenerationEngine,
-    pub(super) receiver: async_channel::Receiver<RepositoryEvent>,
     pub(super) board_id: Option<String>,
     pub(super) board: Option<Arc<Board>>,
     pub(super) prompt: Entity<TextInput>,
@@ -193,28 +202,22 @@ pub(super) struct AppView {
     pub(super) camera_x: f32,
     pub(super) camera_y: f32,
     pub(super) zoom: f32,
+    pub(super) camera_glide: Option<CameraGlide>,
     pub(super) zoom_settled: bool,
     pub(super) zoom_settle_task: Option<Task<()>>,
     pub(super) running_tick_task: Option<Task<()>>,
+    /// Drops the render caches once the window has stayed hidden for a while.
+    hidden_release_task: Option<Task<()>>,
     repository_task: Option<Task<()>>,
-    #[cfg(target_os = "macos")]
-    window_memory_state: WindowMemoryState,
-    #[cfg(target_os = "macos")]
-    _window_occlusion_observer: Option<WindowOcclusionObserver>,
-    #[cfg(target_os = "macos")]
-    window_occlusion_task: Option<Task<()>>,
+    /// Holds an idle-sleep assertion while any Codex process runs.
+    idle_sleep_guard: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     pub(super) drag: Option<DragState>,
 }
 
 impl Drop for AppView {
     fn drop(&mut self) {
-        let pending = self
-            .engine
-            .repository()
-            .paths()
-            .root
-            .join("pending-attachments");
+        let pending = self.pending_attachments_dir();
         // Synchronous on purpose: the view drops during quit, and a detached
         // task started here would race process exit and leak the files.
         for path in self.attachments.drain(..) {
@@ -222,6 +225,15 @@ impl Drop for AppView {
                 let _ = std::fs::remove_file(path);
             }
         }
+    }
+}
+
+/// Persists the window's frame and macOS Space; a no-op on other platforms.
+fn save_window_state(window: &Window, path: &std::path::Path) {
+    if let Some(state) = window.native_window_state()
+        && let Err(error) = crate::storage::atomic_write(path, &state)
+    {
+        eprintln!("Could not save the window state: {error:#}");
     }
 }
 
@@ -234,9 +246,12 @@ pub fn run() -> Result<()> {
     let sweeper = repository.clone();
     std::thread::spawn(move || {
         sweeper.condition_existing_generated_images();
-        sweeper.refresh_undersized_thumbnails();
+        sweeper.refresh_stale_thumbnails();
     });
+    let window_state_path = repository.paths().root.join("window-state.bin");
     let engine = GenerationEngine::new(repository);
+    let resolver = engine.clone();
+    std::thread::spawn(move || resolver.resolve_codex());
     let engine_for_quit = engine.clone();
     application().run(move |cx: &mut App| {
         bind_keys(cx);
@@ -258,44 +273,63 @@ pub fn run() -> Result<()> {
         .detach();
 
         let bounds = Bounds::centered(None, size(px(1500.), px(950.)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(900.), px(600.))),
-                titlebar: Some(TitlebarOptions {
-                    title: Some(APP_NAME.into()),
-                    appears_transparent: cfg!(target_os = "macos"),
-                    traffic_light_position: cfg!(target_os = "macos")
-                        .then(|| point(px(14.), px(14.))),
-                }),
-                ..Default::default()
-            },
-            {
-                let engine = engine.clone();
-                let receiver = receiver.clone();
-                move |window, cx| {
-                    let view = cx.new(|cx| AppView::new(engine, receiver, window, cx));
-                    window.focus(&view.focus_handle(cx), cx);
-                    window.on_window_should_close(cx, {
-                        let weak = view.downgrade();
-                        move |_, cx| {
-                            weak.update(cx, |view, cx| {
-                                if view.engine.active_count() > 0 {
-                                    view.overlay = Overlay::QuitConfirm;
-                                    cx.notify();
-                                    false
-                                } else {
-                                    true
-                                }
-                            })
-                            .unwrap_or(true)
+        let window = cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_min_size: Some(size(px(900.), px(600.))),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some(APP_NAME.into()),
+                        appears_transparent: cfg!(target_os = "macos"),
+                        traffic_light_position: cfg!(target_os = "macos")
+                            .then(|| point(px(14.), px(14.))),
+                    }),
+                    ..Default::default()
+                },
+                {
+                    let engine = engine.clone();
+                    let receiver = receiver.clone();
+                    let window_state_path = window_state_path.clone();
+                    move |window, cx| {
+                        if let Ok(state) = std::fs::read(&window_state_path) {
+                            window.restore_native_window_state(&state);
                         }
-                    });
-                    view
-                }
-            },
-        )
-        .expect("failed to open CodexImage window");
+                        let view = cx.new(|cx| AppView::new(engine, receiver, window, cx));
+                        window.focus(&view.focus_handle(cx), cx);
+                        window.on_window_should_close(cx, {
+                            let weak = view.downgrade();
+                            let window_state_path = window_state_path.clone();
+                            move |window, cx| {
+                                let close = weak
+                                    .update(cx, |view, cx| {
+                                        if view.engine.active_count() > 0 {
+                                            view.overlay = Overlay::QuitConfirm;
+                                            cx.notify();
+                                            false
+                                        } else {
+                                            true
+                                        }
+                                    })
+                                    .unwrap_or(true);
+                                if close {
+                                    save_window_state(window, &window_state_path);
+                                }
+                                close
+                            }
+                        });
+                        view
+                    }
+                },
+            )
+            .expect("failed to open CodexImage window");
+        cx.on_app_quit(move |cx| {
+            // Fails harmlessly when the window already closed and saved itself.
+            let _ = window.update(cx, |_, window, _| {
+                save_window_state(window, &window_state_path);
+            });
+            async {}
+        })
+        .detach();
         cx.activate(true);
     });
     Ok(())
@@ -314,15 +348,6 @@ impl AppView {
         let chat_input = cx.new(|cx| TextInput::auto_growing("Ask about this card…", 6, cx));
         let image_cache = cx.new(|cx| DecodedImageCache::new(DECODED_IMAGE_CACHE_BUDGET, cx));
         let sprite_cache = cx.new(|cx| CardSpriteCache::new(CARD_SPRITE_CACHE_BUDGET, cx));
-        #[cfg(target_os = "macos")]
-        let (window_occlusion_observer, window_occlusion_receiver) =
-            match WindowOcclusionObserver::new(window) {
-                Ok((observer, receiver)) => (Some(observer), Some(receiver)),
-                Err(error) => {
-                    eprintln!("Could not observe window occlusion: {error:#}");
-                    (None, None)
-                }
-            };
         // Activation follows keyboard focus, not visibility. It only controls
         // elapsed-time updates; true occlusion owns the GPU cache lifetime below.
         let activation_subscription = cx.observe_window_activation(window, |view, window, cx| {
@@ -334,8 +359,17 @@ impl AppView {
                 view.running_tick_task.take();
             }
         });
+        let visibility_subscription = cx
+            .observe_window_visibility(window, |view, visibility, window, cx| {
+                view.handle_window_visibility(visibility, window, cx)
+            });
         let prompt_subscription = cx.subscribe(&prompt, |this, _, event, cx| {
             this.handle_input_event(event, cx)
+        });
+        let modal_subscription = cx.subscribe(&modal_input, |this, _, event, cx| {
+            if matches!(this.overlay, Overlay::EditNode(_)) {
+                this.handle_input_event(event, cx)
+            }
         });
         let search_subscription = cx.observe(&search_input, |_, _, cx| cx.notify());
         let summaries = engine.repository().summaries();
@@ -352,7 +386,6 @@ impl AppView {
         let chat_list_state = ListState::new(0, ListAlignment::Bottom, px(400.));
         let mut view = Self {
             engine,
-            receiver,
             board_id,
             board,
             prompt,
@@ -397,26 +430,24 @@ impl AppView {
             camera_x: 80.,
             camera_y: 90.,
             zoom: 1.,
+            camera_glide: None,
             zoom_settled: true,
             zoom_settle_task: None,
             running_tick_task: None,
+            hidden_release_task: None,
             repository_task: None,
-            #[cfg(target_os = "macos")]
-            window_memory_state: WindowMemoryState::default(),
-            #[cfg(target_os = "macos")]
-            _window_occlusion_observer: window_occlusion_observer,
-            #[cfg(target_os = "macos")]
-            window_occlusion_task: None,
+            idle_sleep_guard: None,
             _subscriptions: vec![
                 activation_subscription,
+                visibility_subscription,
                 prompt_subscription,
+                modal_subscription,
                 search_subscription,
             ],
             drag: None,
         };
         view.refresh_image_metadata(cx);
         view.refresh_layout(cx);
-        let receiver = view.receiver.clone();
         let window_handle = window.window_handle();
         view.repository_task = Some(cx.spawn(async move |weak, cx| {
             while let Ok(event) = receiver.recv().await {
@@ -438,58 +469,56 @@ impl AppView {
                 }
             }
         }));
-        #[cfg(target_os = "macos")]
-        if let Some(receiver) = window_occlusion_receiver {
-            let window_handle = window.window_handle();
-            view.window_occlusion_task = Some(cx.spawn(async move |weak, cx| {
-                while let Ok(visible) = receiver.recv().await {
-                    if window_handle
-                        .update(cx, |_, window, cx| {
-                            weak.update(cx, |view, cx| {
-                                view.handle_window_visibility(visible, window, cx)
-                            })
-                        })
-                        .and_then(|result| result)
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }));
-        }
         window.focus(&view.focus, cx);
         view
     }
 
-    #[cfg(target_os = "macos")]
     fn handle_window_visibility(
         &mut self,
-        visible: bool,
+        visibility: WindowVisibility,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match self.window_memory_state.update(visible) {
-            VisibilityChange::None => {}
-            VisibilityChange::Release => {
+        match visibility {
+            WindowVisibility::Hidden => {
                 self.running_tick_task.take();
-                let images_released = self
-                    .image_cache
-                    .update(cx, |cache, cx| cache.clear(window, cx));
-                let sprites_released = self
-                    .sprite_cache
-                    .update(cx, |cache, cx| cache.clear(window, cx));
-                if images_released || sprites_released {
-                    // Invalidate the retained scene so it cannot keep using
-                    // atlas entries removed by either cache.
-                    window.refresh();
-                }
+                // A quick app switch or Space change comes straight back;
+                // dropping everything at once would re-decode and
+                // re-rasterize the whole viewport for nothing.
+                self.hidden_release_task = Some(cx.spawn_in(window, async move |weak, cx| {
+                    cx.background_executor().timer(HIDDEN_RELEASE_DELAY).await;
+                    let _ = weak.update_in(cx, |view, window, cx| {
+                        if view.clear_render_caches(window, cx) {
+                            // Invalidate the retained scene so it cannot keep
+                            // using atlas entries removed by either cache.
+                            window.refresh();
+                        }
+                    });
+                }));
             }
-            VisibilityChange::Restore => {
+            WindowVisibility::Visible => {
+                self.hidden_release_task.take();
                 // Images and sprites repopulate on demand in the next render.
                 cx.notify();
                 window.refresh();
             }
         }
+    }
+
+    /// Idle sleep would stall every Codex run, so the Mac stays awake while
+    /// any generation or chat is working.
+    fn sync_idle_sleep(&mut self, cx: &mut Context<Self>) {
+        let busy = self.engine.is_busy();
+        if busy == self.idle_sleep_guard.is_some() {
+            return;
+        }
+        self.idle_sleep_guard = busy.then(|| {
+            let guard = cx.prevent_idle_sleep("Generating images with Codex");
+            cx.spawn(async move |_, _| match guard.await {
+                Ok(_guard) => std::future::pending::<()>().await,
+                Err(error) => eprintln!("Could not prevent idle sleep: {error:#}"),
+            })
+        });
     }
 
     fn handle_repository_events(
@@ -517,6 +546,7 @@ impl AppView {
                     None,
                     cx,
                 ),
+                RepositoryEvent::WorkChanged => self.sync_idle_sleep(cx),
             }
         }
 
@@ -552,7 +582,7 @@ impl AppView {
 
     /// Rebuilds the derived board state. Cards whose node, layout, and images
     /// are all unchanged are carried over wholesale, so a single finished
-    /// generation no longer re-wraps every prompt or re-encodes every sprite.
+    /// generation does not re-wrap every prompt or re-encode every sprite.
     pub(super) fn refresh_layout(&mut self, cx: &mut Context<Self>) {
         let previous = std::mem::take(&mut self.canvas_nodes);
         let cached: HashMap<&str, &Arc<CanvasNode>> = previous
@@ -560,9 +590,7 @@ impl AppView {
             .map(|canvas_node| (canvas_node.node.id.as_str(), canvas_node))
             .collect();
         if let Some(board) = &self.board {
-            // Keep transient derivation index-aligned with the board. The old
-            // string-keyed prompt/output maps cloned every node id and every
-            // wrapped-line Vec even when a repository event changed one node.
+            // Keep transient derivation index-aligned with the board.
             let mut derived = Vec::with_capacity(board.nodes.len());
             let mut heights = HashMap::with_capacity(board.nodes.len());
             for node in &board.nodes {
@@ -688,9 +716,6 @@ impl AppView {
         }
     }
 
-    /// Resolves each image to the file the canvas should draw. Anything that
-    /// requires decoding — building a missing thumbnail, reading an aspect
-    /// ratio — is handed to the background executor and applied when it lands.
     pub(super) fn reset_image_metadata(&mut self) {
         self.image_metadata_tasks.clear();
         self.pending_image_jobs.clear();
@@ -698,12 +723,12 @@ impl AppView {
         self.image_ratios.clear();
     }
 
+    /// Resolves each image to the file the canvas should draw. Anything that
+    /// requires decoding — building a missing thumbnail, reading an aspect
+    /// ratio — is handed to the background executor and applied when it lands.
     pub(super) fn refresh_image_metadata(&mut self, cx: &mut Context<Self>) {
         let (Some(board_id), Some(board)) = (self.board_id.as_deref(), self.board.as_ref()) else {
-            self.image_metadata_tasks.clear();
-            self.image_assets.clear();
-            self.image_ratios.clear();
-            self.pending_image_jobs.clear();
+            self.reset_image_metadata();
             return;
         };
         let repository = self.engine.repository();
@@ -785,8 +810,9 @@ impl AppView {
         }
         self.image_metadata_tasks.retain(|task| !task.is_ready());
         let task = cx.spawn(async move |weak, cx| {
-            for batch in jobs.chunks(BATCH) {
-                let batch = batch.to_vec();
+            let mut jobs = jobs.into_iter().peekable();
+            while jobs.peek().is_some() {
+                let batch: Vec<_> = jobs.by_ref().take(BATCH).collect();
                 let resolved = smol::unblock(move || resolve_image_jobs(batch)).await;
                 if weak
                     .update(cx, |view, cx| {
@@ -922,18 +948,13 @@ impl AppView {
     }
 
     pub(super) fn card_height(&self, node: &BoardNode) -> f32 {
-        self.heights
-            .get(&node.id)
-            .copied()
-            .unwrap_or_else(|| self.measure_card_height(node))
-    }
-
-    fn measure_card_height(&self, node: &BoardNode) -> f32 {
-        card_height(
-            node,
-            self.expanded_prompts.contains(&node.id),
-            &self.image_ratios,
-        )
+        self.heights.get(&node.id).copied().unwrap_or_else(|| {
+            card_height(
+                node,
+                self.expanded_prompts.contains(&node.id),
+                &self.image_ratios,
+            )
+        })
     }
 
     pub(super) fn current_position(&self, id: &str) -> Option<Position> {
@@ -969,6 +990,7 @@ impl AppView {
         self.camera_x = 80.;
         self.camera_y = 90.;
         self.zoom = 1.;
+        self.camera_glide = None;
         self.zoom_settled = true;
         self.zoom_settle_task.take();
         self.refresh_image_metadata(cx);
@@ -977,11 +999,19 @@ impl AppView {
         cx.notify();
     }
 
-    pub(super) fn clear_render_caches(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.image_cache
+    /// Returns whether either cache held anything to release.
+    pub(super) fn clear_render_caches(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let images_released = self
+            .image_cache
             .update(cx, |cache, cx| cache.clear(window, cx));
-        self.sprite_cache
+        let sprites_released = self
+            .sprite_cache
             .update(cx, |cache, cx| cache.clear(window, cx));
+        images_released || sprites_released
     }
 
     /// Enter submits whichever surface is open: a modal or the composer.
@@ -1020,13 +1050,8 @@ impl AppView {
         }
     }
 
-    pub(super) fn node(&self, id: &str) -> Option<BoardNode> {
-        self.board
-            .as_ref()?
-            .nodes
-            .iter()
-            .find(|node| node.id == id)
-            .cloned()
+    pub(super) fn node(&self, id: &str) -> Option<&BoardNode> {
+        self.board.as_ref()?.nodes.iter().find(|node| node.id == id)
     }
 
     pub(super) fn display_image_path(&self, url: &str, high_res: bool) -> PathBuf {
@@ -1037,12 +1062,9 @@ impl AppView {
                 asset.thumbnail.clone()
             };
         }
-        let Some(board_id) = self.board_id.as_deref() else {
-            return PathBuf::new();
-        };
-        self.engine
-            .repository()
-            .image_path(board_id, url)
+        self.board_id
+            .as_deref()
+            .and_then(|board_id| self.engine.repository().image_path(board_id, url))
             .unwrap_or_default()
     }
 
@@ -1139,7 +1161,7 @@ impl Render for AppView {
             if !empty {
                 root = root.child(self.render_canvas(window, cx));
             } else {
-                root = root.child(self.render_empty(window, cx));
+                root = root.child(self.render_empty(cx));
             }
             root = root.child(self.render_header(cx));
             if let Some(button) = self.render_gallery_button(cx) {
@@ -1152,16 +1174,21 @@ impl Render for AppView {
             Overlay::Boards => root.child(self.render_boards(window, cx)),
             Overlay::Gallery => root.child(self.render_gallery(cx)),
             Overlay::Lightbox(lightbox) => root.child(self.render_lightbox(lightbox, window, cx)),
-            Overlay::EditNode(_) => root.child(self.render_modal(
-                "Edit prompt",
-                "Update the request and regenerate this node in a fresh Codex session.",
-                "Save & regenerate",
-                cx,
-            )),
+            Overlay::EditNode(edit) => {
+                let attachments = self.render_edit_attachments(edit, cx);
+                root.child(self.render_modal(
+                    "Edit prompt",
+                    "Update the request and reference images, then regenerate this node in a fresh Codex session.",
+                    "Save & regenerate",
+                    Some(attachments),
+                    cx,
+                ))
+            }
             Overlay::RenameBoard(_) => root.child(self.render_modal(
                 "Rename board",
                 "Choose a concise name for this exploration.",
                 "Rename",
+                None,
                 cx,
             )),
             Overlay::NodeText(node_id) => {

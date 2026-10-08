@@ -37,7 +37,6 @@ pub(super) struct Prepaint {
     cursor: Option<PaintQuad>,
     selections: Vec<PaintQuad>,
     origin: Point<Pixels>,
-    measured_visual_lines: usize,
     scroll_x: f32,
     scroll_y: f32,
     vertical_inset: f32,
@@ -168,7 +167,6 @@ impl Element for TextElement {
                 let logical_content = if is_placeholder { "" } else { &content };
                 Arc::new(TextLayout::new(shaped, logical_content, px(LINE_HEIGHT)))
             });
-        let measured_visual_lines = layout.visual_line_count;
         let viewport_width = f32::from(bounds.size.width).max(0.);
         let viewport_height = f32::from(bounds.size.height).max(0.);
         let total_height = f32::from(layout.total_height);
@@ -239,7 +237,6 @@ impl Element for TextElement {
             cursor,
             selections,
             origin,
-            measured_visual_lines,
             scroll_x,
             scroll_y,
             vertical_inset,
@@ -268,8 +265,12 @@ impl Element for TextElement {
                 window.paint_quad(selection);
             }
             for line in &prepaint.layout.lines {
+                let top = prepaint.origin.y + line.y;
+                if top + line.height < bounds.top() || top > bounds.bottom() {
+                    continue;
+                }
                 let _ = line.shaped.paint(
-                    point(prepaint.origin.x, prepaint.origin.y + line.y),
+                    point(prepaint.origin.x, top),
                     px(LINE_HEIGHT),
                     gpui::TextAlign::Left,
                     None,
@@ -284,7 +285,7 @@ impl Element for TextElement {
             }
         });
         let grew = self.input.update(cx, |input, _| {
-            let height_changed = input.measured_visual_lines != prepaint.measured_visual_lines;
+            let height_changed = input.measured_visual_lines != prepaint.layout.visual_line_count;
             input.last_layout = Some(prepaint.layout.clone());
             if input
                 .layout_cache
@@ -297,7 +298,7 @@ impl Element for TextElement {
                 });
             }
             input.last_bounds = Some(bounds);
-            input.measured_visual_lines = prepaint.measured_visual_lines;
+            input.measured_visual_lines = prepaint.layout.visual_line_count;
             input.scroll_x = prepaint.scroll_x;
             input.scroll_y = prepaint.scroll_y;
             input.vertical_inset = prepaint.vertical_inset;

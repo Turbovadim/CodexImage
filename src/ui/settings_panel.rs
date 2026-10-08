@@ -71,7 +71,6 @@ impl AppView {
         let model = self.modal_input.read(cx).content().trim().to_owned();
         self.change_settings(|settings| settings.model = model, cx);
         self.close_overlay(window, cx);
-        cx.notify();
     }
 
     pub(super) fn render_settings(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -202,7 +201,7 @@ impl AppView {
                             if lineage == 0 {
                                 "Off".to_owned()
                             } else {
-                                format!("{lineage} image(s)")
+                                format!("{lineage} image{}", if lineage == 1 { "" } else { "s" })
                             },
                             lineage > 0,
                         )
@@ -223,7 +222,6 @@ impl AppView {
                                 "Cancel",
                                 cx.listener(|this, _, window, cx| {
                                     this.close_overlay(window, cx);
-                                    cx.notify();
                                 }),
                             ))
                             .child(

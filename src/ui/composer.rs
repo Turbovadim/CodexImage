@@ -64,6 +64,61 @@ fn save_pending_clipboard_images(
     Ok(paths)
 }
 
+/// A reference image thumbnail with its remove button, as shown in the
+/// composer and the prompt editor.
+pub(super) fn attachment_thumb(
+    id: String,
+    path: PathBuf,
+    removable: bool,
+    on_remove: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    div()
+        .relative()
+        .child(
+            img(path)
+                .size(px(42.))
+                .object_fit(ObjectFit::Cover)
+                .rounded_md(),
+        )
+        .child(
+            div()
+                .id(SharedString::from(id))
+                .role(Role::Button)
+                .aria_label("Remove attachment")
+                .absolute()
+                .top(px(-5.))
+                .right(px(-5.))
+                .size(px(16.))
+                .rounded_full()
+                .border_1()
+                .border_color(theme::line())
+                .bg(theme::background())
+                // The default line height is taller than the badge and would
+                // push the glyph off-centre, so it is pinned to the font size.
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(12.))
+                .line_height(px(12.))
+                .text_color(theme::dim())
+                .tooltip(tip("Remove attachment"))
+                .child("×")
+                .when(!removable, |remove| remove.text_color(theme::faint()))
+                .when(removable, |remove| {
+                    // The badge overlaps the photo, so hover stays opaque.
+                    remove
+                        .cursor_pointer()
+                        .hover(|style| {
+                            style
+                                .border_color(theme::danger())
+                                .text_color(theme::danger())
+                        })
+                        .on_click(on_remove)
+                }),
+        )
+        .into_any_element()
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub(super) struct ComposerTarget {
     pub(super) node_id: String,
@@ -100,7 +155,7 @@ impl AppView {
         match event {
             TextInputEvent::PastedImages(images) => {
                 let available = crate::model::MAX_ATTACHMENTS
-                    .saturating_sub(self.attachments.len() + self.pending_attachment_writes);
+                    .saturating_sub(self.attachment_count() + self.pending_attachment_writes);
                 let save_count = available.min(images.len());
                 if save_count == 0 {
                     self.show_toast(
@@ -126,12 +181,7 @@ impl AppView {
                     );
                 }
                 self.pending_attachment_writes += save_count;
-                let directory = self
-                    .engine
-                    .repository()
-                    .paths()
-                    .root
-                    .join("pending-attachments");
+                let directory = self.pending_attachments_dir();
                 let images = Arc::clone(images);
                 cx.spawn(async move |weak, cx| {
                     let result = smol::unblock(move || {
@@ -157,7 +207,7 @@ impl AppView {
                         match result {
                             // These paths already own reserved slots and came
                             // from GPUI-decoded clipboard images.
-                            Ok(paths) => view.attachments.extend(paths),
+                            Ok(paths) => view.attachment_sink().extend(paths),
                             Err(error) => view.show_error(error, cx),
                         }
                         cx.notify();
@@ -172,15 +222,15 @@ impl AppView {
 
     pub(super) fn queue_attachments(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         let slots = crate::model::MAX_ATTACHMENTS
-            .saturating_sub(self.attachments.len() + self.pending_attachment_writes)
+            .saturating_sub(self.attachment_count() + self.pending_attachment_writes)
             .min(paths.len());
-        if slots == 0 || paths.is_empty() {
+        if slots == 0 {
             return;
         }
         // Reserve capacity while checking paths so concurrent drops and
         // clipboard writes cannot overfill the composer or submit early.
         self.pending_attachment_writes += slots;
-        let existing = self.attachments.clone();
+        let existing = self.attachment_sink().clone();
         cx.spawn(async move |weak, cx| {
             let valid = smol::unblock(move || {
                 let mut valid = Vec::new();
@@ -202,9 +252,10 @@ impl AppView {
             let _ = weak.update(cx, |view, cx| {
                 view.pending_attachment_writes =
                     view.pending_attachment_writes.saturating_sub(slots);
+                let sink = view.attachment_sink();
                 for path in valid {
-                    if !view.attachments.contains(&path) {
-                        view.attachments.push(path);
+                    if !sink.contains(&path) {
+                        sink.push(path);
                     }
                 }
                 cx.notify();
@@ -219,7 +270,7 @@ impl AppView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.attachments.len() + self.pending_attachment_writes >= crate::model::MAX_ATTACHMENTS
+        if self.attachment_count() + self.pending_attachment_writes >= crate::model::MAX_ATTACHMENTS
         {
             self.show_toast(
                 format!(
@@ -250,45 +301,40 @@ impl AppView {
         .detach();
     }
 
-    fn remove_attachment(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index >= self.attachments.len() {
-            return;
+    /// The reference images being collected: the open prompt editor's when
+    /// there is one, otherwise the composer's. Pastes, drops and the file
+    /// picker all land here.
+    fn attachment_sink(&mut self) -> &mut Vec<PathBuf> {
+        match &mut self.overlay {
+            Overlay::EditNode(edit) => &mut edit.added,
+            _ => &mut self.attachments,
         }
-        let path = self.attachments.remove(index);
-        let pending = self
-            .engine
-            .repository()
-            .paths()
-            .root
-            .join("pending-attachments");
-        if path.starts_with(pending) {
-            smol::unblock(move || {
-                let _ = fs::remove_file(path);
-            })
-            .detach();
-        }
-        cx.notify();
     }
 
-    /// Removes the attachments consumed by one successful submission while
-    /// preserving any references the user added as it was starting.
-    fn discard_submitted_attachments(&mut self, submitted: &[PathBuf]) {
-        let pending = self
-            .engine
+    pub(super) fn attachment_count(&self) -> usize {
+        match &self.overlay {
+            Overlay::EditNode(edit) => edit.kept.len() + edit.added.len(),
+            _ => self.attachments.len(),
+        }
+    }
+
+    /// Where clipboard images wait until their submission imports them.
+    pub(super) fn pending_attachments_dir(&self) -> PathBuf {
+        self.engine
             .repository()
             .paths()
             .root
-            .join("pending-attachments");
-        let mut paths = Vec::new();
-        self.attachments.retain(|path| {
-            if !submitted.contains(path) {
-                return true;
-            }
-            if path.starts_with(&pending) {
-                paths.push(path.clone());
-            }
-            false
-        });
+            .join("pending-attachments")
+    }
+
+    /// Deletes the clipboard images among `paths` that were saved for a
+    /// submission; files the user picked from disk are left alone.
+    pub(super) fn discard_pending_files(&self, paths: Vec<PathBuf>) {
+        let pending = self.pending_attachments_dir();
+        let paths: Vec<_> = paths
+            .into_iter()
+            .filter(|path| path.starts_with(&pending))
+            .collect();
         if !paths.is_empty() {
             smol::unblock(move || {
                 for path in paths {
@@ -297,6 +343,22 @@ impl AppView {
             })
             .detach();
         }
+    }
+
+    fn remove_attachment(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.attachments.len() {
+            return;
+        }
+        let path = self.attachments.remove(index);
+        self.discard_pending_files(vec![path]);
+        cx.notify();
+    }
+
+    /// Removes the attachments consumed by one successful submission while
+    /// preserving any references the user added as it was starting.
+    fn discard_submitted_attachments(&mut self, submitted: &[PathBuf]) {
+        self.attachments.retain(|path| !submitted.contains(path));
+        self.discard_pending_files(submitted.to_vec());
     }
 
     pub(super) fn generate_from_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -339,9 +401,11 @@ impl AppView {
                     .collect(),
             ),
         };
+        let parent_id = targets.first().map(|target| target.node_id.clone());
+        let anchor = self.new_cards_anchor(parent_id.as_deref(), self.count, window);
         let request = NewNodesRequest {
             prompt,
-            parent_id: targets.first().map(|target| target.node_id.clone()),
+            parent_id,
             merged_from: targets
                 .iter()
                 .skip(1)
@@ -352,7 +416,11 @@ impl AppView {
             count: self.count,
             attachment_paths: submitted_attachments.clone(),
             attachment_urls: Vec::new(),
-            position: None,
+            position: Some(self.free_position(
+                anchor,
+                self.count,
+                crate::layout::ESTIMATED_CARD_HEIGHT,
+            )),
         };
         self.submission_pending = true;
         cx.notify();
@@ -443,49 +511,12 @@ impl AppView {
         if !self.attachments.is_empty() {
             let mut strip = div().mb_2().flex().gap_2();
             for (index, path) in self.attachments.iter().enumerate() {
-                strip = strip.child(
-                    div()
-                        .relative()
-                        .child(
-                            img(path.clone())
-                                .size(px(42.))
-                                .object_fit(ObjectFit::Cover)
-                                .rounded_md(),
-                        )
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("remove-attachment-{index}")))
-                                .role(Role::Button)
-                                .aria_label("Remove attachment")
-                                .absolute()
-                                .top(px(-5.))
-                                .right(px(-5.))
-                                .size(px(16.))
-                                .rounded_full()
-                                .border_1()
-                                .border_color(theme::line())
-                                .bg(theme::background())
-                                .text_center()
-                                .text_xs()
-                                .text_color(theme::dim())
-                                .cursor_pointer()
-                                .hover(|style| {
-                                    style
-                                        .bg(theme::danger().opacity(0.2))
-                                        .text_color(theme::danger())
-                                })
-                                .tooltip(tip("Remove attachment"))
-                                .child("×")
-                                .when(submission_pending, |remove| {
-                                    remove.text_color(theme::faint()).cursor_default()
-                                })
-                                .when(!submission_pending, |remove| {
-                                    remove.on_click(cx.listener(move |this, _, _, cx| {
-                                        this.remove_attachment(index, cx);
-                                    }))
-                                }),
-                        ),
-                );
+                strip = strip.child(attachment_thumb(
+                    format!("remove-attachment-{index}"),
+                    path.clone(),
+                    !submission_pending,
+                    cx.listener(move |this, _, _, cx| this.remove_attachment(index, cx)),
+                ));
             }
             composer = composer.child(strip);
         }
@@ -602,7 +633,7 @@ impl AppView {
         composer.into_any_element()
     }
 
-    pub(super) fn render_empty(&self, _window: &Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_empty(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut samples = div()
             .mt_4()
             .flex()

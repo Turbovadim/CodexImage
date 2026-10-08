@@ -7,8 +7,8 @@
 //! callers could commit out of order, leaving a stale board list on disk.
 //!
 //! Instead every mutation just bumps a revision. One writer thread serializes
-//! the *current* state whenever it is behind, so a burst of updates collapses
-//! into a single write and the newest state always lands last.
+//! the *current* state shortly after it falls behind, so a burst of updates
+//! collapses into a single write and the newest state always lands last.
 
 use super::{RepositoryEvent, RepositoryState, atomic_write};
 use crate::model::Board;
@@ -19,11 +19,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How long `flush` waits for the writer before giving up, so a wedged disk
 /// cannot keep the app from quitting.
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the writer waits after the first request of a burst. One job step
+/// is several mutations a few milliseconds apart, and each write is a full
+/// serialization plus two device flushes.
+const WRITE_DEBOUNCE: Duration = Duration::from_millis(300);
 
 #[derive(Default)]
 struct Queue {
@@ -34,6 +38,8 @@ struct Queue {
     /// How many times the file was actually rewritten, which is what makes
     /// request coalescing observable to tests.
     writes: u64,
+    /// A `flush` is waiting, so the pending write must not be debounced.
+    flushing: bool,
     shutdown: bool,
 }
 
@@ -91,6 +97,7 @@ impl BoardWriter {
         // `request` yet; the writer's snapshot will wait for that lock and
         // include the mutation even when shutdown interleaves at that point.
         queue.requested += 1;
+        queue.flushing = true;
         let target = queue.requested;
         self.shared.changed.notify_all();
         while queue.written < target && !queue.shutdown {
@@ -135,6 +142,13 @@ fn run(
             if queue.requested == queue.written {
                 return;
             }
+            let deadline = Instant::now() + WRITE_DEBOUNCE;
+            while !queue.flushing && !queue.shutdown {
+                if shared.changed.wait_until(&mut queue, deadline).timed_out() {
+                    break;
+                }
+            }
+            queue.flushing = false;
             queue.requested
         };
 

@@ -2,14 +2,16 @@
 //! regenerate, duplicate, and delete.
 
 use super::app::AppView;
-use super::app::Overlay;
+use super::app::{NodeEdit, Overlay};
 use super::composer::ComposerTarget;
 use super::input::TextInputMode;
 use super::keymap::{
     BranchHovered, ChatHovered, CombineHovered, DeleteHovered, DuplicateHovered, EditHovered,
     OpenSettings, RegenerateHovered,
 };
-use crate::layout::{ESTIMATED_CARD_HEIGHT, free_spot_near};
+use crate::layout::{
+    CARD_WIDTH, ESTIMATED_CARD_HEIGHT, Position, V_GAP, free_spot_near, row_width,
+};
 use crate::model::NewNodesRequest;
 use anyhow::Result;
 use gpui::{Context, Focusable, Window};
@@ -90,7 +92,7 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(node) = self.node(id) {
+        if let Some(node) = self.node(id).cloned() {
             self.targets = vec![ComposerTarget {
                 node_id: node.id,
                 prompt: node.prompt,
@@ -124,7 +126,9 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(node) = self.node(id) else { return };
+        let Some(node) = self.node(id).cloned() else {
+            return;
+        };
         let Some(image) = source_image.or_else(|| node.images.first().cloned()) else {
             self.show_toast("This card has no image to combine".into(), false, None, cx);
             return;
@@ -186,7 +190,7 @@ impl AppView {
         self.submit_node_action(
             window,
             cx,
-            move |engine, board_id| engine.regenerate(&board_id, &id, None, None),
+            move |engine, board_id| engine.regenerate(&board_id, &id, None, None, None),
             |_, _, _| {},
         );
     }
@@ -204,13 +208,22 @@ impl AppView {
     }
 
     pub(super) fn edit_node(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(node) = self.node(id) else { return };
+        let Some((prompt, attachments)) = self
+            .node(id)
+            .map(|node| (node.prompt.clone(), node.attachments.clone()))
+        else {
+            return;
+        };
         self.modal_input.update(cx, |input, cx| {
             input.set_mode(TextInputMode::AutoGrow { max_lines: 24 }, cx);
             input.set_placeholder("Edit prompt…", cx);
-            input.set_content(node.prompt, cx);
+            input.set_content(prompt, cx);
         });
-        self.overlay = Overlay::EditNode(id.to_owned());
+        self.overlay = Overlay::EditNode(NodeEdit {
+            node_id: id.to_owned(),
+            kept: attachments,
+            added: Vec::new(),
+        });
         window.focus(&self.modal_input.focus_handle(cx), cx);
         cx.notify();
     }
@@ -228,25 +241,18 @@ impl AppView {
     }
 
     pub(super) fn duplicate_node(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(node) = self.node(id) else { return };
-        // Pin the copy to the nearest free column beside the original; left to
-        // the tree layout it would land at the far end of the sibling row.
-        let position = self.current_position(id).map(|anchor| {
-            let occupied = self
-                .layout
-                .iter()
-                .map(|(id, position)| {
-                    let height = self
-                        .heights
-                        .get(id)
-                        .copied()
-                        .unwrap_or(ESTIMATED_CARD_HEIGHT);
-                    (*position, height)
-                })
-                .collect::<Vec<_>>();
-            let spot = free_spot_near(anchor, self.card_height(&node), &occupied);
-            (spot.x, spot.y)
-        });
+        let Some(node) = self.node(id).cloned() else {
+            return;
+        };
+        // A copy of a card that has no images yet will grow once they land.
+        let height = if node.images.is_empty() {
+            self.card_height(&node).max(ESTIMATED_CARD_HEIGHT)
+        } else {
+            self.card_height(&node)
+        };
+        let position = self
+            .current_position(id)
+            .map(|anchor| self.free_position(anchor, 1, height));
         let request = NewNodesRequest {
             prompt: node.prompt,
             parent_id: node.parent_id,
@@ -264,6 +270,51 @@ impl AppView {
             move |engine, board_id| engine.add_and_start(&board_id, request).map(|_| ()),
             |_, _, _| {},
         );
+    }
+
+    /// Where a row of `count` new cards gets pinned: the free spot nearest
+    /// `anchor`. New cards are always pinned; left to the tree layout they land
+    /// at the far end of a row and move whenever the tree reflows.
+    pub(super) fn free_position(&self, anchor: Position, count: usize, height: f32) -> (f32, f32) {
+        let occupied: Vec<_> = self
+            .layout
+            .iter()
+            .map(|(id, position)| {
+                let height = self
+                    .heights
+                    .get(id)
+                    .copied()
+                    .unwrap_or(ESTIMATED_CARD_HEIGHT);
+                (*position, height)
+            })
+            .collect();
+        let spot = free_spot_near(anchor, row_width(count), height, &occupied);
+        (spot.x, spot.y)
+    }
+
+    /// The anchor for `count` cards generated from the composer: centred under
+    /// the parent when branching, otherwise centred in the viewport so a fresh
+    /// generation appears where the user is looking.
+    pub(super) fn new_cards_anchor(
+        &self,
+        parent_id: Option<&str>,
+        count: usize,
+        window: &Window,
+    ) -> Position {
+        let parent = parent_id.and_then(|id| Some((self.node(id)?, self.current_position(id)?)));
+        if let Some((parent, position)) = parent {
+            return Position {
+                x: position.x + (CARD_WIDTH - row_width(count)) / 2.,
+                y: position.y + self.card_height(parent) + V_GAP,
+            };
+        }
+        let viewport = window.viewport_size();
+        let centre_x = (f32::from(viewport.width) / 2. - self.camera_x) / self.zoom;
+        let centre_y = (f32::from(viewport.height) / 2. - self.camera_y) / self.zoom;
+        Position {
+            x: centre_x - row_width(count) / 2.,
+            y: centre_y - ESTIMATED_CARD_HEIGHT / 2.,
+        }
     }
 
     pub(super) fn chat_hovered(

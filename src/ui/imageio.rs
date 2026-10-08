@@ -1,10 +1,12 @@
 //! Image decoding through macOS ImageIO (`CGImageSource`).
 //!
-//! This is the fallback decoder for formats the pure-Rust codecs cannot read,
-//! HEIC photo attachments above all. It is not the primary path: measured on
-//! Apple Silicon, `fdeflate` (PNG) and `zune-jpeg` beat ImageIO once the
-//! mandatory CGBitmapContext conversion is included. Multi-frame images
-//! (animated GIF/WebP) are declined to keep animation handling in one place.
+//! This decodes the formats the pure-Rust codecs cannot read, HEIC photo
+//! attachments above all, and oversized static images, which it can downsample
+//! without materializing the full pixel buffer. It is not the general path:
+//! measured on Apple Silicon, `fdeflate` (PNG) and `zune-jpeg` beat ImageIO
+//! once the mandatory CGBitmapContext conversion is included. Multi-frame
+//! images (animated GIF/WebP) are declined to keep animation handling in one
+//! place.
 
 use core_foundation::base::{CFType, TCFType};
 use core_foundation::boolean::CFBoolean;
@@ -146,7 +148,7 @@ pub fn decode_render_image(bytes: Vec<u8>, max_dimension: Option<u32>) -> Option
 /// output of Core Graphics has to be divided back out. Opaque images (the
 /// common case here) skip the division entirely.
 fn unpremultiply(pixels: &mut [u8]) {
-    for pixel in pixels.chunks_exact_mut(4) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
         let alpha = pixel[3] as u32;
         if alpha == 255 || alpha == 0 {
             continue;

@@ -1,7 +1,7 @@
 mod writer;
 
 use crate::model::{
-    Board, BoardNode, BoardSummary, ChatMessage, ChatRole, MAX_ATTACHMENT_BYTES,
+    AttachmentEdit, Board, BoardNode, BoardSummary, ChatMessage, ChatRole, MAX_ATTACHMENT_BYTES,
     MAX_ATTACHMENT_TOTAL_BYTES, MAX_ATTACHMENTS, MAX_CHAT_MESSAGES, NewNodesRequest, NodeStatus,
     StopReason,
 };
@@ -26,7 +26,7 @@ pub const THUMBNAIL_MAX_DIMENSION: u32 = 680;
 // Rasterizing hundreds of cards during a zoom-out then decodes ~40 KB files
 // instead of the full-size thumbnails.
 pub const SPRITE_THUMBNAIL_MAX_DIMENSION: u32 = 320;
-const THUMBNAIL_SWEEP_VERSION: u8 = 1;
+const THUMBNAIL_SWEEP_VERSION: u8 = 2;
 
 #[derive(Clone, Debug)]
 pub enum RepositoryEvent {
@@ -39,6 +39,8 @@ pub enum RepositoryEvent {
     /// Saving the board list failed. Emitted by the background writer, which
     /// has no caller left to return an error to.
     PersistFailed(String),
+    /// A generation or chat started or finished.
+    WorkChanged,
 }
 
 #[derive(Clone)]
@@ -136,6 +138,27 @@ impl Repository {
         let mut boards = load_boards(&paths.boards_file)?;
         let mut changed = false;
         for board in &mut boards {
+            // Sizes outlive the nodes that used them; drop the leftovers so
+            // every save stops serializing them.
+            let referenced: HashSet<&str> = board
+                .nodes
+                .iter()
+                .flat_map(|node| {
+                    [
+                        &node.images,
+                        &node.attempts,
+                        &node.attachments,
+                        &node.source_images,
+                    ]
+                })
+                .flatten()
+                .map(String::as_str)
+                .collect();
+            let sizes = board.image_sizes.len();
+            board
+                .image_sizes
+                .retain(|url, _| referenced.contains(url.as_str()));
+            changed |= board.image_sizes.len() != sizes;
             for node in &mut board.nodes {
                 if node.attempts.is_empty() && !node.images.is_empty() {
                     node.attempts.clone_from(&node.images);
@@ -191,15 +214,6 @@ impl Repository {
         &self.paths
     }
 
-    pub fn boards(&self) -> Vec<Board> {
-        self.inner
-            .read()
-            .boards
-            .iter()
-            .map(|board| board.as_ref().clone())
-            .collect()
-    }
-
     pub fn board(&self, board_id: &str) -> Option<Board> {
         self.board_snapshot(board_id)
             .map(|board| board.as_ref().clone())
@@ -234,28 +248,21 @@ impl Repository {
             .boards
             .iter()
             .map(|board| {
-                let mut updated_at = None;
-                let mut image_count = 0;
-                let mut last_image = None;
-                let mut total_tokens = 0;
-                for node in &board.nodes {
-                    updated_at = Some(updated_at.map_or(node.created_at, |updated_at: i64| {
-                        updated_at.max(node.created_at)
-                    }));
-                    image_count += node.images.len();
-                    if let Some(image) = node.images.last() {
-                        last_image = Some(image.clone());
-                    }
-                    total_tokens += node.token_count();
-                }
+                let nodes = &board.nodes;
                 BoardSummary {
                     id: board.id.clone(),
                     title: board.title.clone(),
-                    created_at: board.created_at,
-                    updated_at: updated_at.unwrap_or(board.created_at),
-                    image_count,
-                    last_image,
-                    total_tokens,
+                    updated_at: nodes
+                        .iter()
+                        .map(|node| node.created_at)
+                        .max()
+                        .unwrap_or(board.created_at),
+                    image_count: nodes.iter().map(|node| node.images.len()).sum(),
+                    last_image: nodes
+                        .iter()
+                        .rev()
+                        .find_map(|node| node.images.last().cloned()),
+                    total_tokens: nodes.iter().map(BoardNode::token_count).sum(),
                 }
             })
             .collect();
@@ -317,14 +324,14 @@ impl Repository {
         if request.attachment_paths.len() + request.attachment_urls.len() > MAX_ATTACHMENTS {
             bail!("Too many attachments (max {MAX_ATTACHMENTS})");
         }
-        let parent = {
+        let (parent, merged_from) = {
             let state = self.inner.read();
             let board = state
                 .boards
                 .iter()
                 .find(|board| board.id == board_id)
                 .context("Board not found")?;
-            request
+            let parent = request
                 .parent_id
                 .as_deref()
                 .map(|parent_id| {
@@ -335,23 +342,15 @@ impl Repository {
                         .cloned()
                         .context("Parent node not found")
                 })
-                .transpose()?
-        };
-        let merged_from: Vec<String> = match &parent {
-            Some(parent) => {
-                let state = self.inner.read();
-                let board = state
-                    .boards
-                    .iter()
-                    .find(|board| board.id == board_id)
-                    .context("Board not found")?;
-                let mut merged_from = request.merged_from;
+                .transpose()?;
+            let mut merged_from = Vec::new();
+            if let Some(parent) = &parent {
+                merged_from = request.merged_from;
                 merged_from
                     .retain(|id| *id != parent.id && board.nodes.iter().any(|node| node.id == *id));
                 merged_from.dedup();
-                merged_from
             }
-            None => Vec::new(),
+            (parent, merged_from)
         };
         let source_images = match (&parent, request.source_images) {
             (Some(_), Some(images)) => images,
@@ -391,8 +390,10 @@ impl Repository {
                 status: NodeStatus::Running,
                 error: None,
                 stop_reason: None,
-                x: request.position.map(|(x, _)| x + 32.0 * index as f32),
-                y: request.position.map(|(_, y)| y + 32.0 * index as f32),
+                x: request
+                    .position
+                    .map(|(x, _)| x + crate::layout::COLUMN_STEP * index as f32),
+                y: request.position.map(|(_, y)| y),
                 created_at: run_started_at + index as i64,
                 run_started_at: Some(run_started_at),
                 finished_at: None,
@@ -417,8 +418,23 @@ impl Repository {
         node_id: &str,
         prompt: Option<String>,
         aspect: Option<String>,
+        attachments: Option<AttachmentEdit>,
     ) -> Result<BoardNode> {
-        self.update_node(board_id, node_id, |node| {
+        // Removed references stay on disk: duplicated cards share their files.
+        let attachments = attachments
+            .map(|edit| {
+                if edit.keep.len() + edit.add.len() > MAX_ATTACHMENTS {
+                    bail!("Too many attachments (max {MAX_ATTACHMENTS})");
+                }
+                let imported = self.import_attachments(board_id, &edit.add)?;
+                Ok((edit.keep, imported))
+            })
+            .transpose()?;
+        self.mutate_node(board_id, node_id, |node| {
+            if let Some((keep, imported)) = attachments {
+                node.attachments.retain(|url| keep.contains(url));
+                node.attachments.extend(imported);
+            }
             if let Some(prompt) = prompt {
                 let prompt = prompt.trim();
                 if !prompt.is_empty() {
@@ -438,6 +454,7 @@ impl Repository {
             node.run_started_at = Some(now_ms());
             node.finished_at = None;
             node.usage = None;
+            node.clone()
         })
     }
 
@@ -463,18 +480,6 @@ impl Repository {
         drop(state);
         self.persist_and_notify();
         Ok(())
-    }
-
-    pub fn update_node(
-        &self,
-        board_id: &str,
-        node_id: &str,
-        update: impl FnOnce(&mut BoardNode),
-    ) -> Result<BoardNode> {
-        self.mutate_node(board_id, node_id, |node| {
-            update(node);
-            node.clone()
-        })
     }
 
     /// Mutates a node without cloning it for a return value. Generation event
@@ -571,14 +576,13 @@ impl Repository {
     }
 
     pub fn mark_stopped(&self, board_id: &str, node_id: &str, reason: StopReason) -> Result<()> {
-        self.update_node(board_id, node_id, |node| {
+        self.mutate_node(board_id, node_id, |node| {
             if node.status == NodeStatus::Running {
                 node.status = NodeStatus::Stopped;
                 node.stop_reason = Some(reason);
                 node.finished_at = Some(now_ms());
             }
-        })?;
-        Ok(())
+        })
     }
 
     /// Appends one line to a card's side conversation, keeping the stored
@@ -676,19 +680,20 @@ impl Repository {
                 remove_thumbnails(&source);
                 create_thumbnail(&source)?;
             }
-            atomic_write(&marker, b"conditioned-v1\n")?;
+            write_marker(&marker, b"conditioned-v1\n")?;
             Ok(applied)
         })();
         let _ = fs::remove_file(&temporary);
         result.with_context(|| format!("failed to condition {}", source.display()))
     }
 
-    /// Re-creates every stored thumbnail that is smaller than the current
-    /// `THUMBNAIL_MAX_DIMENSION` allows, then announces a change so open
-    /// views pick the sharper files up. A one-time sweep after upgrades that
-    /// raise the thumbnail size; run it on a background thread, it decodes
-    /// every affected original.
-    pub fn refresh_undersized_thumbnails(&self) {
+    /// Re-creates the thumbnails of every image a board still shows when they
+    /// are not what `create_thumbnail` writes today: smaller or larger than
+    /// the current sizes, or 16-bit. Then announces a change so open views
+    /// pick the new files up. A one-time sweep after upgrades that change the
+    /// thumbnail format; run it on a background thread, it decodes every
+    /// affected original.
+    pub fn refresh_stale_thumbnails(&self) {
         // Imports always create both current thumbnail sizes. This versioned
         // marker turns the upgrade scan into the one-time pass its contract
         // promises, while a dimension or algorithm change gets a new marker.
@@ -698,71 +703,66 @@ impl Repository {
         if marker.is_file() {
             return;
         }
-        let Ok(boards) = fs::read_dir(&self.paths.images) else {
-            return;
+        // Images no node refers to are never displayed, and a long-lived
+        // board directory holds far more of those than live ones.
+        let referenced: HashSet<PathBuf> = {
+            let state = self.inner.read();
+            state
+                .boards
+                .iter()
+                .flat_map(|board| {
+                    board
+                        .nodes
+                        .iter()
+                        .flat_map(|node| {
+                            [
+                                &node.images,
+                                &node.attempts,
+                                &node.attachments,
+                                &node.source_images,
+                            ]
+                        })
+                        .flatten()
+                        .filter_map(|url| self.image_path(&board.id, url))
+                })
+                .collect()
         };
         let mut regenerated = false;
         let mut complete = true;
-        for board in boards {
-            let Ok(board) = board else {
-                complete = false;
-                continue;
-            };
-            let board_path = board.path();
-            if !board_path.is_dir() {
+        for path in referenced {
+            if !path.is_file() {
                 continue;
             }
-            let Ok(entries) = fs::read_dir(board_path) else {
+            let (Some(thumbnail), Some(sprite)) =
+                (thumbnail_path_for(&path), sprite_thumbnail_path_for(&path))
+            else {
+                continue;
+            };
+            let Ok((width, height)) = image::image_dimensions(&path) else {
                 complete = false;
                 continue;
             };
-            for entry in entries {
-                let Ok(entry) = entry else {
-                    complete = false;
-                    continue;
-                };
-                let path = entry.path();
-                let is_thumbnail = path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_none_or(|name| name.starts_with("t_") || name.starts_with("s_"));
-                if is_thumbnail || !path.is_file() {
-                    continue;
-                }
-                let (Some(thumbnail), Some(sprite)) =
-                    (thumbnail_path_for(&path), sprite_thumbnail_path_for(&path))
-                else {
-                    continue;
-                };
-                let Ok(source_dimensions) = image::image_dimensions(&path) else {
-                    complete = false;
-                    continue;
-                };
-                // A missing or unreadable thumbnail beside a readable original
-                // counts as undersized and is rebuilt.
-                let undersized = |candidate: &Path, target: u32| {
-                    image::image_dimensions(candidate).map_or(true, |(thumb_w, thumb_h)| {
-                        thumb_w.max(thumb_h)
-                            < source_dimensions.0.max(source_dimensions.1).min(target)
-                    })
-                };
-                if undersized(&thumbnail, THUMBNAIL_MAX_DIMENSION) {
-                    if create_thumbnail(&path).is_ok() {
-                        regenerated = true;
-                    } else {
-                        complete = false;
-                    }
-                } else if undersized(&sprite, SPRITE_THUMBNAIL_MAX_DIMENSION) {
-                    if create_sprite_thumbnail(&path).is_ok() {
-                        regenerated = true;
-                    } else {
-                        complete = false;
-                    }
-                }
+            // A missing or unreadable thumbnail beside a readable original
+            // counts as stale and is rebuilt.
+            let current = |candidate: &Path, target: u32| {
+                thumbnail_header(candidate).is_some_and(|(long_edge, eight_bit)| {
+                    eight_bit && long_edge <= target && long_edge >= width.max(height).min(target)
+                })
+            };
+            let rebuilt = if !current(&thumbnail, THUMBNAIL_MAX_DIMENSION) {
+                create_thumbnail(&path).map(drop)
+            } else if !current(&sprite, SPRITE_THUMBNAIL_MAX_DIMENSION) {
+                create_sprite_thumbnail(&path)
+            } else {
+                continue;
+            };
+            match rebuilt {
+                Ok(()) => regenerated = true,
+                Err(_) => complete = false,
             }
         }
         if complete {
-            let _ = atomic_write(&marker, b"complete\n");
+            let _ = write_marker(&marker, b"complete\n");
         }
         if regenerated {
             // Thumbnail paths held by the view must be resolved again after a
@@ -776,6 +776,10 @@ impl Repository {
             node_id: node_id.into(),
             text: text.into(),
         });
+    }
+
+    pub fn emit_work_changed(&self) {
+        let _ = self.events.try_send(RepositoryEvent::WorkChanged);
     }
 
     fn import_attachments(&self, board_id: &str, paths: &[PathBuf]) -> Result<Vec<String>> {
@@ -844,7 +848,7 @@ impl Repository {
             }
             let size = create_thumbnail(&destination)?;
             if crate::generation::conditioner::enabled() {
-                atomic_write(&marker, b"conditioned-v1\n")?;
+                write_marker(&marker, b"conditioned-v1\n")?;
             }
             let url = format!("/images/{board_id}/{name}");
             self.record_image_sizes(board_id, [(url.clone(), size)]);
@@ -975,6 +979,16 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     result.with_context(|| format!("failed to save {}", path.display()))
 }
 
+/// Writes a marker whose loss only repeats cheap work, so it skips the two
+/// device flushes `atomic_write` pays.
+fn write_marker(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
 fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
     if fs::read(path).is_ok_and(|current| current == bytes) {
         return Ok(());
@@ -984,16 +998,17 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// Builds both display thumbnails beside `source`: `t_` at
 /// `THUMBNAIL_MAX_DIMENSION` and `s_` at `SPRITE_THUMBNAIL_MAX_DIMENSION`.
-/// Writes both thumbnail sizes and returns the source's pixel size, which the
-/// full decode here makes free to report.
+/// Returns the source's pixel size, which the full decode here makes free to
+/// report.
 pub fn create_thumbnail(source: &Path) -> Result<[u32; 2]> {
     let image = decode(source)?;
     let size = [image.width(), image.height()];
-    let thumbnail = image.thumbnail(THUMBNAIL_MAX_DIMENSION, THUMBNAIL_MAX_DIMENSION);
-    let sprite = thumbnail.thumbnail(
-        SPRITE_THUMBNAIL_MAX_DIMENSION,
-        SPRITE_THUMBNAIL_MAX_DIMENSION,
-    );
+    // `thumbnail` scales up as readily as down; a small source keeps its size.
+    let long_edge = size[0].max(size[1]);
+    let thumbnail_edge = THUMBNAIL_MAX_DIMENSION.min(long_edge);
+    let sprite_edge = SPRITE_THUMBNAIL_MAX_DIMENSION.min(long_edge);
+    let thumbnail = image.thumbnail(thumbnail_edge, thumbnail_edge);
+    let sprite = thumbnail.thumbnail(sprite_edge, sprite_edge);
     save_thumbnail(thumbnail, source, thumbnail_path_for(source))?;
     save_thumbnail(sprite, source, sprite_thumbnail_path_for(source))?;
     Ok(size)
@@ -1008,6 +1023,24 @@ fn create_sprite_thumbnail(source: &Path) -> Result<()> {
         SPRITE_THUMBNAIL_MAX_DIMENSION,
     );
     save_thumbnail(sprite, source, sprite_thumbnail_path_for(source))
+}
+
+/// A stored thumbnail's long edge and whether its channels are 8-bit, read
+/// from the header alone.
+fn thumbnail_header(path: &Path) -> Option<(u32, bool)> {
+    use image::{ColorType, ImageDecoder};
+    let decoder = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .into_decoder()
+        .ok()?;
+    let (width, height) = decoder.dimensions();
+    let eight_bit = matches!(
+        decoder.color_type(),
+        ColorType::L8 | ColorType::La8 | ColorType::Rgb8 | ColorType::Rgba8
+    );
+    Some((width.max(height), eight_bit))
 }
 
 fn decode(path: &Path) -> Result<image::DynamicImage> {
@@ -1043,7 +1076,7 @@ fn save_thumbnail(
     crate::disk_cache::store_rgba(
         &destination,
         Some(THUMBNAIL_MAX_DIMENSION),
-        &image.into_rgba8(),
+        image.into_rgba8(),
     );
     Ok(())
 }
@@ -1129,7 +1162,7 @@ mod tests {
         DataPaths, Repository, RepositoryEvent, atomic_write, board_mut, create_thumbnail,
         thumbnail_path_for,
     };
-    use crate::model::{BoardNode, NewNodesRequest, NodeStatus};
+    use crate::model::{AttachmentEdit, BoardNode, NewNodesRequest, NodeStatus};
     use async_channel::{Receiver, unbounded};
     use image::{ColorType, DynamicImage, ImageFormat, Rgba, RgbaImage};
     use std::fs;
@@ -1320,13 +1353,107 @@ mod tests {
             .unwrap()
             .remove(0);
         let imported = node.attachments[0].clone();
-        open.record_image_sizes(&board.id, [("/images/legacy".to_owned(), [7, 9])]);
+        open.record_image_sizes(&board.id, [("/images/orphan".to_owned(), [7, 9])]);
         drop(open);
 
         let (reopened, _) = repository(&directory);
         let sizes = reopened.board(&board.id).unwrap().image_sizes;
         assert_eq!(sizes.get(&imported), Some(&[48, 32]));
-        assert_eq!(sizes.get("/images/legacy"), Some(&[7, 9]));
+        // A size no node refers to is dropped rather than saved forever.
+        assert!(!sizes.contains_key("/images/orphan"));
+    }
+
+    #[test]
+    fn the_thumbnail_sweep_rebuilds_oversized_thumbnails_of_referenced_images() {
+        let directory = TempDir::new().unwrap();
+        let attachment = directory.path().join("wide.png");
+        DynamicImage::ImageRgba8(RgbaImage::new(48, 32))
+            .save(&attachment)
+            .unwrap();
+        let (repository, _receiver) = repository(&directory);
+        let board = repository.create_board().unwrap();
+        let node = repository
+            .add_nodes(
+                &board.id,
+                NewNodesRequest {
+                    prompt: "wide".into(),
+                    parent_id: None,
+                    merged_from: Vec::new(),
+                    source_images: None,
+                    aspect: "auto".into(),
+                    count: 1,
+                    attachment_paths: vec![attachment],
+                    attachment_urls: Vec::new(),
+                    position: None,
+                },
+            )
+            .unwrap()
+            .remove(0);
+        let thumbnail = repository
+            .thumbnail_path(&board.id, &node.attachments[0])
+            .unwrap();
+        // A small source keeps its own size instead of being scaled up.
+        assert_eq!(image::image_dimensions(&thumbnail).unwrap(), (48, 32));
+
+        DynamicImage::ImageRgba8(RgbaImage::new(900, 600))
+            .save(&thumbnail)
+            .unwrap();
+        repository.refresh_stale_thumbnails();
+
+        assert_eq!(image::image_dimensions(&thumbnail).unwrap(), (48, 32));
+    }
+
+    #[test]
+    fn regenerating_with_an_attachment_edit_replaces_the_references() {
+        let directory = TempDir::new().unwrap();
+        let files: Vec<_> = ["a.png", "b.png", "c.png"]
+            .into_iter()
+            .map(|name| {
+                let path = directory.path().join(name);
+                DynamicImage::ImageRgba8(RgbaImage::new(8, 8))
+                    .save(&path)
+                    .unwrap();
+                path
+            })
+            .collect();
+        let (open, _receiver) = repository(&directory);
+        let board = open.create_board().unwrap();
+        let node = open
+            .add_nodes(
+                &board.id,
+                NewNodesRequest {
+                    prompt: "references".into(),
+                    parent_id: None,
+                    merged_from: Vec::new(),
+                    source_images: None,
+                    aspect: "auto".into(),
+                    count: 1,
+                    attachment_paths: files[..2].to_vec(),
+                    attachment_urls: Vec::new(),
+                    position: None,
+                },
+            )
+            .unwrap()
+            .remove(0);
+
+        let edit = AttachmentEdit {
+            keep: vec![node.attachments[1].clone()],
+            add: vec![files[2].clone()],
+        };
+        let edited = open
+            .regenerate_node(&board.id, &node.id, None, None, Some(edit))
+            .unwrap();
+
+        assert_eq!(edited.attachments.len(), 2);
+        assert_eq!(edited.attachments[0], node.attachments[1]);
+        assert!(!node.attachments.contains(&edited.attachments[1]));
+        assert!(open.image_path(&board.id, &edited.attachments[1]).is_some());
+
+        // A plain retry leaves the references alone.
+        let retried = open
+            .regenerate_node(&board.id, &node.id, None, None, None)
+            .unwrap();
+        assert_eq!(retried.attachments, edited.attachments);
     }
 
     #[test]
@@ -1377,7 +1504,7 @@ mod tests {
             .unwrap()
             .remove(0);
         repository
-            .update_node(&board.id, &node.id, |node| {
+            .mutate_node(&board.id, &node.id, |node| {
                 node.attempts = vec![url.clone()];
                 node.images = vec![url.clone()];
             })

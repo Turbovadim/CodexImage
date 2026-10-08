@@ -2,17 +2,17 @@
 //! prompt and rename modals, the quit confirmation, and toasts.
 
 use super::app::AppView;
-use super::app::Overlay;
-use super::composer::control_button;
+use super::app::{NodeEdit, Overlay};
+use super::composer::{attachment_thumb, control_button};
 use super::format::{format_date, format_tokens, node_depths, status_label, time_ago};
 use super::input::TextInputMode;
-use super::keymap::{Generate, OpenBoards, ToggleGallery};
+use super::keymap::{AddAttachment, Generate, OpenBoards, ToggleGallery};
 use super::theme;
 use super::tooltip::{tip, tip_with_shortcut};
-use crate::model::BoardSummary;
+use crate::model::{AttachmentEdit, BoardSummary, MAX_ATTACHMENTS};
 use gpui::{
-    AnyElement, ClipboardItem, Context, Focusable, FontWeight, ObjectFit, Role, SharedString,
-    StyledImage, WeakEntity, Window, div, img, list, prelude::*, px,
+    AnyElement, ClipboardItem, Context, ExternalPaths, Focusable, FontWeight, ObjectFit, Role,
+    SharedString, StyledImage, WeakEntity, Window, div, img, list, prelude::*, px,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -26,7 +26,7 @@ pub(super) struct Toast {
 
 /// One board-switcher row, resolved when the switcher opens. Building these
 /// walks every node of every board and clones its title, which is far too much
-/// to repeat per frame while a generation drives 30 fps repaints.
+/// to repeat per frame.
 pub(super) struct BoardRow {
     summary: BoardSummary,
     /// The lower-cased title, so filtering never re-cases every title.
@@ -70,7 +70,6 @@ struct GalleryImage {
 pub(super) struct GalleryRow {
     node_id: String,
     prompt: SharedString,
-    status: SharedString,
     metadata: SharedString,
     indent: f32,
     images: Vec<GalleryImage>,
@@ -92,14 +91,15 @@ impl GalleryRow {
                 Self {
                     node_id: node.id.clone(),
                     prompt: node.prompt.clone().into(),
-                    metadata: format!(
-                        "{} · {} · {} branch depth",
-                        status,
-                        format_date(node.created_at),
-                        depth
-                    )
+                    metadata: if depth == 0 {
+                        format!("{status} · {}", format_date(node.created_at))
+                    } else {
+                        format!(
+                            "{status} · {} · depth {depth}",
+                            format_date(node.created_at)
+                        )
+                    }
                     .into(),
-                    status: status.into(),
                     indent: depth as f32 * 18.,
                     images: node
                         .images
@@ -124,17 +124,9 @@ fn render_gallery_row(
     if row.images.is_empty() {
         strip = strip.child(
             div()
-                .h(px(96.))
-                .flex_1()
-                .rounded_lg()
-                .border_1()
-                .border_color(theme::line())
-                .flex()
-                .items_center()
-                .justify_center()
                 .text_xs()
                 .text_color(theme::faint())
-                .child(row.status.clone()),
+                .child("No images"),
         );
     } else {
         for (index, image) in row.images.iter().enumerate() {
@@ -280,10 +272,13 @@ impl AppView {
     }
 
     pub(super) fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.overlay = Overlay::None;
+        if let Overlay::EditNode(edit) = std::mem::replace(&mut self.overlay, Overlay::None) {
+            self.discard_pending_files(edit.added);
+        }
         self.armed_board_delete = None;
         self.modal_input.update(cx, |input, cx| input.clear(cx));
         window.focus(&self.focus, cx);
+        cx.notify();
     }
 
     pub(super) fn open_boards(
@@ -336,10 +331,23 @@ impl AppView {
     }
 
     pub(super) fn save_edited_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Overlay::EditNode(node_id) = &self.overlay else {
+        let Overlay::EditNode(edit) = &self.overlay else {
             return;
         };
-        let node_id = node_id.clone();
+        if self.pending_attachment_writes > 0 {
+            self.show_toast(
+                "Wait for attachments to finish processing".into(),
+                false,
+                None,
+                cx,
+            );
+            return;
+        }
+        let node_id = edit.node_id.clone();
+        let attachments = AttachmentEdit {
+            keep: edit.kept.clone(),
+            add: edit.added.clone(),
+        };
         let prompt = self.modal_input.read(cx).content().trim().to_owned();
         if prompt.is_empty() {
             return;
@@ -350,16 +358,17 @@ impl AppView {
         self.submit_node_action(
             window,
             cx,
-            move |engine, board_id| engine.regenerate(&board_id, &node_id, Some(prompt), None),
+            move |engine, board_id| {
+                engine.regenerate(&board_id, &node_id, Some(prompt), None, Some(attachments))
+            },
             move |view, window, cx| {
                 // Close the editor only if it still shows the prompt that was
                 // submitted; the user may have moved on while it ran.
                 if view.board_id == submitted_board
-                    && matches!(&view.overlay, Overlay::EditNode(id) if *id == submitted_node)
+                    && matches!(&view.overlay, Overlay::EditNode(edit) if edit.node_id == submitted_node)
                     && view.modal_input.read(cx).content().trim() == submitted_prompt
                 {
-                    view.overlay = Overlay::None;
-                    window.focus(&view.focus, cx);
+                    view.close_overlay(window, cx);
                 }
             },
         );
@@ -385,7 +394,7 @@ impl AppView {
 
     pub(super) fn render_boards(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let query = self.search_input.read(cx).content().to_lowercase();
-        let width = 360.;
+        let width = 400.;
         let mut list = div()
             .id("board-list")
             .max_h(px(
@@ -427,6 +436,7 @@ impl AppView {
             list = list.child(
                 div()
                     .id(SharedString::from(format!("board-{}", summary.id)))
+                    .group("board-row")
                     .role(Role::Button)
                     .aria_label(format!("Open board {}", summary.title))
                     .flex()
@@ -454,14 +464,17 @@ impl AppView {
                                 div()
                                     .text_sm()
                                     .text_color(if active { theme::ink() } else { theme::dim() })
+                                    .truncate()
                                     .child(summary.title.clone()),
                             )
-                            .child(div().text_xs().text_color(theme::faint()).child(format!(
-                                "{} images · {} tok · {}",
-                                summary.image_count,
-                                format_tokens(summary.total_tokens),
-                                time_ago(summary.updated_at)
-                            ))),
+                            .child(div().text_xs().text_color(theme::faint()).truncate().child(
+                                format!(
+                                    "{} images · {} tok · {}",
+                                    summary.image_count,
+                                    format_tokens(summary.total_tokens),
+                                    time_ago(summary.updated_at)
+                                ),
+                            )),
                     )
                     .child(
                         div()
@@ -474,6 +487,9 @@ impl AppView {
                             .text_xs()
                             .text_color(theme::faint())
                             .cursor_pointer()
+                            // Row actions stay out of the way until the row is hovered.
+                            .invisible()
+                            .group_hover("board-row", |style| style.visible())
                             .hover(|style| style.bg(theme::hover()).text_color(theme::ink()))
                             .tooltip(tip("Rename this board"))
                             .child("Rename")
@@ -482,8 +498,8 @@ impl AppView {
                                 let title = this
                                     .engine
                                     .repository()
-                                    .board(&rename_id)
-                                    .map(|board| board.title)
+                                    .board_snapshot(&rename_id)
+                                    .map(|board| board.title.clone())
                                     .unwrap_or_default();
                                 this.modal_input.update(cx, |input, cx| {
                                     input.set_mode(TextInputMode::SingleLine, cx);
@@ -509,6 +525,11 @@ impl AppView {
                             .text_xs()
                             .text_color(theme::danger())
                             .cursor_pointer()
+                            .when(!armed, |button| {
+                                button
+                                    .invisible()
+                                    .group_hover("board-row", |style| style.visible())
+                            })
                             .hover(|style| style.bg(theme::danger().opacity(0.16)))
                             .tooltip(tip(if armed {
                                 "Click again to delete this board for good"
@@ -642,6 +663,8 @@ impl AppView {
                     .border_b_1()
                     .border_color(theme::line())
                     .px_6()
+                    // The window's traffic lights sit over this corner.
+                    .when(cfg!(target_os = "macos"), |header| header.pl(px(88.)))
                     .py_4()
                     .flex()
                     .items_center()
@@ -693,7 +716,6 @@ impl AppView {
                             .child("×")
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.close_overlay(window, cx);
-                                cx.notify();
                             })),
                     ),
             )
@@ -701,11 +723,65 @@ impl AppView {
             .into_any_element()
     }
 
+    /// The prompt editor's reference images: stored ones first, then files
+    /// added while editing, each removable, followed by the attach button.
+    pub(super) fn render_edit_attachments(
+        &self,
+        edit: &NodeEdit,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut strip = div().mt_3().flex().flex_wrap().items_center().gap_2();
+        for (index, url) in edit.kept.iter().enumerate() {
+            strip = strip.child(attachment_thumb(
+                format!("remove-kept-attachment-{index}"),
+                self.display_image_path(url, false),
+                true,
+                cx.listener(move |this, _, _, cx| {
+                    if let Overlay::EditNode(edit) = &mut this.overlay
+                        && index < edit.kept.len()
+                    {
+                        edit.kept.remove(index);
+                        cx.notify();
+                    }
+                }),
+            ));
+        }
+        for (index, path) in edit.added.iter().enumerate() {
+            strip = strip.child(attachment_thumb(
+                format!("remove-added-attachment-{index}"),
+                path.clone(),
+                true,
+                cx.listener(move |this, _, _, cx| {
+                    if let Overlay::EditNode(edit) = &mut this.overlay
+                        && index < edit.added.len()
+                    {
+                        let path = edit.added.remove(index);
+                        this.discard_pending_files(vec![path]);
+                        cx.notify();
+                    }
+                }),
+            ));
+        }
+        let full = self.attachment_count() + self.pending_attachment_writes >= MAX_ATTACHMENTS;
+        if !full {
+            strip = strip.child(control_button(
+                if self.pending_attachment_writes == 0 {
+                    "Attach".to_owned()
+                } else {
+                    format!("Attach ({} pending)", self.pending_attachment_writes)
+                },
+                cx.listener(|this, _, window, cx| this.add_attachment(&AddAttachment, window, cx)),
+            ));
+        }
+        strip.into_any_element()
+    }
+
     pub(super) fn render_modal(
         &self,
         title: &str,
         detail: &str,
         action: &str,
+        extra: Option<AnyElement>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         div()
@@ -719,6 +795,12 @@ impl AppView {
             .items_center()
             .justify_center()
             .occlude()
+            .on_drop(cx.listener(|this, dropped: &ExternalPaths, _, cx| {
+                if matches!(this.overlay, Overlay::EditNode(_)) {
+                    this.queue_attachments(dropped.paths().to_vec(), cx);
+                    cx.notify();
+                }
+            }))
             .child(
                 div()
                     .w(px(760.))
@@ -753,6 +835,7 @@ impl AppView {
                             .py_2()
                             .child(self.modal_input.clone()),
                     )
+                    .children(extra)
                     .child(
                         div()
                             .mt_5()
@@ -763,7 +846,6 @@ impl AppView {
                                 "Cancel",
                                 cx.listener(|this, _, window, cx| {
                                     this.close_overlay(window, cx);
-                                    cx.notify();
                                 }),
                             ))
                             .child(
@@ -794,11 +876,10 @@ impl AppView {
     pub(super) fn render_node_text(&self, node_id: &str, cx: &mut Context<Self>) -> AnyElement {
         let node = self.node(node_id);
         let error = node
-            .as_ref()
             .and_then(|node| node.error.clone())
             .filter(|error| !error.is_empty());
         let text = node
-            .map(|node| node.text)
+            .map(|node| node.text.clone())
             .filter(|text| !text.is_empty())
             // The card would only offer this popup for one of the two, but a
             // stale click can race a refresh; degrade to a placeholder.
@@ -838,7 +919,6 @@ impl AppView {
             "Close",
             cx.listener(|this, _, window, cx| {
                 this.close_overlay(window, cx);
-                cx.notify();
             }),
         ));
         div()
@@ -852,7 +932,6 @@ impl AppView {
             .occlude()
             .on_click(cx.listener(|this, _, window, cx| {
                 this.close_overlay(window, cx);
-                cx.notify();
             }))
             .child(
                 div()
@@ -927,7 +1006,6 @@ impl AppView {
                                 "Keep running",
                                 cx.listener(|this, _, window, cx| {
                                     this.close_overlay(window, cx);
-                                    cx.notify();
                                 }),
                             ))
                             .child(

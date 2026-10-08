@@ -102,6 +102,22 @@ impl BoardNode {
         Some(&self.text)
     }
 
+    /// Whether `image` is one of the attached references rather than an output.
+    pub fn is_reference(&self, image: &str) -> bool {
+        let matches = |url: &String| url == image;
+        !self.images.iter().any(matches) && self.attachments.iter().any(matches)
+    }
+
+    /// The list `image` is browsed within: the attached references when it is
+    /// one of them, otherwise the generated images.
+    pub fn image_set(&self, image: &str) -> &[String] {
+        if self.is_reference(image) {
+            &self.attachments
+        } else {
+            &self.images
+        }
+    }
+
     pub fn token_count(&self) -> u64 {
         let Some(usage) = &self.usage else { return 0 };
         usage.get("input_tokens").copied().unwrap_or(0)
@@ -127,11 +143,18 @@ pub struct Board {
 pub struct BoardSummary {
     pub id: String,
     pub title: String,
-    pub created_at: i64,
     pub updated_at: i64,
     pub image_count: usize,
     pub last_image: Option<String>,
     pub total_tokens: u64,
+}
+
+/// Replaces a node's reference images: stored URLs to keep, in order, then
+/// files to import.
+#[derive(Clone, Debug, Default)]
+pub struct AttachmentEdit {
+    pub keep: Vec<String>,
+    pub add: Vec<std::path::PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -146,7 +169,7 @@ pub struct NewNodesRequest {
     pub count: usize,
     pub attachment_paths: Vec<std::path::PathBuf>,
     pub attachment_urls: Vec<String>,
-    /// Pins the new nodes at an explicit canvas position instead of letting
-    /// the tree layout place them.
+    /// Pins the new nodes in a row starting at this canvas position instead
+    /// of letting the tree layout place them.
     pub position: Option<(f32, f32)>,
 }

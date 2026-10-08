@@ -139,9 +139,6 @@ pub fn wrap_prompt(value: &str, max_graphemes: usize) -> Vec<String> {
         }
     }
 
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
     lines
 }
 
@@ -178,25 +175,34 @@ pub fn output_layout(node: &BoardNode, ratios: &HashMap<String, f32>) -> OutputL
             }
         }
         2..=4 => {
-            let cell_width = (CARD_WIDTH - MEDIA_GAP) / 2.;
+            // Three outputs lead with a full-width image rather than leaving
+            // the fourth cell of a grid empty.
+            let rows: &[usize] = match urls.len() {
+                2 => &[2],
+                3 => &[1, 2],
+                _ => &[2, 2],
+            };
             let mut cells = Vec::with_capacity(urls.len());
             let mut y = 0.;
-            for (row, chunk) in urls.chunks(2).enumerate() {
-                let row_height = chunk
+            let mut index = 0;
+            for &columns in rows {
+                let cell_width = (CARD_WIDTH - MEDIA_GAP * (columns - 1) as f32) / columns as f32;
+                let row_height = urls[index..index + columns]
                     .iter()
                     .map(|url| image_height(cell_width, output_ratio(node, url, ratios)))
                     .fold(0_f32, f32::max);
-                for (column, _) in chunk.iter().enumerate() {
+                for column in 0..columns {
                     cells.push(OutputCell {
-                        index: row * 2 + column,
+                        index: index + column,
                         x: column as f32 * (cell_width + MEDIA_GAP),
                         y,
                         width: cell_width,
                         height: row_height,
                     });
                 }
+                index += columns;
                 y += row_height;
-                if row * 2 + chunk.len() < urls.len() {
+                if index < urls.len() {
                     y += MEDIA_GAP;
                 }
             }

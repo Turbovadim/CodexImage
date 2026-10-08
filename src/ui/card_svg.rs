@@ -240,7 +240,14 @@ mod tests {
                 .expect("rendered sprite text");
             image.as_bytes(0).expect("pixels").to_vec()
         };
-        let ink = |pixels: &[u8]| pixels.chunks_exact(4).filter(|pixel| pixel[3] > 0).count();
+        let ink = |pixels: &[u8]| {
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|pixel| pixel[3] > 0)
+                .count()
+        };
 
         let sprite = render(crate::ui::theme::CARD_FONT_SVG_FAMILIES);
         assert!(ink(&sprite) > 0, "the sprite face drew nothing");

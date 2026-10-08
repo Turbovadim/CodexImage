@@ -2,8 +2,7 @@
 //!
 //! Card sprites are encoded as SVG, so every colour has to be expressible both
 //! as a GPUI `Hsla` and as an SVG `#rrggbb` string. Both are derived from the
-//! constants here; they used to be written out twice and could drift apart
-//! without anything noticing.
+//! constants here so they cannot drift apart.
 
 use gpui::{Hsla, rgb};
 

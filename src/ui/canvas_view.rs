@@ -26,7 +26,7 @@ use gpui::{
     div, fill, point, prelude::*, px, size,
 };
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub(super) const NODE_TOOLBAR_HEIGHT: f32 = 36.;
 /// World-space toolbar metrics; everything scales with the canvas zoom so the
@@ -38,7 +38,7 @@ const TOOLBAR_RIGHT_MARGIN: f32 = 4.;
 const MIN_ZOOM: f32 = 0.08;
 const MAX_ZOOM: f32 = 2.;
 /// How long zoom must hold still before sprites re-render for the new tier.
-const ZOOM_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+const ZOOM_SETTLE_DELAY: Duration = Duration::from_millis(150);
 /// Only the elapsed-time label needs a clock. Generation activity arrives
 /// through repository events; no decorative animation keeps the canvas busy.
 const RUNNING_STATUS_INTERVAL: Duration = Duration::from_secs(1);
@@ -48,6 +48,25 @@ const MINIMAP_RIGHT: f32 = 18.;
 const MINIMAP_BOTTOM: f32 = 24.;
 /// Vertical band reserved for the board switcher and gallery button.
 const HEADER_CLEARANCE: f32 = 60.;
+/// Vertical band the composer covers at the bottom of the canvas.
+const COMPOSER_CLEARANCE: f32 = 100.;
+/// Long enough to show where the camera went, short enough not to wait on.
+const CAMERA_GLIDE: Duration = Duration::from_millis(220);
+
+#[derive(Clone, Copy, PartialEq)]
+pub(in crate::ui) struct Camera {
+    x: f32,
+    y: f32,
+    zoom: f32,
+}
+
+/// A finite move of the camera to a destination, for jumps the user did not
+/// steer by hand. Any direct pan or zoom cancels it.
+pub(in crate::ui) struct CameraGlide {
+    from: Camera,
+    to: Camera,
+    started: Instant,
+}
 
 #[derive(Clone, Copy)]
 struct MinimapNodeRect {
@@ -301,21 +320,120 @@ impl AppView {
             max_x = max_x.max(position.x + CARD_WIDTH);
             max_y = max_y.max(position.y + self.card_height(node));
         }
+        // Fit into what the header and composer leave uncovered.
         let viewport = window.viewport_size();
         let width = f32::from(viewport.width) - 100.;
-        let height = f32::from(viewport.height) - 150.;
-        let old_zoom = self.zoom;
-        self.zoom = (width / (max_x - min_x).max(1.))
+        let height = f32::from(viewport.height) - HEADER_CLEARANCE - COMPOSER_CLEARANCE - 40.;
+        let zoom = (width / (max_x - min_x).max(1.))
             .min(height / (max_y - min_y).max(1.))
             .clamp(MIN_ZOOM, 1.);
-        if self.zoom != old_zoom {
+        let free_centre_y =
+            (HEADER_CLEARANCE + f32::from(viewport.height) - COMPOSER_CLEARANCE) / 2.;
+        self.glide_camera_to(
+            Camera {
+                x: (f32::from(viewport.width) - (max_x - min_x) * zoom) / 2. - min_x * zoom,
+                y: free_centre_y - (max_y - min_y) * zoom / 2. - min_y * zoom,
+                zoom,
+            },
+            cx,
+        );
+    }
+
+    /// Where the camera is, or where it is headed while a glide runs, so
+    /// repeated zoom steps compound instead of restarting from mid-flight.
+    fn camera_destination(&self) -> Camera {
+        self.camera_glide.as_ref().map_or(
+            Camera {
+                x: self.camera_x,
+                y: self.camera_y,
+                zoom: self.zoom,
+            },
+            |glide| glide.to,
+        )
+    }
+
+    fn glide_camera_to(&mut self, to: Camera, cx: &mut Context<Self>) {
+        let from = Camera {
+            x: self.camera_x,
+            y: self.camera_y,
+            zoom: self.zoom,
+        };
+        if from == to {
+            return;
+        }
+        if from.zoom != to.zoom {
+            // Sprites wait for the zoom to land, exactly as during a pinch.
+            self.zoom_settled = false;
+            self.zoom_settle_task.take();
+        }
+        self.camera_glide = Some(CameraGlide {
+            from,
+            to,
+            started: Instant::now(),
+        });
+        cx.notify();
+    }
+
+    /// Hands the camera back to the user mid-glide.
+    fn stop_camera_glide(&mut self, cx: &mut Context<Self>) {
+        if self.camera_glide.take().is_some() && !self.zoom_settled {
             self.schedule_zoom_settle(cx);
         }
-        self.camera_x =
-            (f32::from(viewport.width) - (max_x - min_x) * self.zoom) / 2. - min_x * self.zoom;
-        self.camera_y =
-            (f32::from(viewport.height) - (max_y - min_y) * self.zoom) / 2. - min_y * self.zoom;
-        cx.notify();
+    }
+
+    /// Moves the camera one frame along its glide. The world point under the
+    /// viewport centre travels in a straight line while the zoom eases
+    /// geometrically, which keeps the motion from swinging sideways.
+    fn advance_camera_glide(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let Some(glide) = &self.camera_glide else {
+            return;
+        };
+        let (from, to) = (glide.from, glide.to);
+        let progress = glide.started.elapsed().as_secs_f32() / CAMERA_GLIDE.as_secs_f32();
+        if progress >= 1. {
+            self.camera_glide = None;
+            (self.camera_x, self.camera_y, self.zoom) = (to.x, to.y, to.zoom);
+            if !self.zoom_settled {
+                self.schedule_zoom_settle(cx);
+            }
+            return;
+        }
+        let eased = 1. - (1. - progress).powi(3);
+        let viewport = window.viewport_size();
+        let centre = (
+            f32::from(viewport.width) / 2.,
+            f32::from(viewport.height) / 2.,
+        );
+        let world = |camera: Camera| {
+            (
+                (centre.0 - camera.x) / camera.zoom,
+                (centre.1 - camera.y) / camera.zoom,
+            )
+        };
+        let (from_world, to_world) = (world(from), world(to));
+        self.zoom = from.zoom * (to.zoom / from.zoom).powf(eased);
+        self.camera_x = centre.0 - (from_world.0 + (to_world.0 - from_world.0) * eased) * self.zoom;
+        self.camera_y = centre.1 - (from_world.1 + (to_world.1 - from_world.1) * eased) * self.zoom;
+        window.request_animation_frame();
+    }
+
+    /// One zoom step about the viewport centre, for the buttons and shortcuts.
+    fn zoom_step(&mut self, factor: f32, window: &Window, cx: &mut Context<Self>) {
+        let camera = self.camera_destination();
+        let zoom = (camera.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        let viewport = window.viewport_size();
+        let centre = (
+            f32::from(viewport.width) / 2.,
+            f32::from(viewport.height) / 2.,
+        );
+        self.glide_camera_to(
+            Camera {
+                x: centre.0 - (centre.0 - camera.x) / camera.zoom * zoom,
+                y: centre.1 - (centre.1 - camera.y) / camera.zoom * zoom,
+                zoom,
+            },
+            cx,
+        );
     }
 
     pub(super) fn fit_action(
@@ -330,13 +448,11 @@ impl AppView {
     }
 
     pub(super) fn zoom_in(&mut self, _: &ZoomIn, window: &mut Window, cx: &mut Context<Self>) {
-        let viewport = window.viewport_size();
-        self.zoom_at(point(viewport.width / 2., viewport.height / 2.), 1.25, cx);
+        self.zoom_step(1.25, window, cx);
     }
 
     pub(super) fn zoom_out(&mut self, _: &ZoomOut, window: &mut Window, cx: &mut Context<Self>) {
-        let viewport = window.viewport_size();
-        self.zoom_at(point(viewport.width / 2., viewport.height / 2.), 0.8, cx);
+        self.zoom_step(0.8, window, cx);
     }
 
     /// Returns the canvas to 1:1 without moving what is under the viewport centre.
@@ -349,15 +465,11 @@ impl AppView {
         if !matches!(self.overlay, Overlay::None) {
             return;
         }
-        let viewport = window.viewport_size();
-        self.zoom_at(
-            point(viewport.width / 2., viewport.height / 2.),
-            1. / self.zoom,
-            cx,
-        );
+        self.zoom_step(1. / self.camera_destination().zoom, window, cx);
     }
 
     fn zoom_at(&mut self, position: Point<Pixels>, factor: f32, cx: &mut Context<Self>) {
+        self.stop_camera_glide(cx);
         let old = self.zoom;
         let new = (old * factor).clamp(MIN_ZOOM, MAX_ZOOM);
         if new == old {
@@ -388,18 +500,19 @@ impl AppView {
             return;
         };
         self.overlay = Overlay::None;
-        let old_zoom = self.zoom;
-        self.zoom = 1.;
-        if self.zoom != old_zoom {
-            self.schedule_zoom_settle(cx);
-        }
-        self.camera_x =
-            f32::from(window.viewport_size().width) / 2. - (position.x + CARD_WIDTH / 2.);
-        self.camera_y = 100. - position.y;
+        self.glide_camera_to(
+            Camera {
+                x: f32::from(window.viewport_size().width) / 2. - (position.x + CARD_WIDTH / 2.),
+                y: 100. - position.y,
+                zoom: 1.,
+            },
+            cx,
+        );
         cx.notify();
     }
 
     pub(super) fn render_canvas(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        self.advance_camera_glide(window, cx);
         let viewport = window.viewport_size();
         let minimap = self.render_minimap(viewport, cx);
         let zoom_controls = self.render_zoom_controls(cx);
@@ -720,11 +833,6 @@ impl AppView {
         viewport: gpui::Size<Pixels>,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        const WIDTH: f32 = MINIMAP_WIDTH;
-        const HEIGHT: f32 = MINIMAP_HEIGHT;
-        const RIGHT: f32 = MINIMAP_RIGHT;
-        const BOTTOM: f32 = MINIMAP_BOTTOM;
-
         let scene = self.minimap_scene.as_ref()?;
         let min_x = scene.min_x;
         let min_y = scene.min_y;
@@ -772,8 +880,8 @@ impl AppView {
             },
         )
         .size_full();
-        let origin_x = viewport_width - RIGHT - WIDTH;
-        let origin_y = viewport_height - BOTTOM - HEIGHT;
+        let origin_x = viewport_width - MINIMAP_RIGHT - MINIMAP_WIDTH;
+        let origin_y = viewport_height - MINIMAP_BOTTOM - MINIMAP_HEIGHT;
         Some(
             div()
                 .id("minimap")
@@ -781,10 +889,10 @@ impl AppView {
                 .role(Role::Button)
                 .aria_label("Canvas minimap. Click to move the camera")
                 .absolute()
-                .right(px(RIGHT))
-                .bottom(px(BOTTOM))
-                .w(px(WIDTH))
-                .h(px(HEIGHT))
+                .right(px(MINIMAP_RIGHT))
+                .bottom(px(MINIMAP_BOTTOM))
+                .w(px(MINIMAP_WIDTH))
+                .h(px(MINIMAP_HEIGHT))
                 .overflow_hidden()
                 .rounded_lg()
                 .border_1()
@@ -803,9 +911,15 @@ impl AppView {
                         let local_y = f32::from(event.position.y) - origin_y;
                         let world_x = min_x + (local_x - offset_x) / scale;
                         let world_y = min_y + (local_y - offset_y) / scale;
-                        this.camera_x = viewport_width / 2. - world_x * this.zoom;
-                        this.camera_y = viewport_height / 2. - world_y * this.zoom;
-                        cx.notify();
+                        let zoom = this.camera_destination().zoom;
+                        this.glide_camera_to(
+                            Camera {
+                                x: viewport_width / 2. - world_x * zoom,
+                                y: viewport_height / 2. - world_y * zoom,
+                                zoom,
+                            },
+                            cx,
+                        );
                     }),
                 )
                 .into_any_element(),
@@ -878,6 +992,18 @@ impl AppView {
         } else {
             ATTACHMENT_ROW_HEIGHT
         };
+        // Mirrors the 36px thumbnails `card_scene` paints every 42px.
+        let thumb_x = local_x - 14.;
+        if (prompt_height + 8. ..=prompt_height + 44.).contains(&local_y)
+            && thumb_x >= 0.
+            && thumb_x % 42. <= 36.
+            && let Some(url) = canvas_node.node.attachments.get((thumb_x / 42.) as usize)
+        {
+            return Some(CanvasClickTarget::Image {
+                node_id: canvas_node.node.id.clone(),
+                url: url.clone(),
+            });
+        }
         let media_top = prompt_height + attachment_height + 26. + MEDIA_GAP;
         let media_y = local_y - media_top;
         if media_y >= 0. && media_y <= canvas_node.output_layout.height() {
@@ -966,6 +1092,7 @@ impl AppView {
             return;
         }
         window.focus(&self.focus, cx);
+        self.stop_camera_glide(cx);
         if let Some((index, origin)) = self.canvas_node_at(event.position) {
             let canvas_node = &self.canvas_nodes[index];
             self.drag = match self.canvas_click_target(canvas_node, event.position, origin) {
@@ -997,6 +1124,7 @@ impl AppView {
             let factor = (-f32::from(delta.y) * 0.004).exp();
             self.zoom_at(event.position, factor, cx);
         } else {
+            self.stop_camera_glide(cx);
             self.camera_x += f32::from(delta.x);
             self.camera_y += f32::from(delta.y);
             cx.notify();
@@ -1150,7 +1278,7 @@ impl AppView {
             ToolbarAction::Retry => self.regenerate_node(node_id, window, cx),
             ToolbarAction::Copy => {
                 if let Some(node) = self.node(node_id) {
-                    cx.write_to_clipboard(ClipboardItem::new_string(node.prompt));
+                    cx.write_to_clipboard(ClipboardItem::new_string(node.prompt.clone()));
                     self.show_toast("Prompt copied".into(), false, None, cx);
                 }
             }

@@ -5,6 +5,7 @@ use super::card::{
     ATTACHED_TEXT_HEIGHT, ATTACHMENT_ROW_HEIGHT, COLLAPSED_PROMPT_LINES, CanvasImageAsset,
     CanvasNode, EXPANDED_PROMPT_LINES, MEDIA_GAP, OutputLayout, PROMPT_LINE_HEIGHT,
     SHOW_MORE_HEIGHT, attached_text_height, card_height_from_metadata, status_area_height,
+    wrap_prompt,
 };
 use super::theme;
 use crate::layout::CARD_WIDTH;
@@ -180,8 +181,22 @@ impl CardScene {
     }
 }
 
-pub fn build_card_scene(canvas_node: &CanvasNode, expanded: bool) -> CardScene {
+/// Wraps `text` to `width` graphemes and keeps the first `max_lines`, ending
+/// in an ellipsis when something was cut. The full text opens on click.
+fn clamp_lines(text: &str, width: usize, max_lines: usize) -> Vec<String> {
+    let mut lines = wrap_prompt(text, width);
+    if lines.len() > max_lines {
+        lines.truncate(max_lines);
+        if let Some(last) = lines.last_mut() {
+            last.push('…');
+        }
+    }
+    lines
+}
+
+pub fn build_card_scene(canvas_node: &CanvasNode) -> CardScene {
     let node = &canvas_node.node;
+    let expanded = canvas_node.expanded;
     let mut scene = CardScene {
         height: card_height_from_metadata(
             node,
@@ -189,15 +204,13 @@ pub fn build_card_scene(canvas_node: &CanvasNode, expanded: bool) -> CardScene {
             canvas_node.prompt_lines.len(),
             canvas_node.output_layout.height(),
         ),
-        primitives: Vec::new(),
-        has_blurred_images: false,
-        max_high_resolution_dimension: 0.,
+        ..Default::default()
     };
     // While the generation runs, any displayed image is an intermediate
     // attempt; blur it so the card marks progress without spoiling the result.
     let running = node.status == NodeStatus::Running;
     let blur_outputs = running && node.images.is_empty();
-    let border = if node.status == NodeStatus::Running {
+    let border = if running {
         CardColor::Accent45
     } else {
         CardColor::Line
@@ -311,9 +324,13 @@ pub fn build_card_scene(canvas_node: &CanvasNode, expanded: bool) -> CardScene {
         OutputLayout::None => {}
         OutputLayout::Tiles { height, cells } => {
             let media = CardRect::new(0., cursor_y, CARD_WIDTH, *height);
-            scene.quad(media, 0., CardColor::Hover, None);
+            let fill = if cells.is_empty() {
+                CardColor::Raised
+            } else {
+                CardColor::Hover
+            };
+            scene.quad(media, 0., fill, None);
             if cells.is_empty() {
-                scene.quad(media, 0., CardColor::Raised, None);
                 scene.text(
                     "Generating…",
                     media,
@@ -446,14 +463,20 @@ pub fn build_card_scene(canvas_node: &CanvasNode, expanded: bool) -> CardScene {
                 CardColor::Danger,
                 TextAlign::Center,
             );
-            scene.text(
-                canvas_node.status_message.clone(),
-                CardRect::new(18., cursor_y + 45., CARD_WIDTH - 36., 32.),
-                11.5,
-                16.,
-                CardColor::Danger,
-                TextAlign::Center,
-            );
+            // Two centred lines fill the 32px message block; a single line
+            // sits in its middle.
+            let lines = clamp_lines(&canvas_node.status_message, 50, 2);
+            let first_y = cursor_y + 45. + (2 - lines.len().min(2)) as f32 * 8.;
+            for (index, line) in lines.into_iter().enumerate() {
+                scene.text(
+                    line,
+                    CardRect::new(18., first_y + index as f32 * 16., CARD_WIDTH - 36., 16.),
+                    11.5,
+                    16.,
+                    CardColor::Danger,
+                    TextAlign::Center,
+                );
+            }
             let text_offset = attached_text_height(node);
             if text_offset > 0. {
                 scene.text(
@@ -482,7 +505,9 @@ pub fn build_card_scene(canvas_node: &CanvasNode, expanded: bool) -> CardScene {
         NodeStatus::Error | NodeStatus::Stopped => {
             let message_height = status_height - attached_text_height(node);
             scene.text(
-                canvas_node.status_message.clone(),
+                clamp_lines(&canvas_node.status_message, 44, 1)
+                    .pop()
+                    .unwrap_or_default(),
                 CardRect::new(14., cursor_y, CARD_WIDTH - 90., message_height),
                 10.8,
                 message_height,

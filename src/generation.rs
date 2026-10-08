@@ -2,11 +2,12 @@ mod codex;
 pub(crate) mod conditioner;
 mod prompt;
 
-pub use conditioner::{condition_image_for_reingestion, run_condition_image_cli};
+pub use conditioner::run_condition_image_cli;
 
 use crate::manifest::{OutputManifest, absolute_file_path, is_canonical_path_inside};
 use crate::model::{
-    Board, BoardNode, ChatRole, MAX_ACTIVE_PER_BOARD, NewNodesRequest, NodeStatus, StopReason,
+    AttachmentEdit, Board, BoardNode, ChatRole, MAX_ACTIVE_PER_BOARD, NewNodesRequest, NodeStatus,
+    StopReason,
 };
 use crate::settings::Settings;
 use crate::storage::{Repository, now_ms};
@@ -29,7 +30,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(1_200);
-const FINAL_SWEEP_DELAY: Duration = Duration::from_millis(800);
+/// A new file is imported once two looks this far apart see the same size.
+const STABILITY_RECHECK: Duration = Duration::from_millis(300);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 #[cfg(unix)]
 const FORCE_KILL_SIGNAL: i32 = libc::SIGKILL;
@@ -155,6 +157,12 @@ impl GenerationEngine {
         self.inner.settings.clone()
     }
 
+    /// Resolving Codex runs a login shell, which would otherwise delay the
+    /// first generation. Call from a background thread at startup.
+    pub fn resolve_codex(&self) {
+        self.codex_invocation();
+    }
+
     fn codex_invocation(&self) -> &CodexInvocation {
         self.inner.codex.get_or_init(CodexInvocation::resolve)
     }
@@ -167,8 +175,9 @@ impl GenerationEngine {
         self.inner.jobs.lock().len()
     }
 
-    pub fn active_node_ids(&self) -> HashSet<String> {
-        self.inner.jobs.lock().keys().cloned().collect()
+    /// Whether any generation or chat is running a Codex process.
+    pub fn is_busy(&self) -> bool {
+        !self.inner.jobs.lock().is_empty() || !self.inner.chats.lock().is_empty()
     }
 
     pub fn add_and_start(
@@ -207,13 +216,17 @@ impl GenerationEngine {
         node_id: &str,
         prompt: Option<String>,
         aspect: Option<String>,
+        attachments: Option<AttachmentEdit>,
     ) -> Result<()> {
         let _submission = self.inner.submission_lock.lock();
         self.stop(node_id, Termination::Replaced, FORCE_KILL_SIGNAL);
-        let node = self
-            .inner
-            .repository
-            .regenerate_node(board_id, node_id, prompt, aspect)?;
+        let node = self.inner.repository.regenerate_node(
+            board_id,
+            node_id,
+            prompt,
+            aspect,
+            attachments,
+        )?;
         let board = self
             .inner
             .repository
@@ -254,6 +267,7 @@ impl GenerationEngine {
             .chats
             .lock()
             .insert(node_id.to_owned(), Arc::clone(&control));
+        self.inner.repository.emit_work_changed();
         let engine = self.clone();
         let worker_control = Arc::clone(&control);
         if let Err(error) = thread::Builder::new()
@@ -300,6 +314,8 @@ impl GenerationEngine {
             .is_some_and(|current| Arc::ptr_eq(current, &control))
         {
             chats.remove(&control.node_id);
+            drop(chats);
+            self.inner.repository.emit_work_changed();
         }
     }
 
@@ -453,6 +469,7 @@ impl GenerationEngine {
             .jobs
             .lock()
             .insert(node_id.clone(), control.clone());
+        self.inner.repository.emit_work_changed();
         let engine = self.clone();
         let worker_control = control.clone();
         if let Err(error) = thread::Builder::new()
@@ -596,7 +613,14 @@ impl GenerationEngine {
         let mut stdout_open = true;
         let mut log_dirty = false;
         let exit_status = loop {
-            let wait = POLL_INTERVAL.saturating_sub(last_poll.elapsed());
+            // A file awaiting its second look is checked again promptly, so an
+            // image shows up right after Codex writes it.
+            let poll_interval = if runtime.sizes.is_empty() {
+                POLL_INTERVAL
+            } else {
+                STABILITY_RECHECK
+            };
+            let wait = poll_interval.saturating_sub(last_poll.elapsed());
             if stdout_open {
                 match line_rx.recv_timeout(wait) {
                     Ok(line) => {
@@ -620,7 +644,7 @@ impl GenerationEngine {
                 log_dirty = true;
                 self.handle_event(board, node, &mut runtime, &line);
             }
-            if last_poll.elapsed() >= POLL_INTERVAL {
+            if last_poll.elapsed() >= poll_interval {
                 // Keep logs externally observable without turning the 64 KiB
                 // buffer back into one write syscall per streamed JSON line.
                 if log_dirty {
@@ -658,8 +682,10 @@ impl GenerationEngine {
         }
 
         let _ = self.collect_images(board, node, control, &mut runtime);
-        thread::sleep(FINAL_SWEEP_DELAY);
-        let _ = self.collect_images(board, node, control, &mut runtime);
+        if !runtime.sizes.is_empty() {
+            thread::sleep(STABILITY_RECHECK);
+            let _ = self.collect_images(board, node, control, &mut runtime);
+        }
         if !self.is_current(control) {
             return Ok(());
         }
@@ -784,6 +810,10 @@ impl GenerationEngine {
                 }
                 let canonical = path.canonicalize()?;
                 if !is_canonical_path_inside(&canonical_directory, &canonical) {
+                    // Settled as unusable; a lingering size would keep the
+                    // fast recheck running for the rest of the job.
+                    runtime.sizes.remove(&path);
+                    runtime.seen.insert(path);
                     continue;
                 }
                 let url = self
@@ -906,15 +936,10 @@ impl GenerationEngine {
     }
 
     fn record_timeout(&self, board: &Board, node: &BoardNode) -> Result<()> {
-        let attempts = self
-            .inner
-            .repository
-            .node(&board.id, &node.id)
-            .map(|node| node.attempts.len())
-            .unwrap_or(0);
         self.inner
             .repository
             .mutate_node(&board.id, &node.id, |node| {
+                let attempts = node.attempts.len();
                 node.status = NodeStatus::Error;
                 node.error = Some(format!(
                     "No generation activity for 20 minutes. {}",
@@ -1047,6 +1072,8 @@ impl GenerationEngine {
         let mut command = self.codex_invocation().command();
         command
             .arg("exec")
+            // The app keeps its own history; avoid duplicate Codex session files.
+            .arg("--ephemeral")
             .arg("-s")
             .arg(sandbox.as_arg())
             .arg("-C")
@@ -1093,6 +1120,8 @@ impl GenerationEngine {
             .is_some_and(|current| Arc::ptr_eq(current, control))
         {
             jobs.remove(&control.node_id);
+            drop(jobs);
+            self.inner.repository.emit_work_changed();
         }
     }
 

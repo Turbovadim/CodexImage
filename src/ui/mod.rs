@@ -23,7 +23,5 @@ mod overlays;
 mod settings_panel;
 mod theme;
 mod tooltip;
-#[cfg(target_os = "macos")]
-mod window_memory;
 
 pub use app::run;

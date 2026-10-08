@@ -16,7 +16,7 @@ use gpui::{
     MouseUpEvent, ObjectFit, PinchEvent, Pixels, Point, Resource, Role, ScrollWheelEvent,
     StyledImage, Window, div, img, prelude::*, px,
 };
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -37,6 +37,30 @@ pub(super) struct Lightbox {
     pub(super) pan_x: f32,
     pub(super) pan_y: f32,
     pub(super) pending: Option<LightboxLocation>,
+    pub(super) memory: LightboxMemory,
+}
+
+/// Where vertical navigation returns to: the image last shown on each card,
+/// and the card below each card that the user last moved through. Left/right
+/// updates the image memory, so up then down comes back to the swapped image.
+#[derive(Default)]
+pub(super) struct LightboxMemory {
+    last_image: HashMap<String, String>,
+    descent: HashMap<String, String>,
+}
+
+impl LightboxMemory {
+    fn remember(&mut self, location: &LightboxLocation) {
+        self.last_image
+            .insert(location.node_id.clone(), location.image.clone());
+    }
+
+    fn image_for<'a>(&'a self, node: &'a BoardNode) -> Option<&'a String> {
+        self.last_image
+            .get(&node.id)
+            .filter(|image| node.images.contains(image))
+            .or_else(|| node.images.first())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,13 +88,10 @@ impl Lightbox {
     }
 
     fn commit_pending(&mut self, expected: &LightboxLocation) -> bool {
-        if self.pending.as_ref() != Some(expected) {
+        let Some(target) = self.pending.take_if(|pending| pending == expected) else {
             return false;
-        }
-        let target = self
-            .pending
-            .take()
-            .expect("pending target was just checked");
+        };
+        self.memory.remember(&target);
         self.node_id = target.node_id;
         self.image = target.image;
         self.reset_view();
@@ -173,6 +194,7 @@ pub(super) fn fitted_image_size(
 
 pub(super) fn lightbox_target(
     board: &Board,
+    memory: &LightboxMemory,
     current: &LightboxLocation,
     horizontal: i32,
     vertical: i32,
@@ -182,22 +204,32 @@ pub(super) fn lightbox_target(
     }
     let node = board.nodes.iter().find(|node| node.id == current.node_id)?;
     if horizontal != 0 {
-        let index = node
-            .images
+        let images = node.image_set(&current.image);
+        let index = images
             .iter()
             .position(|image| image == &current.image)
             .unwrap_or(0) as i32
             + horizontal;
-        if index >= 0 && (index as usize) < node.images.len() {
+        if index >= 0 && (index as usize) < images.len() {
             return Some(LightboxLocation {
                 node_id: node.id.clone(),
-                image: node.images[index as usize].clone(),
+                image: images[index as usize].clone(),
             });
         }
+        // Reference images are browsed on their own and never hop cards.
+        if node.is_reference(&current.image) {
+            return None;
+        }
+        // Past the card's edge, only single-image cards hop between each
+        // other. Multi-image cards stay self-contained so left/right never
+        // leaves them, and they are never landed on from a sibling.
         // Siblings share a parent; top-level cards share having none.
         // Horizontal navigation runs during both render and prefetch. Select
         // the neighboring sort key in-place instead of allocating and sorting
         // every sibling on each call.
+        if node.images.len() != 1 {
+            return None;
+        }
         let mut sibling = node;
         for _ in 0..horizontal.unsigned_abs() {
             let key = (sibling.created_at, sibling.id.as_str());
@@ -207,7 +239,7 @@ pub(super) fn lightbox_target(
                     .iter()
                     .filter(|candidate| {
                         candidate.parent_id == node.parent_id
-                            && !candidate.images.is_empty()
+                            && candidate.images.len() == 1
                             && (candidate.created_at, candidate.id.as_str()) > key
                     })
                     .min_by_key(|candidate| (candidate.created_at, candidate.id.as_str()))?
@@ -217,7 +249,7 @@ pub(super) fn lightbox_target(
                     .iter()
                     .filter(|candidate| {
                         candidate.parent_id == node.parent_id
-                            && !candidate.images.is_empty()
+                            && candidate.images.len() == 1
                             && (candidate.created_at, candidate.id.as_str()) < key
                     })
                     .max_by_key(|candidate| (candidate.created_at, candidate.id.as_str()))?
@@ -237,7 +269,7 @@ pub(super) fn lightbox_target(
         let mut parent_id = node.parent_id.as_deref();
         while let Some(id) = parent_id {
             let parent = board.nodes.iter().find(|candidate| candidate.id == id)?;
-            if let Some(image) = parent.images.first() {
+            if let Some(image) = memory.image_for(parent) {
                 return Some(LightboxLocation {
                     node_id: parent.id.clone(),
                     image: image.clone(),
@@ -248,13 +280,26 @@ pub(super) fn lightbox_target(
         return None;
     }
 
+    // Return to the card the user last came up from, if it is still below.
+    let remembered = memory
+        .descent
+        .get(&node.id)
+        .and_then(|id| board.nodes.iter().find(|candidate| &candidate.id == id))
+        .filter(|candidate| is_descendant(board, candidate, &node.id))
+        .and_then(|child| Some((child, memory.image_for(child)?)));
+    if let Some((child, image)) = remembered {
+        return Some(LightboxLocation {
+            node_id: child.id.clone(),
+            image: image.clone(),
+        });
+    }
     let mut queue: VecDeque<&BoardNode> = board
         .nodes
         .iter()
         .filter(|candidate| candidate.parent_id.as_deref() == Some(&node.id))
         .collect();
     while let Some(child) = queue.pop_front() {
-        if let Some(image) = child.images.first() {
+        if let Some(image) = memory.image_for(child) {
             return Some(LightboxLocation {
                 node_id: child.id.clone(),
                 image: image.clone(),
@@ -268,6 +313,21 @@ pub(super) fn lightbox_target(
         );
     }
     None
+}
+
+fn is_descendant(board: &Board, node: &BoardNode, ancestor_id: &str) -> bool {
+    let mut parent_id = node.parent_id.as_deref();
+    while let Some(id) = parent_id {
+        if id == ancestor_id {
+            return true;
+        }
+        parent_id = board
+            .nodes
+            .iter()
+            .find(|candidate| candidate.id == id)
+            .and_then(|parent| parent.parent_id.as_deref());
+    }
+    false
 }
 
 impl AppView {
@@ -309,6 +369,11 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let mut memory = LightboxMemory::default();
+        memory.remember(&LightboxLocation {
+            node_id: node_id.clone(),
+            image: image.clone(),
+        });
         self.overlay = Overlay::Lightbox(Lightbox {
             node_id,
             image,
@@ -316,6 +381,7 @@ impl AppView {
             pan_x: 0.,
             pan_y: 0.,
             pending: None,
+            memory,
         });
         window.focus(&self.lightbox_focus, cx);
         cx.notify();
@@ -327,12 +393,24 @@ impl AppView {
         };
         let Some(board) = &self.board else { return };
         let origin = current.navigation_origin();
-        let Some(target) = lightbox_target(board, &origin, horizontal, vertical) else {
+        let Some(target) = lightbox_target(board, &current.memory, &origin, horizontal, vertical)
+        else {
             return;
         };
         let Overlay::Lightbox(current) = &mut self.overlay else {
             return;
         };
+        if vertical < 0 {
+            current
+                .memory
+                .descent
+                .insert(target.node_id.clone(), origin.node_id);
+        } else if vertical > 0 {
+            current
+                .memory
+                .descent
+                .insert(origin.node_id, target.node_id.clone());
+        }
         current.request(target);
         cx.notify();
     }
@@ -367,17 +445,19 @@ impl AppView {
             self.show_error(error, cx);
         }
 
-        let Some((board, current)) = self.board.as_ref().and_then(|board| {
+        let Some((board, lightbox)) = self.board.as_ref().and_then(|board| {
             let Overlay::Lightbox(lightbox) = &self.overlay else {
                 return None;
             };
-            Some((board, lightbox.displayed_location()))
+            Some((board, lightbox))
         }) else {
             return;
         };
+        let current = lightbox.displayed_location();
         let mut previous_path = None;
         for horizontal in [-1, 1] {
-            let Some(target) = lightbox_target(board, &current, horizontal, 0) else {
+            let Some(target) = lightbox_target(board, &lightbox.memory, &current, horizontal, 0)
+            else {
                 continue;
             };
             let path = self.display_image_path(&target.image, true);
@@ -480,9 +560,15 @@ impl AppView {
         let image_height = fit_height * lightbox.zoom;
         // Past this displayed size the capped decode would look soft, so ask
         // for the native pixels. The capped decode (or the thumbnail) stays on
-        // screen until the sharper tier finishes loading.
-        let wants_native =
-            image_width.max(image_height) * window.scale_factor() > DECODED_LONG_EDGE_CAP as f32;
+        // screen until the sharper tier finishes loading. A source that fits
+        // the cap was never downscaled, so its capped decode already is native.
+        let source_exceeds_cap = self
+            .board
+            .as_ref()
+            .and_then(|board| board.image_sizes.get(&lightbox.image))
+            .is_none_or(|size| size[0].max(size[1]) > DECODED_LONG_EDGE_CAP);
+        let wants_native = source_exceeds_cap
+            && image_width.max(image_height) * window.scale_factor() > DECODED_LONG_EDGE_CAP as f32;
         let native = wants_native
             .then(|| {
                 self.image_cache
@@ -508,14 +594,12 @@ impl AppView {
             .board
             .as_ref()
             .and_then(|board| board.nodes.iter().find(|node| node.id == lightbox.node_id));
-        let image_index = node
-            .and_then(|node| {
-                node.images
-                    .iter()
-                    .position(|image| image == &lightbox.image)
-            })
+        let images = node.map(|node| node.image_set(&lightbox.image));
+        let is_reference = node.is_some_and(|node| node.is_reference(&lightbox.image));
+        let image_index = images
+            .and_then(|images| images.iter().position(|image| image == &lightbox.image))
             .unwrap_or(0);
-        let total = node.map(|node| node.images.len()).unwrap_or(1);
+        let total = images.map_or(1, <[String]>::len);
         let copy_path = path.clone();
         let save_path = path.clone();
         let open_path = path.clone();
@@ -580,7 +664,6 @@ impl AppView {
                 "×",
                 cx.listener(|this, _, window, cx| {
                     this.close_overlay(window, cx);
-                    cx.notify();
                 }),
             ));
 
@@ -632,7 +715,6 @@ impl AppView {
                         if matches!(&this.overlay, Overlay::Lightbox(lightbox) if lightbox.zoom <= 1.)
                         {
                             this.close_overlay(window, cx);
-                            cx.notify();
                         }
                     }))
                     .child(
@@ -654,7 +736,7 @@ impl AppView {
             if self
                 .board
                 .as_ref()
-                .and_then(|board| lightbox_target(board, &location, direction, 0))
+                .and_then(|board| lightbox_target(board, &lightbox.memory, &location, direction, 0))
                 .is_none()
             {
                 continue;
@@ -694,7 +776,7 @@ impl AppView {
             };
             root = root.child(chevron);
         }
-        if total > 1 {
+        if total > 1 || is_reference {
             root = root.child(
                 div()
                     .id("lightbox-position")
@@ -711,7 +793,11 @@ impl AppView {
                     .aria_label(format!("Image {} of {}", image_index + 1, total))
                     .text_sm()
                     .text_color(theme::ink())
-                    .child(format!("{} / {}", image_index + 1, total)),
+                    .child(if is_reference {
+                        format!("Reference {} / {}", image_index + 1, total)
+                    } else {
+                        format!("{} / {}", image_index + 1, total)
+                    }),
             );
         }
         if lightbox.zoom > 1. {
@@ -783,7 +869,7 @@ impl AppView {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lightbox, LightboxLocation, lightbox_target};
+    use super::{Lightbox, LightboxLocation, LightboxMemory, lightbox_target};
     use crate::model::{Board, BoardNode, NodeStatus};
     use gpui::{point, px};
 
@@ -822,6 +908,7 @@ mod tests {
             pan_x: 40.,
             pan_y: -20.,
             pending: None,
+            memory: LightboxMemory::default(),
         };
         let destination = LightboxLocation {
             node_id: "node-b".into(),
@@ -849,6 +936,7 @@ mod tests {
             pan_x: 0.,
             pan_y: 0.,
             pending: None,
+            memory: LightboxMemory::default(),
         };
 
         lightbox.zoom_at(1.5, point(px(500.), px(400.)), 1_000., 800., 1.);
@@ -870,6 +958,7 @@ mod tests {
             pan_x: 0.,
             pan_y: 0.,
             pending: None,
+            memory: LightboxMemory::default(),
         };
         let focal_x = 200.;
         let image_point_before = (focal_x - lightbox.pan_x) / lightbox.zoom;
@@ -891,6 +980,7 @@ mod tests {
             pan_x: 0.,
             pan_y: 0.,
             pending: None,
+            memory: LightboxMemory::default(),
         };
 
         lightbox.pan_to(999., -999., 1_000., 800., 2.);
@@ -913,35 +1003,133 @@ mod tests {
                 tree_node("empty-child", Some("take-a"), &[], 3),
                 tree_node("descendant", Some("empty-child"), &["d-0", "d-1"], 4),
                 tree_node("other-root", None, &["o-0"], 5),
+                tree_node("single-c", Some("root"), &["c-0"], 6),
+                tree_node("single-d", Some("root"), &["d-single"], 7),
+                tree_node("another-root", None, &["r-0"], 8),
             ],
         };
+        let memory = LightboxMemory::default();
         let a0 = LightboxLocation {
             node_id: "take-a".into(),
             image: "a-0".into(),
         };
-        let a1 = lightbox_target(&board, &a0, 1, 0).expect("next image");
+        let a1 = lightbox_target(&board, &memory, &a0, 1, 0).expect("next image");
         assert_eq!(a1.node_id, "take-a");
         assert_eq!(a1.image, "a-1");
 
-        let b0 = lightbox_target(&board, &a1, 1, 0).expect("next sibling");
-        assert_eq!(b0.node_id, "take-b");
-        assert_eq!(b0.image, "b-0");
-        assert_eq!(lightbox_target(&board, &b0, -1, 0), Some(a1.clone()));
+        // Multi-image cards are self-contained: no hop out at the edge.
+        assert_eq!(lightbox_target(&board, &memory, &a1, 1, 0), None);
+        assert_eq!(lightbox_target(&board, &memory, &a0, -1, 0), None);
+
+        // Single-image siblings hop between each other, skipping multi-image cards.
+        let c0 = LightboxLocation {
+            node_id: "single-c".into(),
+            image: "c-0".into(),
+        };
+        let d = lightbox_target(&board, &memory, &c0, 1, 0).expect("next single sibling");
+        assert_eq!(d.node_id, "single-d");
+        assert_eq!(
+            lightbox_target(&board, &memory, &d, -1, 0),
+            Some(c0.clone())
+        );
+        assert_eq!(lightbox_target(&board, &memory, &c0, -1, 0), None);
 
         // Vertical moves land on the first image of a multi-image card.
-        let parent = lightbox_target(&board, &a0, 0, -1).expect("parent image");
+        let parent = lightbox_target(&board, &memory, &a0, 0, -1).expect("parent image");
         assert_eq!(parent.node_id, "root");
         assert_eq!(parent.image, "root-0");
-        let descendant = lightbox_target(&board, &a0, 0, 1).expect("descendant image");
+        let descendant = lightbox_target(&board, &memory, &a0, 0, 1).expect("descendant image");
         assert_eq!(descendant.node_id, "descendant");
         assert_eq!(descendant.image, "d-0");
 
-        // Top-level cards are siblings of each other.
-        let root_1 = lightbox_target(&board, &parent, 1, 0).expect("next root image");
+        // Top-level single-image cards are siblings of each other.
+        let root_1 = lightbox_target(&board, &memory, &parent, 1, 0).expect("next root image");
         assert_eq!(root_1.image, "root-1");
-        let other_root = lightbox_target(&board, &root_1, 1, 0).expect("next root card");
-        assert_eq!(other_root.node_id, "other-root");
-        assert_eq!(other_root.image, "o-0");
-        assert_eq!(lightbox_target(&board, &other_root, -1, 0), Some(root_1));
+        assert_eq!(lightbox_target(&board, &memory, &root_1, 1, 0), None);
+        let other_root = LightboxLocation {
+            node_id: "other-root".into(),
+            image: "o-0".into(),
+        };
+        let another_root =
+            lightbox_target(&board, &memory, &other_root, 1, 0).expect("next root card");
+        assert_eq!(another_root.node_id, "another-root");
+        assert_eq!(
+            lightbox_target(&board, &memory, &another_root, -1, 0),
+            Some(other_root)
+        );
+    }
+
+    #[test]
+    fn reference_images_are_browsed_apart_from_the_outputs() {
+        let mut node = tree_node("node", None, &["out-0"], 0);
+        node.attachments = vec!["ref-0".into(), "ref-1".into()];
+        let board = Board {
+            id: "board".into(),
+            title: "Board".into(),
+            created_at: 0,
+            image_sizes: Default::default(),
+            nodes: vec![node, tree_node("sibling", None, &["s-0"], 1)],
+        };
+        let memory = LightboxMemory::default();
+        let at = |image: &str| LightboxLocation {
+            node_id: "node".into(),
+            image: image.into(),
+        };
+
+        assert_eq!(
+            lightbox_target(&board, &memory, &at("ref-0"), 1, 0),
+            Some(at("ref-1"))
+        );
+        // The last reference neither wraps into the outputs nor hops cards.
+        assert_eq!(lightbox_target(&board, &memory, &at("ref-1"), 1, 0), None);
+        assert_eq!(
+            lightbox_target(&board, &memory, &at("out-0"), 1, 0).map(|target| target.node_id),
+            Some("sibling".into())
+        );
+    }
+
+    #[test]
+    fn vertical_navigation_returns_to_the_remembered_image_and_card() {
+        let board = Board {
+            id: "board".into(),
+            title: "Board".into(),
+            created_at: 0,
+            image_sizes: Default::default(),
+            nodes: vec![
+                tree_node("root", None, &["root-0", "root-1"], 0),
+                tree_node("take-a", Some("root"), &["a-0", "a-1"], 1),
+                tree_node("take-b", Some("root"), &["b-0", "b-1"], 2),
+            ],
+        };
+        let mut memory = LightboxMemory::default();
+        let b1 = LightboxLocation {
+            node_id: "take-b".into(),
+            image: "b-1".into(),
+        };
+        let root_1 = LightboxLocation {
+            node_id: "root".into(),
+            image: "root-1".into(),
+        };
+        memory.remember(&b1);
+        memory.remember(&root_1);
+        memory.descent.insert("root".into(), "take-b".into());
+
+        // Up lands on the parent's last shown image, not its first.
+        assert_eq!(
+            lightbox_target(&board, &memory, &b1, 0, -1),
+            Some(root_1.clone())
+        );
+        // Down returns to the card and image the user came up from, even
+        // though take-a is the first child.
+        assert_eq!(
+            lightbox_target(&board, &memory, &root_1, 0, 1),
+            Some(b1.clone())
+        );
+
+        // A stale descent entry falls back to the first child.
+        memory.descent.insert("root".into(), "gone".into());
+        let fallback = lightbox_target(&board, &memory, &root_1, 0, 1).expect("first child");
+        assert_eq!(fallback.node_id, "take-a");
+        assert_eq!(fallback.image, "a-0");
     }
 }

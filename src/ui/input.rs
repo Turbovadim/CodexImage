@@ -70,13 +70,6 @@ impl TextInputMode {
     pub(super) fn is_multiline(self) -> bool {
         !matches!(self, Self::SingleLine)
     }
-
-    pub(super) fn viewport_lines(self, measured_lines: usize) -> usize {
-        match self {
-            Self::SingleLine => 1,
-            Self::AutoGrow { max_lines } => measured_lines.clamp(1, max_lines.max(1)),
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -221,8 +214,10 @@ impl TextInput {
     pub(super) fn viewport_height(&self) -> f32 {
         match self.mode {
             TextInputMode::SingleLine => SINGLE_LINE_HEIGHT,
-            _ => (self.mode.viewport_lines(self.measured_visual_lines).max(1) as f32 * LINE_HEIGHT)
-                .max(SINGLE_LINE_HEIGHT),
+            TextInputMode::AutoGrow { max_lines } => {
+                let lines = self.measured_visual_lines.clamp(1, max_lines.max(1));
+                (lines as f32 * LINE_HEIGHT).max(SINGLE_LINE_HEIGHT)
+            }
         }
     }
 
@@ -450,20 +445,13 @@ impl TextInput {
         }
     }
 
-    fn offset_from_utf16(&self, offset: usize) -> usize {
-        offset_from_utf16_in(&self.content, offset)
-    }
-
-    fn offset_to_utf16(&self, offset: usize) -> usize {
-        offset_to_utf16_in(&self.content, offset)
-    }
-
     fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
-        self.offset_to_utf16(range.start)..self.offset_to_utf16(range.end)
+        offset_to_utf16_in(&self.content, range.start)..offset_to_utf16_in(&self.content, range.end)
     }
 
     fn range_from_utf16(&self, range: &Range<usize>) -> Range<usize> {
-        self.offset_from_utf16(range.start)..self.offset_from_utf16(range.end)
+        offset_from_utf16_in(&self.content, range.start)
+            ..offset_from_utf16_in(&self.content, range.end)
     }
 }
 
@@ -579,7 +567,10 @@ impl EntityInputHandler for TextInput {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<usize> {
-        Some(self.offset_to_utf16(self.index_for_position(position)))
+        Some(offset_to_utf16_in(
+            &self.content,
+            self.index_for_position(position),
+        ))
     }
 }
 

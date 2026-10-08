@@ -2,7 +2,7 @@
 
 This is a self-contained Cargo workspace containing patched `gpui_apple` and
 `gpui_macos` crates from Zed commit
-`ac099b4a809a564f06907125e7a536c33cb60084`. It requires Rust 1.97.1.
+`46b11cc550d5bb0585fa912dfaa1218cf52e5025`. It requires Rust 1.98.1.
 
 After a macOS window remains fully occluded for two seconds, the patch replaces
 its hidden `CAMetalLayer` with a plain `CALayer`. It then releases the drawable
@@ -10,6 +10,10 @@ pool, path targets, atlas textures, and cached video textures. Before the window
 becomes visible, it installs a fresh Metal layer at the latest drawable size and
 forces one complete render. Shared renderer buffers stay warm, so hiding one
 window does not disturb other visible windows.
+
+Upstream's `gpui_apple/build.rs` reads gpui's shader types from a sibling
+`../gpui` directory, which only exists inside the Zed repository. The patched
+build script asks `cargo metadata` for the pinned gpui checkout instead.
 
 The implementation is app-independent but macOS-specific. It cannot be a normal
 add-on crate because GPUI does not expose its native window state or Metal

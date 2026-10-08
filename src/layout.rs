@@ -3,7 +3,9 @@ use std::collections::HashMap;
 
 pub const CARD_WIDTH: f32 = 340.0;
 const H_GAP: f32 = 64.0;
-const V_GAP: f32 = 96.0;
+pub const V_GAP: f32 = 96.0;
+/// Distance between the left edges of neighbouring cards in a row.
+pub const COLUMN_STEP: f32 = CARD_WIDTH + H_GAP;
 const ROOT_GAP: f32 = 140.0;
 const OVERLAP_MARGIN: f32 = 24.0;
 const MAX_OVERLAP_PASSES: usize = 100;
@@ -65,36 +67,71 @@ pub fn compute_layout(
     tree.into_positions()
 }
 
-/// Finds the nearest free column beside `anchor` for a card of `height`,
-/// stepping outwards one card slot at a time and preferring the side that
-/// needs the smaller move. `occupied` holds the position and height of every
-/// card already on the canvas.
-pub fn free_spot_near(anchor: Position, height: f32, occupied: &[(Position, f32)]) -> Position {
-    let rect = |position: Position, height: f32| Rect {
-        x: position.x,
-        y: position.y,
-        right: position.x + CARD_WIDTH,
-        bottom: position.y + height,
+/// Width of a row of `count` cards laid out one `COLUMN_STEP` apart.
+pub fn row_width(count: usize) -> f32 {
+    COLUMN_STEP * count.max(1) as f32 - H_GAP
+}
+
+/// Finds the free spot nearest `anchor` for a block of `width` by `height`.
+/// `occupied` holds the position and height of every card on the canvas.
+///
+/// The nearest free spot always touches the anchor or sits one gap away from
+/// an existing card, so only those rows and columns are tried. Vertical
+/// distance counts double: a spot in the anchor's row beats one a row away
+/// unless it is more than twice as far.
+pub fn free_spot_near(
+    anchor: Position,
+    width: f32,
+    height: f32,
+    occupied: &[(Position, f32)],
+) -> Position {
+    const ROW_BIAS: f32 = 2.0;
+    let cards: Vec<Rect> = occupied
+        .iter()
+        .map(|(position, height)| Rect {
+            x: position.x,
+            y: position.y,
+            right: position.x + CARD_WIDTH,
+            bottom: position.y + height,
+        })
+        .collect();
+    let block = |x: f32, y: f32| Rect {
+        x,
+        y,
+        right: x + width,
+        bottom: y + height,
     };
-    let free = |candidate: Position| {
-        let candidate = rect(candidate, height);
-        !occupied
+
+    let mut rows = vec![anchor.y];
+    for card in &cards {
+        rows.extend([card.bottom + V_GAP, card.y - V_GAP - height]);
+    }
+    let mut best = anchor;
+    let mut best_cost = f32::INFINITY;
+    for y in rows {
+        let row_cost = (y - anchor.y).abs() * ROW_BIAS;
+        if row_cost >= best_cost {
+            continue;
+        }
+        let in_row: Vec<Rect> = cards
             .iter()
-            .any(|(position, height)| candidate.overlaps(rect(*position, *height)))
-    };
-    for step in 1..=64 {
-        let dx = (CARD_WIDTH + H_GAP) * step as f32;
-        for x in [anchor.x + dx, anchor.x - dx] {
-            let candidate = Position { x, y: anchor.y };
-            if free(candidate) {
-                return candidate;
+            .copied()
+            .filter(|card| card.y < y + height + OVERLAP_MARGIN && card.bottom > y - OVERLAP_MARGIN)
+            .collect();
+        let columns = std::iter::once(anchor.x).chain(
+            in_row
+                .iter()
+                .flat_map(|card| [card.right + H_GAP, card.x - H_GAP - width]),
+        );
+        for x in columns {
+            let cost = (x - anchor.x).hypot(row_cost);
+            if cost < best_cost && !in_row.iter().any(|card| block(x, y).overlaps(*card)) {
+                best = Position { x, y };
+                best_cost = cost;
             }
         }
     }
-    Position {
-        x: anchor.x + CARD_WIDTH + H_GAP,
-        y: anchor.y + height + V_GAP,
-    }
+    best
 }
 
 struct Tree<'nodes> {
@@ -327,7 +364,9 @@ impl<'nodes> Tree<'nodes> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Position, V_GAP, compute_layout};
+    use super::{
+        CARD_WIDTH, COLUMN_STEP, Position, V_GAP, compute_layout, free_spot_near, row_width,
+    };
     use crate::model::{BoardNode, NodeStatus};
     use std::collections::HashMap;
 
@@ -385,6 +424,54 @@ mod tests {
             );
             assert!(position.x.is_finite());
         }
+    }
+
+    #[test]
+    fn free_spot_takes_the_nearest_gap_without_overlapping() {
+        let at = |x: f32, y: f32| (Position { x, y }, 400.);
+        let anchor = Position { x: 0., y: 0. };
+
+        assert_eq!(free_spot_near(anchor, CARD_WIDTH, 400., &[]), anchor);
+
+        // Packed to the right, free on the left: left wins.
+        let row = [at(0., 0.), at(COLUMN_STEP, 0.), at(COLUMN_STEP * 2., 0.)];
+        assert_eq!(
+            free_spot_near(anchor, CARD_WIDTH, 400., &row),
+            Position {
+                x: -COLUMN_STEP,
+                y: 0.
+            }
+        );
+
+        // Neighbours off the column grid still get a snug fit.
+        let uneven = [at(0., 0.), at(450., 0.)];
+        assert_eq!(
+            free_spot_near(anchor, CARD_WIDTH, 400., &uneven),
+            Position {
+                x: -COLUMN_STEP,
+                y: 0.
+            }
+        );
+
+        // A long packed row sends the card to the row below instead of far away.
+        let long: Vec<_> = (-6..=6).map(|i| at(COLUMN_STEP * i as f32, 0.)).collect();
+        assert_eq!(
+            free_spot_near(anchor, CARD_WIDTH, 400., &long),
+            Position {
+                x: 0.,
+                y: 400. + V_GAP
+            }
+        );
+
+        // A row of three cards is placed as one block.
+        let spot = free_spot_near(anchor, row_width(3), 400., &[at(0., 0.)]);
+        assert_eq!(
+            spot,
+            Position {
+                x: COLUMN_STEP,
+                y: 0.
+            }
+        );
     }
 
     #[test]

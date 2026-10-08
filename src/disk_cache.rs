@@ -131,12 +131,13 @@ pub fn store(source: &Path, max_dimension: Option<u32>, image: &RenderImage) {
 
 /// Seeds the cache from RGBA pixels that never went through GPUI, such as a
 /// thumbnail at the moment it is created.
-pub fn store_rgba(source: &Path, max_dimension: Option<u32>, image: &image::RgbaImage) {
-    let mut bgra = image.as_raw().clone();
-    for pixel in bgra.chunks_exact_mut(4) {
+pub fn store_rgba(source: &Path, max_dimension: Option<u32>, image: image::RgbaImage) {
+    let (width, height) = image.dimensions();
+    let mut bgra = image.into_raw();
+    for pixel in bgra.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
-    store_pixels(source, max_dimension, image.width(), image.height(), &bgra);
+    store_pixels(source, max_dimension, width, height, &bgra);
 }
 
 /// `pixels` are straight-alpha BGRA, the layout GPUI renders from.
@@ -151,8 +152,7 @@ fn store_pixels(source: &Path, max_dimension: Option<u32>, width: u32, height: u
         return;
     };
 
-    // Compress directly after the header. The previous two-Vec path held two
-    // full compressed copies at once and copied every byte between them.
+    // Compress directly after the header.
     let compressed_offset = HEADER_LEN + size_of::<u32>();
     let Some(buffer_len) =
         compressed_offset.checked_add(lz4_flex::block::get_maximum_output_size(pixels.len()))

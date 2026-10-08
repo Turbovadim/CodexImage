@@ -6,7 +6,6 @@ use gpui::{Bounds, PaintQuad, Pixels, Point, WrappedLine, fill, point, px, size}
 use std::ops::Range;
 use std::sync::Arc;
 
-#[derive(Clone)]
 pub(super) struct LayoutLine {
     pub(super) shaped: Arc<WrappedLine>,
     pub(super) start: usize,
@@ -16,7 +15,6 @@ pub(super) struct LayoutLine {
     pub(super) has_newline: bool,
 }
 
-#[derive(Clone, Default)]
 pub(super) struct TextLayout {
     pub(super) lines: Vec<LayoutLine>,
     pub(super) content_len: usize,
