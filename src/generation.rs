@@ -1,8 +1,10 @@
 mod codex;
 pub(crate) mod conditioner;
+mod models;
 mod prompt;
 
 pub use conditioner::run_condition_image_cli;
+pub use models::CodexModel;
 
 use crate::manifest::{OutputManifest, absolute_file_path, is_canonical_path_inside};
 use crate::model::{
@@ -161,6 +163,12 @@ impl GenerationEngine {
     /// first generation. Call from a background thread at startup.
     pub fn resolve_codex(&self) {
         self.codex_invocation();
+    }
+
+    /// The models the installed Codex CLI offers this account. Blocks on a
+    /// short-lived `codex app-server`, so call it from a background thread.
+    pub fn list_models(&self) -> Result<Vec<CodexModel>> {
+        models::list_models(self.codex_invocation())
     }
 
     fn codex_invocation(&self) -> &CodexInvocation {

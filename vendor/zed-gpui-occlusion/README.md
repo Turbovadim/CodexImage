@@ -2,7 +2,7 @@
 
 This is a self-contained Cargo workspace containing patched `gpui_apple` and
 `gpui_macos` crates from Zed commit
-`46b11cc550d5bb0585fa912dfaa1218cf52e5025`. It requires Rust 1.98.1.
+`d01f1258376ec2fb498d8386e734b0dabdbb9fe5`. It requires Rust 1.98.1.
 
 After a macOS window remains fully occluded for two seconds, the patch replaces
 its hidden `CAMetalLayer` with a plain `CALayer`. It then releases the drawable

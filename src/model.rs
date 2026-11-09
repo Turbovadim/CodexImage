@@ -108,6 +108,19 @@ impl BoardNode {
         !self.images.iter().any(matches) && self.attachments.iter().any(matches)
     }
 
+    /// What `image` was made from, for a before/after comparison: the image
+    /// the card edited, else its first attached reference. A reference itself
+    /// has none.
+    pub fn compare_source(&self, image: &str) -> Option<&str> {
+        if self.is_reference(image) {
+            return None;
+        }
+        self.source_images
+            .first()
+            .or_else(|| self.attachments.first())
+            .map(String::as_str)
+    }
+
     /// The list `image` is browsed within: the attached references when it is
     /// one of them, otherwise the generated images.
     pub fn image_set(&self, image: &str) -> &[String] {

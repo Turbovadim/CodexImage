@@ -8,20 +8,6 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Quick picks for the model field. It stays free text, so any model the
-/// installed Codex CLI accepts works.
-pub const MODEL_PRESETS: &[&str] = &[
-    "gpt-5.1-codex-max",
-    "gpt-5.1-codex",
-    "gpt-5.1",
-    "gpt-5-codex",
-    "gpt-5",
-];
-
-/// Values accepted for `model_reasoning_effort`, with the empty string meaning
-/// "leave the CLI's own setting alone".
-pub const REASONING_EFFORTS: &[&str] = &["", "minimal", "low", "medium", "high", "xhigh"];
-
 pub const MAX_LINEAGE_REFS: usize = 6;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -51,7 +37,13 @@ impl SettingsData {
     fn sanitize(&mut self) {
         self.model = self.model.trim().to_owned();
         self.reasoning_effort = self.reasoning_effort.trim().to_lowercase();
-        if !REASONING_EFFORTS.contains(&self.reasoning_effort.as_str()) {
+        // The CLI owns the list of efforts; only keep the value safe to splice
+        // into its `-c model_reasoning_effort="…"` override.
+        if !self
+            .reasoning_effort
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase())
+        {
             self.reasoning_effort.clear();
         }
         self.lineage_refs = self.lineage_refs.min(MAX_LINEAGE_REFS);
@@ -109,7 +101,7 @@ mod tests {
     use super::{MAX_LINEAGE_REFS, Settings, SettingsData};
 
     #[test]
-    fn settings_round_trip_through_disk_and_reject_unknown_effort() {
+    fn settings_round_trip_through_disk_and_reject_unsafe_effort() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.json");
         let settings = Settings::load(path.clone());
@@ -130,7 +122,7 @@ mod tests {
 
         let settings = Settings::load(directory.path().join("other.json"));
         settings
-            .update(|data| data.reasoning_effort = "turbo".into())
+            .update(|data| data.reasoning_effort = "high\" -c x=\"y".into())
             .unwrap();
         assert!(settings.get().reasoning_effort.is_empty());
     }

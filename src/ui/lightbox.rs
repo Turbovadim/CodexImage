@@ -7,14 +7,14 @@ use super::canvas_view::DragState;
 use super::composer::control_button;
 use super::format::image_format_for_path;
 use super::image_cache::DECODED_LONG_EDGE_CAP;
-use super::keymap::{LightboxDown, LightboxLeft, LightboxRight, LightboxUp};
+use super::keymap::{LightboxDown, LightboxLeft, LightboxRight, LightboxUp, ToggleCompare};
 use super::theme;
 use super::tooltip::tip_with_shortcut;
 use crate::model::{Board, BoardNode};
 use gpui::{
     AnyElement, ClipboardItem, Context, Image, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ObjectFit, PinchEvent, Pixels, Point, Resource, Role, ScrollWheelEvent,
-    StyledImage, Window, div, img, prelude::*, px,
+    MouseUpEvent, ObjectFit, PinchEvent, Pixels, Point, Resource, Role, ScrollEvent, StyledImage,
+    Window, div, img, prelude::*, px,
 };
 use std::collections::{HashMap, VecDeque};
 use std::fs;
@@ -38,6 +38,9 @@ pub(super) struct Lightbox {
     pub(super) pan_y: f32,
     pub(super) pending: Option<LightboxLocation>,
     pub(super) memory: LightboxMemory,
+    /// Where the before/after divider sits, as a fraction of the image width.
+    /// `None` while not comparing.
+    pub(super) compare: Option<f32>,
 }
 
 /// Where vertical navigation returns to: the image last shown on each card,
@@ -164,6 +167,28 @@ impl Lightbox {
 
     fn clamp_pan(&mut self, viewport_width: f32, viewport_height: f32, image_ratio: f32) {
         (self.pan_x, self.pan_y) = self.clamped_pan(viewport_width, viewport_height, image_ratio);
+    }
+
+    /// The displayed image's left, top, width and height within the stage.
+    fn image_rect(
+        &self,
+        viewport_width: f32,
+        viewport_height: f32,
+        image_ratio: f32,
+    ) -> (f32, f32, f32, f32) {
+        let (fit_width, fit_height) = fitted_image_size(
+            viewport_width,
+            viewport_height,
+            normalized_image_ratio(image_ratio),
+        );
+        let (width, height) = (fit_width * self.zoom, fit_height * self.zoom);
+        let (pan_x, pan_y) = self.clamped_pan(viewport_width, viewport_height, image_ratio);
+        (
+            (viewport_width - width) / 2. + pan_x,
+            (viewport_height - height) / 2. + pan_y,
+            width,
+            height,
+        )
     }
 }
 
@@ -382,6 +407,7 @@ impl AppView {
             pan_y: 0.,
             pending: None,
             memory,
+            compare: None,
         });
         window.focus(&self.lightbox_focus, cx);
         cx.notify();
@@ -501,6 +527,54 @@ impl AppView {
         }
     }
 
+    /// The image the open lightbox image was made from, if it has one.
+    fn lightbox_compare_source(&self) -> Option<&str> {
+        let Overlay::Lightbox(lightbox) = &self.overlay else {
+            return None;
+        };
+        self.board
+            .as_ref()?
+            .nodes
+            .iter()
+            .find(|node| node.id == lightbox.node_id)?
+            .compare_source(&lightbox.image)
+    }
+
+    pub(super) fn toggle_compare(
+        &mut self,
+        _: &ToggleCompare,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let has_source = self.lightbox_compare_source().is_some();
+        if let Overlay::Lightbox(lightbox) = &mut self.overlay
+            && has_source
+        {
+            lightbox.compare = match lightbox.compare {
+                Some(_) => None,
+                None => Some(0.5),
+            };
+            cx.notify();
+        }
+    }
+
+    /// While comparing, the divider follows the pointer across the image.
+    fn move_compare_divider(&mut self, x: Pixels, window: &Window, cx: &mut Context<Self>) {
+        let Some(image_ratio) = self.lightbox_image_ratio() else {
+            return;
+        };
+        let (stage_width, stage_height) = lightbox_stage_size(window);
+        if let Overlay::Lightbox(lightbox) = &mut self.overlay
+            && lightbox.compare.is_some()
+        {
+            let (left, _, width, _) = lightbox.image_rect(stage_width, stage_height, image_ratio);
+            if width > 0. {
+                lightbox.compare = Some(((f32::from(x) - left) / width).clamp(0., 1.));
+                cx.notify();
+            }
+        }
+    }
+
     fn lightbox_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
@@ -508,6 +582,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let Some(DragState::Lightbox { start, origin }) = &self.drag else {
+            self.move_compare_divider(event.position.x, window, cx);
             return;
         };
         if !event.dragging() {
@@ -554,10 +629,8 @@ impl AppView {
                 .copied()
                 .unwrap_or(1.),
         );
-        let (fit_width, fit_height) =
-            fitted_image_size(viewport_width, viewport_height, image_ratio);
-        let image_width = fit_width * lightbox.zoom;
-        let image_height = fit_height * lightbox.zoom;
+        let (image_left, image_top, image_width, image_height) =
+            lightbox.image_rect(viewport_width, viewport_height, image_ratio);
         // Past this displayed size the capped decode would look soft, so ask
         // for the native pixels. The capped decode (or the thumbnail) stays on
         // screen until the sharper tier finishes loading. A source that fits
@@ -608,24 +681,36 @@ impl AppView {
         let combine_node = lightbox.node_id.clone();
         let combine_image = lightbox.image.clone();
         let locate_node = lightbox.node_id.clone();
-        let (pan_x, pan_y) = lightbox.clamped_pan(viewport_width, viewport_height, image_ratio);
-        let image_left = (viewport_width - image_width) / 2. + pan_x;
-        let image_top = (viewport_height - image_height) / 2. + pan_y;
+        let compare_source = node.and_then(|node| node.compare_source(&lightbox.image));
+        let compare = lightbox.compare.zip(compare_source);
         let lightbox_dragging = matches!(&self.drag, Some(DragState::Lightbox { .. }));
         let stage_cursor = if lightbox_dragging {
             gpui::CursorStyle::ClosedHand
         } else if lightbox.zoom > LIGHTBOX_MIN_ZOOM {
             gpui::CursorStyle::OpenHand
+        } else if compare.is_some() {
+            gpui::CursorStyle::ResizeLeftRight
         } else {
             gpui::CursorStyle::Arrow
         };
-        let toolbar = div()
+        let mut toolbar = div()
             .absolute()
             .top(px(16.))
             .right(px(16.))
             .flex()
             .gap_2()
-            .occlude()
+            .occlude();
+        if compare_source.is_some() {
+            toolbar = toolbar.child(control_button(
+                if compare.is_some() {
+                    "Done comparing (X)"
+                } else {
+                    "Compare (X)"
+                },
+                cx.listener(|this, _, window, cx| this.toggle_compare(&ToggleCompare, window, cx)),
+            ));
+        }
+        let toolbar = toolbar
             .child(control_button(
                 "Branch (B)",
                 cx.listener(move |this, _, window, cx| {
@@ -678,7 +763,7 @@ impl AppView {
             .overflow_hidden()
             .bg(gpui::black().opacity(0.97))
             .occlude()
-            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
+            .on_scroll(cx.listener(|this, event: &ScrollEvent, window, cx| {
                 let delta = event.delta.pixel_delta(px(18.));
                 let factor = (-f32::from(delta.y) * 0.004).exp();
                 this.zoom_lightbox(factor, event.position, window, cx);
@@ -712,20 +797,30 @@ impl AppView {
                         }),
                     )
                     .on_click(cx.listener(|this, _, window, cx| {
-                        if matches!(&this.overlay, Overlay::Lightbox(lightbox) if lightbox.zoom <= 1.)
+                        if matches!(&this.overlay, Overlay::Lightbox(lightbox)
+                            if lightbox.zoom <= 1. && lightbox.compare.is_none())
                         {
                             this.close_overlay(window, cx);
                         }
                     }))
-                    .child(
-                        display_image
+                    .child(match compare {
+                        None => display_image
                             .absolute()
                             .left(px(image_left))
                             .top(px(image_top))
                             .w(px(image_width))
                             .h(px(image_height))
-                            .object_fit(ObjectFit::Contain),
-                    ),
+                            .object_fit(ObjectFit::Contain)
+                            .into_any_element(),
+                        Some((split, source)) => self.render_comparison(
+                            display_image,
+                            source,
+                            split,
+                            (image_left, image_top, image_width, image_height),
+                            window,
+                            cx,
+                        ),
+                    }),
             )
             .child(toolbar);
         let location = lightbox.displayed_location();
@@ -820,6 +915,89 @@ impl AppView {
         root.into_any_element()
     }
 
+    /// The source image under the result, with the result clipped to the right
+    /// of a divider at `split` (a fraction of the image width). The source is
+    /// fitted into the result's frame, so differing aspect ratios still line up
+    /// edge to edge.
+    fn render_comparison(
+        &self,
+        result: gpui::Img,
+        source: &str,
+        split: f32,
+        (left, top, width, height): (f32, f32, f32, f32),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let resource = Resource::Path(Arc::from(self.display_image_path(source, true)));
+        let before = match self.image_cache.update(cx, |cache, cx| {
+            cache.load(&resource, DECODED_LONG_EDGE_CAP, window, cx)
+        }) {
+            Some(Ok(image)) if image.frame_count() > 0 => img(image),
+            _ => img(self.display_image_path(source, false)),
+        };
+        let (viewport_width, viewport_height) = lightbox_stage_size(window);
+        let divider = width * split;
+        let label_top = (top + height).min(viewport_height) - 44.;
+        let label = |text: &'static str| {
+            div()
+                .absolute()
+                .top(px(label_top))
+                .rounded_md()
+                .bg(gpui::black().opacity(0.6))
+                .px_2()
+                .py_1()
+                .text_xs()
+                .text_color(gpui::white())
+                .child(text)
+        };
+        div()
+            .absolute()
+            .inset_0()
+            .child(
+                before
+                    .absolute()
+                    .left(px(left))
+                    .top(px(top))
+                    .w(px(width))
+                    .h(px(height))
+                    .object_fit(ObjectFit::Contain),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(left + divider))
+                    .top(px(top))
+                    .w(px(width - divider))
+                    .h(px(height))
+                    .overflow_hidden()
+                    .child(
+                        result
+                            .absolute()
+                            .left(px(-divider))
+                            .top_0()
+                            .w(px(width))
+                            .h(px(height))
+                            .object_fit(ObjectFit::Contain),
+                    ),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(left + divider - 1.))
+                    .top(px(top))
+                    .w(px(2.))
+                    .h(px(height))
+                    .bg(gpui::white().opacity(0.85)),
+            )
+            .when(split > 0.08, |stage| {
+                stage.child(label("Original").right(px(viewport_width - (left + divider) + 10.)))
+            })
+            .when(split < 0.92, |stage| {
+                stage.child(label("Result").left(px(left + divider + 10.)))
+            })
+            .into_any_element()
+    }
+
     /// Copies the full-resolution original. Originals run to several megabytes,
     /// so the read happens off the main thread; only the clipboard write, which
     /// is a platform call, comes back to it.
@@ -900,6 +1078,17 @@ mod tests {
     }
 
     #[test]
+    fn comparison_prefers_the_edited_image_over_attachments() {
+        let mut node = tree_node("node", None, &["out.png"], 0);
+        assert_eq!(node.compare_source("out.png"), None);
+        node.attachments = vec!["ref.png".into()];
+        assert_eq!(node.compare_source("out.png"), Some("ref.png"));
+        assert_eq!(node.compare_source("ref.png"), None);
+        node.source_images = vec!["parent.png".into()];
+        assert_eq!(node.compare_source("out.png"), Some("parent.png"));
+    }
+
+    #[test]
     fn lightbox_keeps_the_displayed_image_until_a_pending_image_is_committed() {
         let mut lightbox = Lightbox {
             node_id: "node-a".into(),
@@ -909,6 +1098,7 @@ mod tests {
             pan_y: -20.,
             pending: None,
             memory: LightboxMemory::default(),
+            compare: None,
         };
         let destination = LightboxLocation {
             node_id: "node-b".into(),
@@ -937,6 +1127,7 @@ mod tests {
             pan_y: 0.,
             pending: None,
             memory: LightboxMemory::default(),
+            compare: None,
         };
 
         lightbox.zoom_at(1.5, point(px(500.), px(400.)), 1_000., 800., 1.);
@@ -959,6 +1150,7 @@ mod tests {
             pan_y: 0.,
             pending: None,
             memory: LightboxMemory::default(),
+            compare: None,
         };
         let focal_x = 200.;
         let image_point_before = (focal_x - lightbox.pan_x) / lightbox.zoom;
@@ -981,6 +1173,7 @@ mod tests {
             pan_y: 0.,
             pending: None,
             memory: LightboxMemory::default(),
+            compare: None,
         };
 
         lightbox.pan_to(999., -999., 1_000., 800., 2.);

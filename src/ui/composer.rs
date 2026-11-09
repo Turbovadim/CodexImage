@@ -688,7 +688,7 @@ impl AppView {
             .map(|board| board.title.as_str())
             .unwrap_or(APP_NAME);
         let generating = self.engine.active_count() > 0;
-        let settings = self.engine.settings().get();
+        let model_summary = self.model_summary();
         let mut switcher = div()
             .id("board-switcher")
             .accessibility_id("codex-image.board-switcher")
@@ -737,7 +737,7 @@ impl AppView {
                 div()
                     .id("model-switch")
                     .role(Role::Button)
-                    .aria_label(format!("Codex settings. Model: {}", settings.model_label()))
+                    .aria_label(format!("Codex settings. Model: {model_summary}"))
                     .aria_keyshortcuts(platform_shortcut("Meta+Comma", "Control+Comma"))
                     .rounded_xl()
                     .border_1()
@@ -758,7 +758,7 @@ impl AppView {
                         "Model this app asks Codex for",
                         Some(platform_shortcut("⌘,", "Ctrl+,")),
                     ))
-                    .child(settings.model_label().to_owned())
+                    .child(model_summary)
                     .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx))),
             )
             .into_any_element()

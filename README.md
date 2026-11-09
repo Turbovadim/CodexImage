@@ -100,8 +100,11 @@ to launch the packaged application:
 ## Model and reasoning effort
 
 `⌘,` / `Ctrl+,` opens settings, also reachable from the model pill next to the
-board name. The model and reasoning effort chosen there are passed to each
-`codex exec` run, so they never change what your Codex CLI does elsewhere.
+board name. Models and the reasoning efforts each one supports are read from
+the installed CLI (`codex app-server`'s `model/list`), so the list follows your
+account without typing ids. The model and reasoning effort chosen there are
+passed to each `codex exec` run, so they never change what your Codex CLI does
+elsewhere.
 The same panel sets how many earlier images from a card's chain travel with a
 generation as reference; three by default, `Off` to send only the image being
 edited. Settings live in `settings.json` beside the boards.
@@ -116,10 +119,12 @@ that instead. Set `CODEXIMAGE_DATA` to choose another data directory or
 `CODEX_BIN` to use a specific Codex executable. Windows discovery includes the
 standard npm, pnpm, Bun, Volta, Cargo, and WinGet locations.
 
-The app stores each generation as a conditioned 16-bit PNG, used by the canvas,
-exports, and later image edits. This reduces repeating artifacts that can build
-up across a chain of edits. Existing board images are conditioned once in the
-background. Codex keeps the raw file in its own generated-images directory.
+When the app detects a repeating pixel pattern across separate parts of a
+generation, it stores a corrected 16-bit PNG for the canvas, exports, and later
+image edits. The correction follows local pattern strength. Images without a
+detected pattern, already-corrected images, and transparent or translucent pixels
+are left unchanged. Existing board images are checked once in the background.
+Codex keeps raw files in its generated-images directory.
 
 Set `CODEXIMAGE_REINGEST_CONDITIONING=0` to turn conditioning off. Use a value
 between `0` and `1` to reduce its strength.

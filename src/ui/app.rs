@@ -18,7 +18,7 @@ use super::lightbox::Lightbox;
 use super::overlays::{BoardRow, GalleryRow, Toast};
 use super::theme;
 use crate::APP_NAME;
-use crate::generation::GenerationEngine;
+use crate::generation::{CodexModel, GenerationEngine};
 use crate::layout::{Position, compute_layout};
 use crate::model::{Board, BoardNode, ChatMessage};
 use crate::storage::{
@@ -190,6 +190,10 @@ pub(super) struct AppView {
     /// The open card conversation, derived like the other overlay rows so the
     /// render pass never walks the board for it.
     pub(super) chat_rows: Arc<Vec<ChatMessage>>,
+    /// What the installed Codex CLI offers, refreshed at startup and whenever
+    /// settings open. Empty until the first answer arrives.
+    pub(super) codex_models: Arc<Vec<CodexModel>>,
+    pub(super) codex_models_task: Option<Task<()>>,
     pub(super) image_cache: Entity<DecodedImageCache>,
     pub(super) sprite_cache: Entity<CardSpriteCache>,
     pub(super) gallery_list_state: ListState,
@@ -418,6 +422,8 @@ impl AppView {
             board_rows_task: None,
             gallery_rows: Arc::new(Vec::new()),
             chat_rows: Arc::new(Vec::new()),
+            codex_models: Arc::new(Vec::new()),
+            codex_models_task: None,
             image_cache,
             sprite_cache,
             gallery_list_state,
@@ -448,6 +454,7 @@ impl AppView {
         };
         view.refresh_image_metadata(cx);
         view.refresh_layout(cx);
+        view.refresh_codex_models(cx);
         let window_handle = window.window_handle();
         view.repository_task = Some(cx.spawn(async move |weak, cx| {
             while let Ok(event) = receiver.recv().await {
@@ -1141,6 +1148,7 @@ impl Render for AppView {
             .on_action(cx.listener(Self::navigate_right))
             .on_action(cx.listener(Self::navigate_up))
             .on_action(cx.listener(Self::navigate_down))
+            .on_action(cx.listener(Self::toggle_compare))
             .on_action(cx.listener(Self::add_attachment))
             .on_action(cx.listener(Self::chat_hovered))
             .on_action(cx.listener(Self::open_settings_action))

@@ -22,8 +22,8 @@ use crate::model::{BoardNode, NodeStatus};
 use crate::storage::now_ms;
 use gpui::{
     AnyElement, Bounds, ClipboardItem, Context, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PinchEvent, Pixels, Point, Role, ScrollWheelEvent, SharedString, Window, canvas,
-    div, fill, point, prelude::*, px, size,
+    MouseUpEvent, PinchEvent, Pixels, Point, Role, ScrollEvent, SharedString, Window, canvas, div,
+    fill, point, prelude::*, px, size,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -630,8 +630,8 @@ impl AppView {
             .overflow_hidden()
             .bg(theme::background())
             .cursor(cursor)
-            .on_scroll_wheel(
-                cx.listener(|this, event: &ScrollWheelEvent, _, cx| this.scroll_canvas(event, cx)),
+            .on_scroll(
+                cx.listener(|this, event: &ScrollEvent, _, cx| this.scroll_canvas(event, cx)),
             )
             // Capture phase: bubble-phase pinch only fires when the canvas itself
             // is hovered, so any chrome on top would block zooming. `pinch_canvas`
@@ -1115,7 +1115,7 @@ impl AppView {
         cx.notify();
     }
 
-    fn scroll_canvas(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+    fn scroll_canvas(&mut self, event: &ScrollEvent, cx: &mut Context<Self>) {
         if !matches!(self.overlay, Overlay::None) {
             return;
         }

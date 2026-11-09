@@ -20,8 +20,8 @@ anyhow = "1"
 async-channel = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 dirs = "6"
-gpui = { git = "https://github.com/zed-industries/zed", rev = "46b11cc550d5bb0585fa912dfaa1218cf52e5025", package = "gpui" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "46b11cc550d5bb0585fa912dfaa1218cf52e5025", package = "gpui_platform", features = ["font-kit"] }
+gpui = { git = "https://github.com/zed-industries/zed", rev = "d01f1258376ec2fb498d8386e734b0dabdbb9fe5", package = "gpui" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "d01f1258376ec2fb498d8386e734b0dabdbb9fe5", package = "gpui_platform", features = ["font-kit"] }
 image = { version = "0.25", default-features = false, features = ["avif", "bmp", "gif", "ico", "jpeg", "png", "pnm", "tiff", "webp"] }
 libc = "0.2"
 lz4_flex = "0.14.0"
@@ -49,7 +49,7 @@ windows-sys = { version = "0.61", features = [
 embed-resource = "3"
 
 [dev-dependencies]
-gpui = { git = "https://github.com/zed-industries/zed", rev = "46b11cc550d5bb0585fa912dfaa1218cf52e5025", features = ["test-support"] }
+gpui = { git = "https://github.com/zed-industries/zed", rev = "d01f1258376ec2fb498d8386e734b0dabdbb9fe5", features = ["test-support"] }
 tempfile = "3"
 
 # Replaces GPUI's macOS platform crates with the vendored occlusion patch, which

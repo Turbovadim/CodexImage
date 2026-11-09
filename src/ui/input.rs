@@ -7,8 +7,8 @@ use super::theme;
 use gpui::{
     App, Bounds, Context, CursorStyle, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
     Image, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Role,
-    ScrollWheelEvent, SharedString, StatefulInteractiveElement, UTF16Selection, Window, actions,
-    div, point, prelude::*, px,
+    ScrollEvent, SharedString, StatefulInteractiveElement, UTF16Selection, Window, actions, div,
+    point, prelude::*, px,
 };
 use std::ops::Range;
 use std::sync::Arc;
@@ -425,7 +425,7 @@ impl TextInput {
         self.selecting = false;
     }
 
-    fn scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn scroll(&mut self, event: &ScrollEvent, _: &mut Window, cx: &mut Context<Self>) {
         if !self.mode.is_multiline() {
             return;
         }
@@ -624,7 +624,7 @@ impl Render for TextInput {
             .on_mouse_move(cx.listener(Self::mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
-            .on_scroll_wheel(cx.listener(Self::scroll))
+            .on_scroll(cx.listener(Self::scroll))
             .w_full()
             .h(px(self.viewport_height()))
             .line_height(px(LINE_HEIGHT))

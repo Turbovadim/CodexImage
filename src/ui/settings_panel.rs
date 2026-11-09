@@ -5,17 +5,38 @@ use super::app::{AppView, Overlay};
 use super::composer::control_button;
 use super::theme;
 use super::tooltip::tip;
-use crate::settings::{MAX_LINEAGE_REFS, MODEL_PRESETS, REASONING_EFFORTS, SettingsData};
+use crate::generation::CodexModel;
+use crate::settings::{MAX_LINEAGE_REFS, SettingsData};
 use gpui::{
-    AnyElement, Context, Focusable, FontWeight, Role, SharedString, Window, div, prelude::*, px,
+    AnyElement, Context, Focusable, FontWeight, Role, SharedString, Stateful, Window, div,
+    prelude::*, px,
 };
+use std::sync::Arc;
 
-fn effort_label(effort: &str) -> &str {
-    if effort.is_empty() {
-        "CLI default"
-    } else {
-        effort
-    }
+fn pill(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    active: bool,
+) -> Stateful<gpui::Div> {
+    let label = label.into();
+    div()
+        .id(id.into())
+        .role(Role::Button)
+        .aria_label(label.clone())
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .border_1()
+        .border_color(if active {
+            theme::accent()
+        } else {
+            theme::line()
+        })
+        .text_xs()
+        .text_color(if active { theme::ink() } else { theme::dim() })
+        .cursor_pointer()
+        .hover(|style| style.border_color(theme::faint()).text_color(theme::ink()))
+        .child(label)
 }
 
 fn row(label: &'static str, detail: &'static str, control: AnyElement) -> AnyElement {
@@ -50,8 +71,82 @@ impl AppView {
             input.set_content(model, cx);
         });
         self.overlay = Overlay::Settings;
-        window.focus(&self.modal_input.focus_handle(cx), cx);
+        // The id field only shows while Codex has not listed any models.
+        if self.codex_models.is_empty() {
+            window.focus(&self.modal_input.focus_handle(cx), cx);
+        }
+        self.refresh_codex_models(cx);
         cx.notify();
+    }
+
+    /// Asks Codex for its models in the background. A refresh already in
+    /// flight is reused, and a failed one keeps the last list.
+    pub(super) fn refresh_codex_models(&mut self, cx: &mut Context<Self>) {
+        if self.codex_models_task.is_some() {
+            return;
+        }
+        let engine = self.engine.clone();
+        self.codex_models_task = Some(cx.spawn(async move |weak, cx| {
+            let models = cx
+                .background_spawn(async move { engine.list_models() })
+                .await;
+            let _ = weak.update(cx, |view, cx| {
+                view.codex_models_task = None;
+                if let Ok(models) = models
+                    && !models.is_empty()
+                {
+                    view.codex_models = Arc::new(models);
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// The listed model a generation would use: the chosen one, or the CLI's
+    /// default when none is chosen.
+    fn listed_model(&self, model: &str) -> Option<&CodexModel> {
+        self.codex_models.iter().find(|listed| {
+            if model.is_empty() {
+                listed.is_default
+            } else {
+                listed.model == model
+            }
+        })
+    }
+
+    /// The header label: the model's display name plus any effort override.
+    pub(super) fn model_summary(&self) -> String {
+        let settings = self.engine.settings().get();
+        let name = self
+            .listed_model(&settings.model)
+            .filter(|_| !settings.model.is_empty())
+            .map_or(settings.model_label(), CodexModel::label);
+        if settings.reasoning_effort.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{name} · {}", settings.reasoning_effort)
+        }
+    }
+
+    /// Selects `model` (empty for the CLI default) and drops an effort override
+    /// the new model does not offer.
+    fn pick_model(&mut self, model: String, cx: &mut Context<Self>) {
+        let effort = self.engine.settings().get().reasoning_effort;
+        let keep_effort = effort.is_empty()
+            || self
+                .listed_model(&model)
+                .is_none_or(|listed| listed.supports_effort(&effort));
+        self.modal_input
+            .update(cx, |input, cx| input.set_content(model.clone(), cx));
+        self.change_settings(
+            |settings| {
+                settings.model = model;
+                if !keep_effort {
+                    settings.reasoning_effort.clear();
+                }
+            },
+            cx,
+        );
     }
 
     /// Writes one settings change and reports a failed save instead of letting
@@ -75,53 +170,48 @@ impl AppView {
 
     pub(super) fn render_settings(&self, cx: &mut Context<Self>) -> AnyElement {
         let settings = self.engine.settings().get();
-        let pill = |id: SharedString, label: String, active: bool| {
-            div()
-                .id(id)
-                .role(Role::Button)
-                .aria_label(label.clone())
-                .px_2()
-                .py_1()
-                .rounded_md()
-                .border_1()
-                .border_color(if active {
-                    theme::accent()
-                } else {
-                    theme::line()
-                })
-                .text_xs()
-                .text_color(if active { theme::ink() } else { theme::dim() })
-                .cursor_pointer()
-                .hover(|style| style.border_color(theme::faint()).text_color(theme::ink()))
-                .child(label)
-        };
-        let mut presets = div().flex().flex_wrap().gap_2().child(
+        let active = self.listed_model(&settings.model);
+        let model_control = self.render_model_choices(&settings, cx);
+        let mut efforts = div().flex().flex_wrap().gap_2().child(
             pill(
-                "model-default".into(),
-                "CLI default".into(),
-                settings.model.is_empty(),
+                "effort-default",
+                match active.and_then(|model| model.default_reasoning_effort.as_deref()) {
+                    Some(effort) => format!("Default ({effort})"),
+                    None => "CLI default".to_owned(),
+                },
+                settings.reasoning_effort.is_empty(),
             )
             .on_click(cx.listener(|this, _, _, cx| {
-                this.modal_input
-                    .update(cx, |input, cx| input.set_content("", cx));
-                this.change_settings(|settings| settings.model.clear(), cx);
+                this.change_settings(|settings| settings.reasoning_effort.clear(), cx)
             })),
         );
-        for preset in MODEL_PRESETS {
-            presets = presets.child(
+        let listed_efforts = active.map_or(&[][..], |model| &model.supported_reasoning_efforts);
+        for option in listed_efforts {
+            let effort = option.reasoning_effort.clone();
+            efforts = efforts.child(
                 pill(
-                    SharedString::from(format!("model-{preset}")),
-                    (*preset).to_owned(),
-                    settings.model == *preset,
+                    format!("effort-{effort}"),
+                    effort.clone(),
+                    settings.reasoning_effort == effort,
                 )
+                .tooltip(tip(option.description.clone()))
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.modal_input
-                        .update(cx, |input, cx| input.set_content(*preset, cx));
-                    this.change_settings(|settings| settings.model = (*preset).to_owned(), cx);
+                    let effort = effort.clone();
+                    this.change_settings(|settings| settings.reasoning_effort = effort, cx)
                 })),
             );
         }
-        let effort = settings.reasoning_effort.clone();
+        if !settings.reasoning_effort.is_empty()
+            && listed_efforts
+                .iter()
+                .all(|option| option.reasoning_effort != settings.reasoning_effort)
+        {
+            efforts = efforts.child(pill(
+                "effort-custom",
+                settings.reasoning_effort.clone(),
+                true,
+            ));
+        }
         let lineage = settings.lineage_refs;
         div()
             .id("settings-overlay")
@@ -153,64 +243,39 @@ impl AppView {
                     .child(div().mt_1().text_sm().text_color(theme::dim()).child(
                         "These apply to this app only. Your Codex CLI config is left alone.",
                     ))
-                    .child(row(
-                        "Model",
-                        "Passed as codex exec -m",
-                        div()
-                            .child(
-                                div()
-                                    .rounded_lg()
-                                    .border_1()
-                                    .border_color(theme::line())
-                                    .bg(theme::background())
-                                    .px_3()
-                                    .py_2()
-                                    .child(self.modal_input.clone()),
-                            )
-                            .child(div().mt_2().child(presets))
-                            .into_any_element(),
-                    ))
+                    .child(row("Model", "Passed as codex exec -m", model_control))
                     .child(row(
                         "Reasoning effort",
                         "Passed as model_reasoning_effort",
-                        pill(
-                            "effort".into(),
-                            effort_label(&effort).to_owned(),
-                            !effort.is_empty(),
-                        )
-                        .tooltip(tip("Click to cycle"))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let next = REASONING_EFFORTS
-                                .iter()
-                                .position(|value| *value == effort)
-                                .map_or(0, |index| (index + 1) % REASONING_EFFORTS.len());
-                            this.change_settings(
-                                |settings| {
-                                    settings.reasoning_effort = REASONING_EFFORTS[next].to_owned()
-                                },
-                                cx,
-                            );
-                        }))
-                        .into_any_element(),
+                        efforts.into_any_element(),
                     ))
                     .child(row(
                         "Chain references",
                         "Earlier images from a card's own chain sent along as identity reference",
-                        pill(
-                            "lineage".into(),
-                            if lineage == 0 {
-                                "Off".to_owned()
-                            } else {
-                                format!("{lineage} image{}", if lineage == 1 { "" } else { "s" })
-                            },
-                            lineage > 0,
-                        )
-                        .tooltip(tip("Click to cycle"))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let next = (lineage + 1) % (MAX_LINEAGE_REFS + 1);
-                            this.change_settings(|settings| settings.lineage_refs = next, cx);
-                        }))
-                        .into_any_element(),
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .children((0..=MAX_LINEAGE_REFS).map(|count| {
+                                pill(
+                                    format!("lineage-{count}"),
+                                    if count == 0 {
+                                        "Off".to_owned()
+                                    } else {
+                                        count.to_string()
+                                    },
+                                    lineage == count,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.change_settings(
+                                            |settings| settings.lineage_refs = count,
+                                            cx,
+                                        )
+                                    },
+                                ))
+                            }))
+                            .into_any_element(),
                     ))
                     .child(
                         div()
@@ -245,5 +310,61 @@ impl AppView {
                     ),
             )
             .into_any_element()
+    }
+
+    /// One button per model Codex lists. Until it lists any, a free-text id
+    /// field stands in so a missing or signed-out CLI never blocks the choice.
+    fn render_model_choices(&self, settings: &SettingsData, cx: &mut Context<Self>) -> AnyElement {
+        let mut choices = div().flex().flex_wrap().gap_2().child(
+            pill("model-default", "CLI default", settings.model.is_empty())
+                .on_click(cx.listener(|this, _, _, cx| this.pick_model(String::new(), cx))),
+        );
+        for model in self.codex_models.iter() {
+            let id = model.model.clone();
+            choices = choices.child(
+                pill(
+                    format!("model-{id}"),
+                    model.label().to_owned(),
+                    settings.model == id,
+                )
+                .tooltip(tip(if model.description.is_empty() {
+                    id.clone()
+                } else {
+                    format!("{id}: {}", model.description)
+                }))
+                .on_click(cx.listener(move |this, _, _, cx| this.pick_model(id.clone(), cx))),
+            );
+        }
+        if self.codex_models.is_empty() {
+            let status = if self.codex_models_task.is_some() {
+                "Loading models from Codex…"
+            } else {
+                "Codex did not list any models. Type an id instead."
+            };
+            return div()
+                .child(
+                    div()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(theme::line())
+                        .bg(theme::background())
+                        .px_3()
+                        .py_2()
+                        .child(self.modal_input.clone()),
+                )
+                .child(div().mt_2().child(choices))
+                .child(
+                    div()
+                        .mt_2()
+                        .text_xs()
+                        .text_color(theme::faint())
+                        .child(status),
+                )
+                .into_any_element();
+        }
+        if !settings.model.is_empty() && self.listed_model(&settings.model).is_none() {
+            choices = choices.child(pill("model-custom", settings.model.clone(), true));
+        }
+        choices.into_any_element()
     }
 }
