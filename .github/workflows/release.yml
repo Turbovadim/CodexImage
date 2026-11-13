@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+# The macOS DMG is built and attached locally with ./scripts/package-macos.sh;
+# these jobs attach the Windows and Linux archives once the release publishes.
+jobs:
+  package:
+    name: Package (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: ./scripts/linux-deps.sh
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - name: Build Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/package-windows.ps1 -Archive
+      - name: Build Linux archive
+        if: runner.os == 'Linux'
+        run: ./scripts/package-linux.sh --archive
+      - name: Attach archive to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          shopt -s nullglob
+          gh release upload "$RELEASE_TAG" dist/CodexImage-*.zip* dist/CodexImage-*.tar.gz* --clobber

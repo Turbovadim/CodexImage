@@ -4,7 +4,7 @@ CodexImage is an infinite canvas for image generation. Each prompt sits in a
 card. Branching a result adds a child card, so the parent prompt and every edit
 stay visible.
 
-It is a native macOS and Windows app built with
+It is a native macOS, Windows, and Linux app built with
 [Zed's GPUI](https://github.com/zed-industries/zed). It calls the Codex CLI
 through your logged-in ChatGPT account. You do not need a separate API key.
 
@@ -35,6 +35,13 @@ and run `CodexImage.exe`. Keep `codex-image-condition.exe` beside it; the app
 uses it to prepare a generated image before feeding it back into a later
 generation in the same run. Release builds are currently unsigned, so Microsoft
 Defender SmartScreen may require **More info > Run anyway** on first launch.
+
+## Install on Linux
+
+You need a 64-bit x86 Linux desktop running Wayland or X11, with Vulkan
+drivers. Install the Codex CLI and run `codex login` first.
+
+Download the latest `linux-x86_64.tar.gz`, extract it, and run `codex-image`.
 
 ## What it does
 
@@ -83,6 +90,13 @@ Create a versioned Apple Silicon DMG and checksum with:
 ./scripts/package-macos.sh --dmg
 ```
 
+On Linux, install the build dependencies (`./scripts/linux-deps.sh` covers
+Debian and Ubuntu), then create a tarball and checksum:
+
+```bash
+./scripts/package-linux.sh --archive
+```
+
 On Windows, install the Rust MSVC toolchain and Visual Studio 2022 Build Tools
 with **Desktop development with C++**, then create a portable ZIP and checksum:
 
@@ -112,8 +126,9 @@ edited. Settings live in `settings.json` beside the boards.
 ## Data and generated images
 
 CodexImage keeps boards under
-`~/Library/Application Support/CodexImage/data` on macOS and
-`%LOCALAPPDATA%\CodexImage\data` on Windows. If it finds data from the old
+`~/Library/Application Support/CodexImage/data` on macOS,
+`%LOCALAPPDATA%\CodexImage\data` on Windows, and
+`~/.local/share/codeximage` on Linux. If it finds data from the old
 Electron app in the platform's roaming application-data directory, it opens
 that instead. Set `CODEXIMAGE_DATA` to choose another data directory or
 `CODEX_BIN` to use a specific Codex executable. Windows discovery includes the
