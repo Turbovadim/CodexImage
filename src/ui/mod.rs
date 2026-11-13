@@ -8,6 +8,7 @@ mod card_svg;
 mod chat;
 mod composer;
 mod format;
+mod icons;
 mod image_cache;
 #[cfg(target_os = "macos")]
 mod imageio;

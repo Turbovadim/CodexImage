@@ -3,10 +3,13 @@
 
 use super::card::{
     ATTACHED_TEXT_HEIGHT, ATTACHMENT_ROW_HEIGHT, COLLAPSED_PROMPT_LINES, CanvasImageAsset,
-    CanvasNode, EXPANDED_PROMPT_LINES, MEDIA_GAP, OutputLayout, PROMPT_LINE_HEIGHT,
-    SHOW_MORE_HEIGHT, attached_text_height, card_height_from_metadata, status_area_height,
-    wrap_prompt,
+    CanvasNode, EXPANDED_PROMPT_LINES, MEDIA_GAP, MEDIA_INSET, MEDIA_RADIUS, MEDIA_WIDTH,
+    OutputLayout, PROMPT_LINE_HEIGHT, SHOW_MORE_HEIGHT, TILE_GAP, attached_text_height,
+    card_height_from_metadata, filmstrip_cell_x, status_area_height, wrap_prompt,
 };
+
+/// Corner radius of the smaller tiles in grids and the filmstrip.
+const TILE_RADIUS: f32 = 8.;
 use super::theme;
 use crate::layout::CARD_WIDTH;
 use crate::model::NodeStatus;
@@ -43,7 +46,6 @@ pub enum CardColor {
     Hover,
     Line,
     Ink,
-    Ink90,
     Dim,
     Faint,
     Accent,
@@ -63,7 +65,6 @@ impl CardColor {
             Self::Hover => (theme::HOVER, 1.),
             Self::Line => (theme::LINE, 1.),
             Self::Ink => (theme::INK, 1.),
-            Self::Ink90 => (theme::INK, 0.9),
             Self::Dim => (theme::DIM, 1.),
             Self::Faint => (theme::FAINT, 1.),
             Self::Accent => (theme::ACCENT, 1.),
@@ -124,6 +125,10 @@ pub struct CardScene {
     /// visible node was measurable during camera movement.
     pub has_blurred_images: bool,
     pub max_high_resolution_dimension: f32,
+    /// Card-local media area of a running card that has no image yet. The
+    /// canvas paints the live "generating" animation over it each frame; the
+    /// cached scene and sprite keep only the plain backdrop.
+    pub generating_area: Option<CardRect>,
 }
 
 impl CardScene {
@@ -236,7 +241,17 @@ pub fn build_card_scene(canvas_node: &CanvasNode) -> CardScene {
     let prompt_block_height = 24.
         + visible_line_count as f32 * PROMPT_LINE_HEIGHT
         + if prompt_clamped { SHOW_MORE_HEIGHT } else { 0. };
+    // The opening paragraph reads as the card's title; the rest is dimmer.
+    let title_lines = visible_prompt_lines
+        .iter()
+        .position(|line| line.trim().is_empty())
+        .unwrap_or(visible_prompt_lines.len());
     for (index, line) in visible_prompt_lines.iter().enumerate() {
+        let color = if index < title_lines || title_lines == visible_prompt_lines.len() {
+            CardColor::Ink
+        } else {
+            CardColor::Dim
+        };
         scene.text(
             line.clone(),
             CardRect::new(
@@ -247,7 +262,7 @@ pub fn build_card_scene(canvas_node: &CanvasNode) -> CardScene {
             ),
             12.5,
             PROMPT_LINE_HEIGHT,
-            CardColor::Ink90,
+            color,
             TextAlign::Left,
         );
     }
@@ -281,17 +296,28 @@ pub fn build_card_scene(canvas_node: &CanvasNode) -> CardScene {
         cursor_y += ATTACHMENT_ROW_HEIGHT;
     }
 
+    // Status at a glance: a coloured dot and what the card holds.
+    let image_count = node.images.len();
+    let (dot, status) = match node.status {
+        NodeStatus::Running => (CardColor::Accent, "Generating".to_owned()),
+        NodeStatus::Done if image_count == 1 => (CardColor::Accent45, "1 image".to_owned()),
+        NodeStatus::Done => (CardColor::Accent45, format!("{image_count} images")),
+        NodeStatus::Error => (CardColor::Danger, "Failed".to_owned()),
+        NodeStatus::Stopped => (CardColor::Faint, "Stopped".to_owned()),
+    };
+    scene.quad(CardRect::new(15., cursor_y + 6., 6., 6.), 3., dot, None);
+    let status_width = status.chars().count() as f32 * 6. + 4.;
     scene.text(
-        "❖ Me",
-        CardRect::new(14., cursor_y, 42., 18.),
+        status,
+        CardRect::new(27., cursor_y, status_width, 18.),
         10.5,
         18.,
-        CardColor::Faint,
+        CardColor::Dim,
         TextAlign::Left,
     );
     if node.aspect != "auto" {
         let pill_width = (node.aspect.len() as f32 * 6.2 + 8.).max(28.);
-        let pill = CardRect::new(56., cursor_y + 1., pill_width, 16.);
+        let pill = CardRect::new(27. + status_width + 6., cursor_y + 1., pill_width, 16.);
         scene.quad(
             pill,
             8.,
@@ -316,25 +342,28 @@ pub fn build_card_scene(canvas_node: &CanvasNode) -> CardScene {
         TextAlign::Right,
     );
     cursor_y += 26.;
-    scene.quad(
-        CardRect::new(0., cursor_y, CARD_WIDTH, MEDIA_GAP),
-        0.,
-        CardColor::Line,
-        None,
-    );
+    // Inset media needs no divider; a card without outputs keeps one above
+    // its status.
+    if matches!(canvas_node.output_layout, OutputLayout::None) {
+        scene.quad(
+            CardRect::new(0., cursor_y, CARD_WIDTH, MEDIA_GAP),
+            0.,
+            CardColor::Line,
+            None,
+        );
+    }
     cursor_y += MEDIA_GAP;
 
     match &canvas_node.output_layout {
         OutputLayout::None => {}
         OutputLayout::Tiles { height, cells } => {
-            let media = CardRect::new(0., cursor_y, CARD_WIDTH, *height);
-            let fill = if cells.is_empty() {
-                CardColor::Raised
-            } else {
-                CardColor::Hover
-            };
-            scene.quad(media, 0., fill, None);
+            let media = CardRect::new(MEDIA_INSET, cursor_y, MEDIA_WIDTH, *height);
             if cells.is_empty() {
+                scene.quad(media, MEDIA_RADIUS, CardColor::Hover, None);
+            }
+            if cells.is_empty() && running {
+                scene.generating_area = Some(media);
+            } else if cells.is_empty() {
                 scene.text(
                     "Generating…",
                     media,
@@ -349,17 +378,27 @@ pub fn build_card_scene(canvas_node: &CanvasNode) -> CardScene {
                     continue;
                 };
                 let bounds = CardRect::new(cell.x, cursor_y + cell.y, cell.width, cell.height);
-                scene.quad(bounds, 0., CardColor::Raised, None);
+                let radius = if cells.len() == 1 {
+                    MEDIA_RADIUS
+                } else {
+                    TILE_RADIUS
+                };
+                scene.quad(bounds, radius, CardColor::Hover, None);
                 scene.image(
                     image.asset.clone(),
                     bounds,
                     CardImageFit::Contain,
-                    0.,
+                    radius,
                     blur_outputs,
                 );
             }
             if node.images.is_empty() && !canvas_node.displayed_images.is_empty() {
-                let badge = CardRect::new(CARD_WIDTH - 76., cursor_y + *height - 27., 68., 19.);
+                let badge = CardRect::new(
+                    MEDIA_INSET + MEDIA_WIDTH - 76.,
+                    cursor_y + *height - 27.,
+                    68.,
+                    19.,
+                );
                 scene.quad(badge, 5., CardColor::Background82, None);
                 scene.text(
                     "Unfinalized",
@@ -379,24 +418,23 @@ pub fn build_card_scene(canvas_node: &CanvasNode) -> CardScene {
             hidden_count,
             strip_cell_width,
         } => {
-            scene.quad(
-                CardRect::new(0., cursor_y, CARD_WIDTH, *height),
-                0.,
-                CardColor::Line,
-                None,
-            );
             if let Some(hero) = canvas_node.displayed_images.first() {
-                let hero_bounds = CardRect::new(0., cursor_y, CARD_WIDTH, *hero_height);
-                scene.quad(hero_bounds, 0., CardColor::Raised, None);
+                let hero_bounds = CardRect::new(MEDIA_INSET, cursor_y, MEDIA_WIDTH, *hero_height);
+                scene.quad(hero_bounds, MEDIA_RADIUS, CardColor::Hover, None);
                 scene.image(
                     hero.asset.clone(),
                     hero_bounds,
                     CardImageFit::Contain,
-                    0.,
+                    MEDIA_RADIUS,
                     blur_outputs,
                 );
             }
-            let badge = CardRect::new(CARD_WIDTH - 57., cursor_y + *hero_height - 25., 49., 19.);
+            let badge = CardRect::new(
+                MEDIA_INSET + MEDIA_WIDTH - 57.,
+                cursor_y + *hero_height - 25.,
+                49.,
+                19.,
+            );
             scene.quad(badge, 5., CardColor::Background82, None);
             scene.text(
                 format!("1 / {}", canvas_node.displayed_images.len()),
@@ -406,34 +444,34 @@ pub fn build_card_scene(canvas_node: &CanvasNode) -> CardScene {
                 CardColor::Ink,
                 TextAlign::Center,
             );
-            let strip_y = cursor_y + *hero_height + MEDIA_GAP;
+            let strip_y = cursor_y + *hero_height + TILE_GAP;
             for compact_index in 0..*compact_count {
                 let Some(image) = canvas_node.displayed_images.get(compact_index + 1) else {
                     continue;
                 };
                 let bounds = CardRect::new(
-                    compact_index as f32 * (*strip_cell_width + MEDIA_GAP),
+                    filmstrip_cell_x(compact_index, *strip_cell_width),
                     strip_y,
                     *strip_cell_width,
                     *strip_cell_width,
                 );
-                scene.quad(bounds, 0., CardColor::Raised, None);
+                scene.quad(bounds, TILE_RADIUS, CardColor::Hover, None);
                 scene.image(
                     image.asset.clone(),
                     bounds,
                     CardImageFit::Cover,
-                    0.,
+                    TILE_RADIUS,
                     blur_outputs,
                 );
             }
             if *hidden_count > 0 {
                 let hidden = CardRect::new(
-                    CARD_WIDTH - *strip_cell_width,
+                    MEDIA_INSET + MEDIA_WIDTH - *strip_cell_width,
                     strip_y,
                     *strip_cell_width,
                     *strip_cell_width,
                 );
-                scene.quad(hidden, 0., CardColor::Raised, None);
+                scene.quad(hidden, TILE_RADIUS, CardColor::Hover, None);
                 scene.text(
                     format!("+{hidden_count}"),
                     hidden,

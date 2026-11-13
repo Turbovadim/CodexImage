@@ -5,17 +5,27 @@ use super::app::AppView;
 use super::app::{NodeEdit, Overlay};
 use super::composer::{attachment_thumb, control_button};
 use super::format::{format_date, format_tokens, node_depths, status_label, time_ago};
+use super::icons::{Icon, icon};
 use super::input::TextInputMode;
 use super::keymap::{AddAttachment, Generate, OpenBoards, ToggleGallery};
 use super::theme;
 use super::tooltip::{tip, tip_with_shortcut};
 use crate::model::{AttachmentEdit, BoardSummary, MAX_ATTACHMENTS};
 use gpui::{
-    AnyElement, ClipboardItem, Context, ExternalPaths, Focusable, FontWeight, ObjectFit, Role,
-    SharedString, StyledImage, WeakEntity, Window, div, img, list, prelude::*, px,
+    Animation, AnimationExt, AnyElement, ClipboardItem, Context, ExternalPaths, Focusable,
+    FontWeight, ObjectFit, Role, SharedString, StyledImage, WeakEntity, Window, div,
+    ease_out_quint, img, list, prelude::*, px,
 };
 use std::path::PathBuf;
 use std::time::Duration;
+
+/// Entrance timing of rows in the boards dropdown, in seconds.
+const BOARD_ROW_APPEAR: f32 = 0.22;
+const BOARD_ROW_STAGGER: f32 = 0.03;
+/// Rows past this one share the last delay, so long lists open promptly.
+const BOARD_ROW_STAGGER_LIMIT: usize = 8;
+/// How long the boards dropdown takes to fold away after closing.
+pub(super) const BOARDS_EXIT: Duration = Duration::from_millis(150);
 
 pub(super) struct Toast {
     pub(super) text: SharedString,
@@ -392,7 +402,14 @@ impl AppView {
         cx.notify();
     }
 
-    pub(super) fn render_boards(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+    /// The boards dropdown. While `exiting` it plays its closing animation:
+    /// it lets clicks through and its buttons do nothing.
+    pub(super) fn render_boards(
+        &self,
+        window: &Window,
+        exiting: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let query = self.search_input.read(cx).content().to_lowercase();
         let width = 400.;
         let mut list = div()
@@ -403,10 +420,11 @@ impl AppView {
             .overflow_y_scroll()
             .px_2()
             .pb_2();
-        for row in self
+        for (row_index, row) in self
             .board_rows
             .iter()
             .filter(|row| row.search_key.contains(&query))
+            .enumerate()
         {
             let summary = &row.summary;
             let id = summary.id.clone();
@@ -423,8 +441,7 @@ impl AppView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_color(theme::faint())
-                .child("❖")
+                .child(icon(Icon::Boards, 15.).text_color(theme::faint()))
                 .into_any_element();
             if let Some(path) = &row.thumbnail {
                 thumbnail = img(path.clone())
@@ -433,6 +450,9 @@ impl AppView {
                     .object_fit(ObjectFit::Cover)
                     .into_any_element();
             }
+            // Rows cascade in: each starts a little after the one above it.
+            let delay = row_index.min(BOARD_ROW_STAGGER_LIMIT) as f32 * BOARD_ROW_STAGGER;
+            let total = delay + BOARD_ROW_APPEAR;
             list = list.child(
                 div()
                     .id(SharedString::from(format!("board-{}", summary.id)))
@@ -453,6 +473,9 @@ impl AppView {
                     .cursor_pointer()
                     .hover(|style| style.bg(theme::hover()))
                     .on_click(cx.listener(move |this, _, window, cx| {
+                        if !matches!(this.overlay, Overlay::Boards) {
+                            return;
+                        }
                         this.open_board(id.clone(), window, cx)
                     }))
                     .child(thumbnail)
@@ -494,6 +517,9 @@ impl AppView {
                             .tooltip(tip("Rename this board"))
                             .child("Rename")
                             .on_click(cx.listener(move |this, _, window, cx| {
+                                if !matches!(this.overlay, Overlay::Boards) {
+                                    return;
+                                }
                                 cx.stop_propagation();
                                 let title = this
                                     .engine
@@ -539,6 +565,9 @@ impl AppView {
                             .when(armed, |button| button.bg(theme::danger().opacity(0.16)))
                             .child(if armed { "Sure?" } else { "Delete" })
                             .on_click(cx.listener(move |this, _, window, cx| {
+                                if !matches!(this.overlay, Overlay::Boards) {
+                                    return;
+                                }
                                 cx.stop_propagation();
                                 if this.armed_board_delete.as_deref() == Some(&delete_id) {
                                     match this.engine.delete_board(&delete_id) {
@@ -570,6 +599,15 @@ impl AppView {
                                 }
                                 cx.notify();
                             })),
+                    )
+                    .with_animation(
+                        SharedString::from(format!("board-row-enter-{}", summary.id)),
+                        Animation::new(Duration::from_secs_f32(total)),
+                        move |row, delta| {
+                            let local = ((delta * total - delay) / BOARD_ROW_APPEAR).clamp(0., 1.);
+                            let eased = 1. - (1. - local).powi(3);
+                            row.opacity(eased).ml(px((1. - eased) * -10.))
+                        },
                     ),
             );
         }
@@ -584,7 +622,7 @@ impl AppView {
             .border_color(theme::line())
             .bg(theme::raised().opacity(0.98))
             .overflow_hidden()
-            .occlude()
+            .when(!exiting, |popover| popover.occlude())
             .child(
                 div().p_3().child(
                     div()
@@ -611,14 +649,40 @@ impl AppView {
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme::accent())
                     .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .gap_2()
                     .hover(|style| style.bg(theme::hover()))
-                    .child("＋ New board")
+                    .child(icon(Icon::Plus, 15.).text_color(theme::accent()))
+                    .child("New board")
                     .on_click(cx.listener(|this, _, window, cx| {
+                        if !matches!(this.overlay, Overlay::Boards) {
+                            return;
+                        }
                         match this.engine.repository().create_board() {
                             Ok(board) => this.open_board(board.id, window, cx),
                             Err(error) => this.show_error(error, cx),
                         }
                     })),
+            )
+            // Drops open from the board button: fade in while sliding down,
+            // and folds back up the same way when closing.
+            .with_animation(
+                if exiting {
+                    "boards-popover-exit"
+                } else {
+                    "boards-popover-enter"
+                },
+                Animation::new(if exiting {
+                    BOARDS_EXIT
+                } else {
+                    Duration::from_millis(220)
+                })
+                .with_easing(ease_out_quint()),
+                move |popover, delta| {
+                    let shown = if exiting { 1. - delta } else { delta };
+                    popover.opacity(shown).top(px(50. + 8. * shown))
+                },
             )
             .into_any_element()
     }

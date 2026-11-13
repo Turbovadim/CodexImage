@@ -170,6 +170,14 @@ pub(super) struct AppView {
     pub(super) count: usize,
     pub(super) activity: HashMap<String, String>,
     pub(super) hovered_node: Option<String>,
+    /// When the hovered card's action bar appeared, for its entrance animation.
+    pub(super) toolbar_appeared_at: Option<std::time::Instant>,
+    /// The card whose action bar is fading out after the pointer left it.
+    pub(super) toolbar_exit: Option<(String, std::time::Instant)>,
+    /// Whether the boards dropdown was open last frame, and when it closed,
+    /// so it can fold away instead of vanishing.
+    pub(super) boards_was_open: bool,
+    pub(super) boards_closed_at: Option<std::time::Instant>,
     pub(super) hovered_toolbar_button: Option<usize>,
     pub(super) expanded_prompts: HashSet<String>,
     pub(super) armed_board_delete: Option<String>,
@@ -209,7 +217,8 @@ pub(super) struct AppView {
     pub(super) camera_glide: Option<CameraGlide>,
     pub(super) zoom_settled: bool,
     pub(super) zoom_settle_task: Option<Task<()>>,
-    pub(super) running_tick_task: Option<Task<()>>,
+    /// The redraw ticker for running cards and the interval it ticks at.
+    pub(super) running_tick_task: Option<(Duration, Task<()>)>,
     /// Drops the render caches once the window has stayed hidden for a while.
     hidden_release_task: Option<Task<()>>,
     repository_task: Option<Task<()>>,
@@ -257,85 +266,87 @@ pub fn run() -> Result<()> {
     let resolver = engine.clone();
     std::thread::spawn(move || resolver.resolve_codex());
     let engine_for_quit = engine.clone();
-    application().run(move |cx: &mut App| {
-        bind_keys(cx);
-        configure_menus(cx);
-        let quit_engine = engine_for_quit.clone();
-        cx.on_app_quit(move |_| {
-            // GPUI only gives quit futures 200 ms. Finish the durable flush
-            // before returning a future so shutdown cannot cut it short.
-            quit_engine.stop_all_for_quit();
-            async {}
-        })
-        .detach();
-        #[cfg(not(target_os = "macos"))]
-        cx.on_window_closed(|cx, _| {
-            if cx.windows().is_empty() {
-                cx.quit();
-            }
-        })
-        .detach();
+    application()
+        .with_assets(super::icons::Assets)
+        .run(move |cx: &mut App| {
+            bind_keys(cx);
+            configure_menus(cx);
+            let quit_engine = engine_for_quit.clone();
+            cx.on_app_quit(move |_| {
+                // GPUI only gives quit futures 200 ms. Finish the durable flush
+                // before returning a future so shutdown cannot cut it short.
+                quit_engine.stop_all_for_quit();
+                async {}
+            })
+            .detach();
+            #[cfg(not(target_os = "macos"))]
+            cx.on_window_closed(|cx, _| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
 
-        let bounds = Bounds::centered(None, size(px(1500.), px(950.)), cx);
-        let window = cx
-            .open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    window_min_size: Some(size(px(900.), px(600.))),
-                    titlebar: Some(TitlebarOptions {
-                        title: Some(APP_NAME.into()),
-                        appears_transparent: cfg!(target_os = "macos"),
-                        traffic_light_position: cfg!(target_os = "macos")
-                            .then(|| point(px(14.), px(14.))),
-                    }),
-                    ..Default::default()
-                },
-                {
-                    let engine = engine.clone();
-                    let receiver = receiver.clone();
-                    let window_state_path = window_state_path.clone();
-                    move |window, cx| {
-                        if let Ok(state) = std::fs::read(&window_state_path) {
-                            window.restore_native_window_state(&state);
-                        }
-                        let view = cx.new(|cx| AppView::new(engine, receiver, window, cx));
-                        window.focus(&view.focus_handle(cx), cx);
-                        window.on_window_should_close(cx, {
-                            let weak = view.downgrade();
-                            let window_state_path = window_state_path.clone();
-                            move |window, cx| {
-                                let close = weak
-                                    .update(cx, |view, cx| {
-                                        if view.engine.active_count() > 0 {
-                                            view.overlay = Overlay::QuitConfirm;
-                                            cx.notify();
-                                            false
-                                        } else {
-                                            true
-                                        }
-                                    })
-                                    .unwrap_or(true);
-                                if close {
-                                    save_window_state(window, &window_state_path);
-                                }
-                                close
+            let bounds = Bounds::centered(None, size(px(1500.), px(950.)), cx);
+            let window = cx
+                .open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(bounds)),
+                        window_min_size: Some(size(px(900.), px(600.))),
+                        titlebar: Some(TitlebarOptions {
+                            title: Some(APP_NAME.into()),
+                            appears_transparent: cfg!(target_os = "macos"),
+                            traffic_light_position: cfg!(target_os = "macos")
+                                .then(|| point(px(14.), px(14.))),
+                        }),
+                        ..Default::default()
+                    },
+                    {
+                        let engine = engine.clone();
+                        let receiver = receiver.clone();
+                        let window_state_path = window_state_path.clone();
+                        move |window, cx| {
+                            if let Ok(state) = std::fs::read(&window_state_path) {
+                                window.restore_native_window_state(&state);
                             }
-                        });
-                        view
-                    }
-                },
-            )
-            .expect("failed to open CodexImage window");
-        cx.on_app_quit(move |cx| {
-            // Fails harmlessly when the window already closed and saved itself.
-            let _ = window.update(cx, |_, window, _| {
-                save_window_state(window, &window_state_path);
-            });
-            async {}
-        })
-        .detach();
-        cx.activate(true);
-    });
+                            let view = cx.new(|cx| AppView::new(engine, receiver, window, cx));
+                            window.focus(&view.focus_handle(cx), cx);
+                            window.on_window_should_close(cx, {
+                                let weak = view.downgrade();
+                                let window_state_path = window_state_path.clone();
+                                move |window, cx| {
+                                    let close = weak
+                                        .update(cx, |view, cx| {
+                                            if view.engine.active_count() > 0 {
+                                                view.overlay = Overlay::QuitConfirm;
+                                                cx.notify();
+                                                false
+                                            } else {
+                                                true
+                                            }
+                                        })
+                                        .unwrap_or(true);
+                                    if close {
+                                        save_window_state(window, &window_state_path);
+                                    }
+                                    close
+                                }
+                            });
+                            view
+                        }
+                    },
+                )
+                .expect("failed to open CodexImage window");
+            cx.on_app_quit(move |cx| {
+                // Fails harmlessly when the window already closed and saved itself.
+                let _ = window.update(cx, |_, window, _| {
+                    save_window_state(window, &window_state_path);
+                });
+                async {}
+            })
+            .detach();
+            cx.activate(true);
+        });
     Ok(())
 }
 
@@ -346,7 +357,7 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let prompt = cx.new(|cx| TextInput::auto_growing("Describe the image you want…", 7, cx));
+        let prompt = cx.new(|cx| TextInput::auto_growing("Describe the image you want…", 12, cx));
         let modal_input = cx.new(|cx| TextInput::single_line("Type here…", cx));
         let search_input = cx.new(|cx| TextInput::single_line("Search boards…", cx));
         let chat_input = cx.new(|cx| TextInput::auto_growing("Ask about this card…", 6, cx));
@@ -407,6 +418,10 @@ impl AppView {
             count: 1,
             activity: HashMap::new(),
             hovered_node: None,
+            toolbar_appeared_at: None,
+            toolbar_exit: None,
+            boards_was_open: false,
+            boards_closed_at: None,
             hovered_toolbar_button: None,
             expanded_prompts: HashSet::new(),
             armed_board_delete: None,
@@ -1118,7 +1133,7 @@ impl Render for AppView {
             .is_none_or(|board| board.nodes.is_empty());
         let overlay_covers_canvas = matches!(self.overlay, Overlay::Gallery | Overlay::Lightbox(_));
         if empty || overlay_covers_canvas {
-            self.sync_running_tick(false, cx);
+            self.sync_running_tick(None, cx);
         }
         let mut root = div()
             .image_cache(self.image_cache.clone())
@@ -1179,9 +1194,26 @@ impl Render for AppView {
             }
             root = root.child(self.render_composer(window, cx));
         }
+        let boards_open = matches!(self.overlay, Overlay::Boards);
+        if self.boards_was_open && !boards_open {
+            self.boards_closed_at = Some(std::time::Instant::now());
+        }
+        self.boards_was_open = boards_open;
+        if boards_open {
+            self.boards_closed_at = None;
+        }
+        if let Some(closed_at) = self.boards_closed_at {
+            if closed_at.elapsed() < super::overlays::BOARDS_EXIT && !overlay_covers_canvas {
+                root = root.child(self.render_boards(window, true, cx));
+                // Keep frames coming until the fold finishes, then drop it.
+                window.request_animation_frame();
+            } else {
+                self.boards_closed_at = None;
+            }
+        }
         root = match &self.overlay {
             Overlay::None => root,
-            Overlay::Boards => root.child(self.render_boards(window, cx)),
+            Overlay::Boards => root.child(self.render_boards(window, false, cx)),
             Overlay::Gallery => root.child(self.render_gallery(cx)),
             Overlay::Lightbox(lightbox) => root.child(self.render_lightbox(lightbox, window, cx)),
             Overlay::EditNode(edit) => {

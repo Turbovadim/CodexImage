@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/gpui_apple", "crates/gpui_macos"]
+members = ["crates/gpui_apple", "crates/gpui_linux", "crates/gpui_macos"]
 resolver = "2"
 
 [workspace.package]
@@ -13,6 +13,18 @@ unexpected_cfgs = { level = "allow" }
 upstream-zed-rev = "d01f1258376ec2fb498d8386e734b0dabdbb9fe5"
 
 [workspace.dependencies]
+# Added for the vendored gpui_linux (Wayland image clipboard patch).
+accesskit_unix = "0.22"
+bytemuck = "1"
+gpui_wgpu = { git = "https://github.com/zed-industries/zed", rev = "d01f1258376ec2fb498d8386e734b0dabdbb9fe5", package = "gpui_wgpu" }
+http_client = { git = "https://github.com/zed-industries/zed", rev = "d01f1258376ec2fb498d8386e734b0dabdbb9fe5", package = "http_client" }
+smol = "2.0"
+url = "2.2"
+oo7 = { git = "https://github.com/zed-industries/oo7", rev = "731c1215edb6905876c6137ab300428c7b8d7c13", version = "0.6", default-features = false }
+notify-rust = "4"
+ashpd = { version = "0.13", default-features = false, features = ["async-io", "inhibit", "open_uri", "file_chooser", "settings"] }
+xkbcommon = { version = "0.8", default-features = false }
+scap = { git = "https://github.com/zed-industries/scap", rev = "b5c86ec58dd4b6b7732bf6ac8be03d6b1f190a82", default-features = false, package = "zed-scap", version = "0.0.8-zed" }
 accesskit = { version = "0.24.0", features = ["enumn"] }
 accesskit_macos = "0.26.0"
 anyhow = "1.0.86"

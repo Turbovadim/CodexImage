@@ -107,7 +107,13 @@ pub struct TextInput {
     pub(super) undo_stack: Vec<InputSnapshot>,
     pub(super) redo_stack: Vec<InputSnapshot>,
     pub(super) history_group: Option<(EditKind, Instant)>,
+    /// Caret, content length and viewport height the scroll last followed.
+    /// The view only re-follows the caret when one of them changes, so wheel
+    /// scrolling can move away from the caret without snapping back.
+    pub(super) revealed: Option<RevealKey>,
 }
+
+pub(super) type RevealKey = (usize, usize, u32);
 
 pub enum TextInputEvent {
     PastedImages(Arc<[Image]>),
@@ -154,6 +160,7 @@ impl TextInput {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             history_group: None,
+            revealed: None,
         }
     }
 
@@ -203,6 +210,7 @@ impl TextInput {
         self.vertical_inset = 0.;
         self.preferred_x = None;
         self.selecting = false;
+        self.revealed = None;
     }
 
     fn clear_history(&mut self) {
@@ -575,8 +583,7 @@ impl EntityInputHandler for TextInput {
 }
 
 impl Render for TextInput {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let focused = self.focus.is_focused(window);
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id(("text-input", cx.entity_id()))
             .key_context("CodexImageInput")
@@ -631,7 +638,6 @@ impl Render for TextInput {
             .text_size(px(14.))
             .text_color(theme::ink())
             .rounded_md()
-            .when(focused, |style| style.bg(theme::hover().opacity(0.22)))
             .overflow_hidden()
             .child(TextElement { input: cx.entity() })
     }

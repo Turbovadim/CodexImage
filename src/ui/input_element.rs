@@ -1,6 +1,6 @@
 //! The custom element that shapes, scrolls, and paints the editor's text.
 
-use super::input::{LINE_HEIGHT, TextInput, TextInputMode};
+use super::input::{LINE_HEIGHT, RevealKey, TextInput, TextInputMode};
 use super::input_layout::{TextLayout, selection_quads};
 use super::theme;
 use gpui::{
@@ -41,6 +41,7 @@ pub(super) struct Prepaint {
     scroll_y: f32,
     vertical_inset: f32,
     shape_key: TextShapeKey,
+    revealed: Option<RevealKey>,
 }
 
 impl IntoElement for TextElement {
@@ -95,6 +96,7 @@ impl Element for TextElement {
         let focused = input.focus.is_focused(window);
         let previous_scroll_x = input.scroll_x;
         let previous_scroll_y = input.scroll_y;
+        let previously_revealed = input.revealed;
         let placeholder = input.placeholder.clone();
 
         let is_placeholder = content.is_empty();
@@ -187,7 +189,10 @@ impl Element for TextElement {
         } else {
             0.
         };
-        if focused {
+        // Follow the caret only after it, the text or the viewport changed;
+        // otherwise keep the user's own scroll position.
+        let reveal_key = focused.then(|| (cursor_index, content.len(), viewport_height.to_bits()));
+        if reveal_key.is_some() && reveal_key != previously_revealed {
             if mode.is_multiline() {
                 let max_scroll = (total_height - viewport_height).max(0.);
                 let caret_top = f32::from(caret.y);
@@ -241,6 +246,7 @@ impl Element for TextElement {
             scroll_y,
             vertical_inset,
             shape_key,
+            revealed: reveal_key,
         }
     }
 
@@ -283,6 +289,7 @@ impl Element for TextElement {
             {
                 window.paint_quad(cursor);
             }
+            paint_scrollbar(bounds, prepaint, window);
         });
         let grew = self.input.update(cx, |input, _| {
             let height_changed = input.measured_visual_lines != prepaint.layout.visual_line_count;
@@ -302,6 +309,7 @@ impl Element for TextElement {
             input.scroll_x = prepaint.scroll_x;
             input.scroll_y = prepaint.scroll_y;
             input.vertical_inset = prepaint.vertical_inset;
+            input.revealed = prepaint.revealed;
             height_changed && matches!(input.mode, TextInputMode::AutoGrow { .. })
         });
         // A notify issued mid-paint marks the view dirty without scheduling a
@@ -310,4 +318,30 @@ impl Element for TextElement {
             window.request_animation_frame();
         }
     }
+}
+
+/// A slim thumb on the right edge that shows where the viewport sits in a
+/// prompt taller than the editor.
+fn paint_scrollbar(bounds: Bounds<Pixels>, prepaint: &Prepaint, window: &mut Window) {
+    let viewport = f32::from(bounds.size.height);
+    let total = f32::from(prepaint.layout.total_height);
+    if total <= viewport + 0.5 || viewport <= 0. {
+        return;
+    }
+    let thumb_height = (viewport * viewport / total).max(18.).min(viewport);
+    let travel = viewport - thumb_height;
+    let progress = (prepaint.scroll_y / (total - viewport)).clamp(0., 1.);
+    window.paint_quad(
+        fill(
+            Bounds::new(
+                point(
+                    bounds.right() - px(4.),
+                    bounds.top() + px(travel * progress),
+                ),
+                size(px(3.), px(thumb_height)),
+            ),
+            theme::faint().opacity(0.6),
+        )
+        .corner_radii(px(1.5)),
+    );
 }

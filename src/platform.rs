@@ -37,8 +37,49 @@ fn prefer_existing_legacy(native: PathBuf, legacy: PathBuf) -> PathBuf {
     }
 }
 
-/// Opens a file in the operating system's default application.
-pub(crate) fn open_path(path: &Path) -> io::Result<()> {
+/// What the "show this file in its folder" action is called on this desktop.
+pub(crate) const REVEAL_LABEL: &str = if cfg!(target_os = "macos") {
+    "Show in Finder"
+} else if cfg!(target_os = "windows") {
+    "Show in Explorer"
+} else {
+    "Show in folder"
+};
+
+/// Opens a file in the desktop's default application.
+///
+/// On Linux and the BSDs this goes through GPUI, which tries each desktop's
+/// opener (`xdg-open`, `gio open`, `kde-open`, `gnome-open`, …) and falls back
+/// to the XDG desktop portal over D-Bus, so it also works on minimal desktops
+/// and inside Flatpak, and passes the Wayland activation token so the opened
+/// application is raised.
+pub(crate) fn open_path(path: &Path, cx: &mut gpui::App) {
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        match url::Url::from_file_path(path) {
+            Ok(url) => cx.open_url(url.as_str()),
+            Err(()) => log_open_error(path, "the path is not absolute"),
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        let _ = cx;
+        let path = path.to_owned();
+        std::thread::spawn(move || {
+            if let Err(error) = open_path_natively(&path) {
+                log_open_error(&path, &error.to_string());
+            }
+        });
+    }
+}
+
+fn log_open_error(path: &Path, reason: &str) {
+    eprintln!("Could not open {}: {reason}", path.display());
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn open_path_natively(path: &Path) -> io::Result<()> {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::ffi::OsStrExt;
@@ -72,12 +113,6 @@ pub(crate) fn open_path(path: &Path) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open").arg(path).spawn()?;
-        Ok(())
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        std::process::Command::new("xdg-open").arg(path).spawn()?;
         Ok(())
     }
 }

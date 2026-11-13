@@ -3,6 +3,7 @@
 
 use super::app::AppView;
 use super::app::Overlay;
+use super::icons::{Icon, icon};
 use super::input::TextInputEvent;
 use super::keymap::{
     AddAttachment, FocusPrompt, Generate, OpenBoards, ToggleGallery, platform_shortcut,
@@ -13,8 +14,8 @@ use crate::APP_NAME;
 use crate::model::NewNodesRequest;
 use anyhow::{Context as _, Result};
 use gpui::{
-    AnyElement, App, Context, Focusable, FontWeight, Image, ImageFormat, ObjectFit,
-    PathPromptOptions, Role, SharedString, StyledImage, Window, div, img, prelude::*, px,
+    AnyElement, App, Context, Div, Focusable, FontWeight, Image, ImageFormat, ObjectFit,
+    PathPromptOptions, Role, SharedString, Stateful, StyledImage, Window, div, img, prelude::*, px,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -22,6 +23,53 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 pub(super) const ASPECTS: &[&str] = &["auto", "1:1", "16:9", "9:16", "4:3", "3:4"];
+
+/// The app's standard control: an icon and a label on a soft filled chip whose
+/// icon picks up the accent colour on hover. Disabled chips dim and ignore the
+/// pointer; callers only attach click handlers to enabled ones.
+pub(super) fn chip(
+    id: &'static str,
+    glyph: Icon,
+    label: impl Into<SharedString>,
+    enabled: bool,
+) -> Stateful<Div> {
+    let label = label.into();
+    div()
+        .id(id)
+        .group(id)
+        .role(Role::Button)
+        .aria_label(label.clone())
+        .h(px(30.))
+        .px(px(10.))
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(px(6.))
+        .rounded_lg()
+        .border_1()
+        .border_color(theme::line().opacity(0.8))
+        .bg(theme::hover().opacity(0.6))
+        .text_xs()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(theme::dim())
+        .child(
+            icon(glyph, 14.)
+                .text_color(theme::faint())
+                .when(enabled, |glyph| {
+                    glyph.group_hover(id, |style| style.text_color(theme::accent()))
+                }),
+        )
+        .child(label)
+        .when(enabled, |chip| {
+            chip.cursor_pointer().hover(|style| {
+                style
+                    .bg(theme::hover())
+                    .border_color(theme::faint().opacity(0.8))
+                    .text_color(theme::ink())
+            })
+        })
+        .when(!enabled, |chip| chip.opacity(0.5).cursor_default())
+}
 
 pub(super) const SAMPLES: &[&str] = &[
     "A cozy cabin in a snowy forest at dusk, warm light in the windows",
@@ -126,6 +174,58 @@ pub(super) struct ComposerTarget {
     pub(super) source_image: Option<String>,
 }
 
+/// A button inside a floating action bar: an icon, optionally with a label,
+/// on a transparent face that lights up on hover. Icon-only buttons rely on
+/// their tooltip for a name.
+pub(super) fn bar_button(
+    id: &'static str,
+    glyph: Icon,
+    label: Option<&'static str>,
+    tooltip: &'static str,
+    shortcut: Option<&'static str>,
+    listener: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    div()
+        .id(id)
+        .group(id)
+        .role(Role::Button)
+        .aria_label(label.unwrap_or(tooltip))
+        .h(px(34.))
+        .when(label.is_some(), |button| button.px(px(12.)))
+        .when(label.is_none(), |button| button.w(px(34.)))
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .gap(px(7.))
+        .rounded_lg()
+        .text_sm()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(theme::dim())
+        .cursor_pointer()
+        .hover(|style| style.bg(theme::hover()).text_color(theme::ink()))
+        .active(|style| style.bg(theme::line()))
+        .tooltip(tip_with_shortcut(tooltip, shortcut))
+        .child(
+            icon(glyph, 16.)
+                .text_color(theme::dim())
+                .group_hover(id, |style| style.text_color(theme::accent())),
+        )
+        .when_some(label, |button, label| button.child(label))
+        .on_click(listener)
+        .into_any_element()
+}
+
+/// A thin vertical rule separating groups in a floating action bar.
+pub(super) fn bar_divider() -> AnyElement {
+    div()
+        .w(px(1.))
+        .h(px(20.))
+        .mx(px(4.))
+        .bg(theme::line())
+        .into_any_element()
+}
+
 pub(super) fn control_button(
     label: impl Into<SharedString>,
     listener: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
@@ -135,16 +235,27 @@ pub(super) fn control_button(
         .id(label.clone())
         .role(Role::Button)
         .aria_label(label.clone())
+        .h(px(34.))
+        .px_3()
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
         .rounded_lg()
         .border_1()
         .border_color(theme::line())
         .bg(theme::raised())
-        .px_3()
-        .py_2()
         .text_sm()
+        .font_weight(FontWeight::MEDIUM)
         .text_color(theme::dim())
         .cursor_pointer()
-        .hover(|style| style.border_color(theme::faint()).text_color(theme::ink()))
+        .hover(|style| {
+            style
+                .bg(theme::hover())
+                .border_color(theme::faint())
+                .text_color(theme::ink())
+        })
+        .active(|style| style.bg(theme::line()))
         .child(label)
         .on_click(listener)
         .into_any_element()
@@ -463,7 +574,7 @@ impl AppView {
 
     pub(super) fn render_composer(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let submission_pending = self.submission_pending;
-        let width = 660_f32.min(f32::from(window.viewport_size().width) - 40.);
+        let width = 760_f32.min(f32::from(window.viewport_size().width) - 40.);
         let left = (f32::from(window.viewport_size().width) - width) / 2.;
         let mut composer = div()
             .absolute()
@@ -499,8 +610,11 @@ impl AppView {
                             .role(Role::Button)
                             .aria_label("Remove branching target")
                             .cursor_pointer()
+                            .p_1()
+                            .rounded_md()
                             .text_color(theme::faint())
-                            .child("×")
+                            .hover(|style| style.bg(theme::hover()))
+                            .child(icon(Icon::X, 12.).text_color(theme::faint()))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.targets.remove(index);
                                 cx.notify();
@@ -520,47 +634,45 @@ impl AppView {
             }
             composer = composer.child(strip);
         }
-        let pill = |id: &'static str, label: String| {
-            div()
-                .id(id)
-                .role(Role::Button)
-                .aria_label(label.clone())
-                .px_2()
-                .py_1()
-                .rounded_md()
-                .border_1()
-                .border_color(theme::line())
-                .text_xs()
-                .text_color(theme::dim())
-                .cursor_pointer()
-                .hover(|style| style.border_color(theme::faint()).text_color(theme::ink()))
-                .child(label)
-        };
         let ready = !submission_pending
             && self.pending_attachment_writes == 0
             && !self.prompt.read(cx).content().trim().is_empty();
         let attachments_full = self.attachments.len() + self.pending_attachment_writes
             >= crate::model::MAX_ATTACHMENTS;
-        let attach_label = if self.pending_attachment_writes == 0 {
-            "Attach".into()
-        } else {
-            format!("Attach ({} pending)", self.pending_attachment_writes)
+        let attach_label = match (self.pending_attachment_writes, self.attachments.len()) {
+            (0, 0) => "Attach".to_owned(),
+            (0, attached) => format!("Attach · {attached}"),
+            (pending, _) => format!("Attaching {pending}…"),
         };
+        let count_label = if self.count == 1 {
+            "1 image".to_owned()
+        } else {
+            format!("{} images", self.count)
+        };
+        composer = composer.child(div().px_1().pb_2().child(self.prompt.clone()));
         composer = composer.child(
             div()
                 .flex()
-                .items_end()
+                .items_center()
                 .gap_2()
+                .pt_2()
+                .border_t_1()
+                .border_color(theme::line().opacity(0.6))
                 .child(
-                    pill("aspect", ASPECTS[self.aspect_index].to_owned())
-                        .tooltip(tip("Aspect ratio — click to cycle"))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.aspect_index = (this.aspect_index + 1) % ASPECTS.len();
-                            cx.notify();
-                        })),
+                    chip(
+                        "aspect",
+                        Icon::AspectRatio,
+                        ASPECTS[self.aspect_index],
+                        true,
+                    )
+                    .tooltip(tip("Aspect ratio — click to cycle"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.aspect_index = (this.aspect_index + 1) % ASPECTS.len();
+                        cx.notify();
+                    })),
                 )
                 .child(
-                    pill("count", format!("×{}", self.count))
+                    chip("count", Icon::Copies, count_label, true)
                         .tooltip(tip("Images per run — click to cycle 1–4"))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.count = this.count % 4 + 1;
@@ -568,12 +680,7 @@ impl AppView {
                         })),
                 )
                 .child(
-                    pill("attach", attach_label)
-                        .when(attachments_full, |pill| {
-                            pill.text_color(theme::faint())
-                                .border_color(theme::line().opacity(0.5))
-                                .cursor_default()
-                        })
+                    chip("attach", Icon::Paperclip, attach_label, !attachments_full)
                         .tooltip(tip_with_shortcut(
                             if attachments_full {
                                 "Attachment limit reached"
@@ -582,13 +689,21 @@ impl AppView {
                             },
                             Some(platform_shortcut("⌘O", "Ctrl+O")),
                         ))
-                        .when(!attachments_full, |pill| {
-                            pill.on_click(cx.listener(|this, _, window, cx| {
+                        .when(!attachments_full, |chip| {
+                            chip.on_click(cx.listener(|this, _, window, cx| {
                                 this.add_attachment(&AddAttachment, window, cx)
                             }))
                         }),
                 )
-                .child(div().flex_1().child(self.prompt.clone()))
+                .child(div().flex_1())
+                .when(ready, |row| {
+                    row.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::faint())
+                            .child("↵ generate · ⇧↵ new line"),
+                    )
+                })
                 .child(
                     div()
                         .id("send")
@@ -598,19 +713,21 @@ impl AppView {
                         } else {
                             "Generate"
                         })
-                        .size(px(28.))
-                        .rounded_lg()
+                        .size(px(32.))
+                        .flex_none()
+                        .rounded_full()
                         .flex()
                         .items_center()
                         .justify_center()
                         .when(ready, |send| {
-                            send.bg(theme::accent_strong().opacity(0.18))
-                                .text_color(theme::accent())
+                            send.bg(theme::accent_strong())
                                 .cursor_pointer()
-                                .hover(|style| style.bg(theme::accent_strong().opacity(0.32)))
+                                .hover(|style| style.bg(theme::accent()))
                         })
                         .when(!ready, |send| {
-                            send.bg(theme::hover()).text_color(theme::faint())
+                            send.bg(theme::hover())
+                                .border_1()
+                                .border_color(theme::line())
                         })
                         .tooltip(tip_with_shortcut(
                             if ready {
@@ -622,7 +739,11 @@ impl AppView {
                             },
                             Some("↵"),
                         ))
-                        .child("↑")
+                        .child(icon(Icon::ArrowUp, 16.).text_color(if ready {
+                            gpui::white()
+                        } else {
+                            theme::faint()
+                        }))
                         .when(ready, |send| {
                             send.on_click(cx.listener(|this, _, window, cx| {
                                 this.generate(&Generate, window, cx)
@@ -695,15 +816,17 @@ impl AppView {
             .role(Role::Button)
             .aria_label(format!("Switch board. Current board: {title}"))
             .aria_keyshortcuts(platform_shortcut("Meta+K", "Control+K"))
+            .group("board-switcher")
+            .h(px(36.))
+            .pl(px(10.))
+            .pr(px(8.))
             .flex()
             .items_center()
-            .gap_2()
+            .gap(px(8.))
             .rounded_xl()
             .border_1()
             .border_color(theme::line())
             .bg(theme::raised().opacity(0.96))
-            .px_3()
-            .py_2()
             .cursor_pointer()
             .hover(|style| style.border_color(theme::faint()).bg(theme::hover()))
             .tooltip(tip_with_shortcut(
@@ -711,19 +834,34 @@ impl AppView {
                 Some(platform_shortcut("⌘K", "Ctrl+K")),
             ))
             .on_click(cx.listener(|this, _, window, cx| this.open_boards(&OpenBoards, window, cx)))
-            .child(div().text_color(theme::accent()).child("❖"))
             .child(
                 div()
-                    .max_w(px(230.))
+                    .size(px(22.))
+                    .flex_none()
+                    .rounded_md()
+                    .bg(theme::accent_strong().opacity(0.18))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(icon(Icon::Boards, 13.).text_color(theme::accent())),
+            )
+            .child(
+                div()
+                    .max_w(px(260.))
                     .text_sm()
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme::ink())
+                    .truncate()
                     .child(title.to_owned()),
             );
         if generating {
             switcher = switcher.child(div().size(px(8.)).rounded_full().bg(theme::accent()));
         }
-        switcher = switcher.child(div().text_xs().text_color(theme::faint()).child("⌄"));
+        switcher = switcher.child(
+            icon(Icon::ChevronDown, 14.)
+                .text_color(theme::faint())
+                .group_hover("board-switcher", |style| style.text_color(theme::ink())),
+        );
         div()
             .absolute()
             .top(px(14.))
@@ -734,31 +872,17 @@ impl AppView {
             .occlude()
             .child(switcher)
             .child(
-                div()
-                    .id("model-switch")
-                    .role(Role::Button)
+                chip("model-switch", Icon::Settings, model_summary.clone(), true)
                     .aria_label(format!("Codex settings. Model: {model_summary}"))
                     .aria_keyshortcuts(platform_shortcut("Meta+Comma", "Control+Comma"))
+                    .h(px(36.))
+                    .px(px(12.))
                     .rounded_xl()
-                    .border_1()
-                    .border_color(theme::line())
                     .bg(theme::raised().opacity(0.96))
-                    .px_3()
-                    .py_2()
-                    .text_xs()
-                    .text_color(theme::dim())
-                    .cursor_pointer()
-                    .hover(|style| {
-                        style
-                            .border_color(theme::faint())
-                            .bg(theme::hover())
-                            .text_color(theme::ink())
-                    })
                     .tooltip(tip_with_shortcut(
                         "Model this app asks Codex for",
                         Some(platform_shortcut("⌘,", "Ctrl+,")),
                     ))
-                    .child(model_summary)
                     .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx))),
             )
             .into_any_element()
@@ -771,36 +895,22 @@ impl AppView {
             .iter()
             .any(|node| !node.images.is_empty())
             .then(|| {
-                div()
-                    .id("gallery-button")
+                chip("gallery-button", Icon::Gallery, "Gallery", true)
                     .accessibility_id("codex-image.gallery.open")
-                    .role(Role::Button)
                     .aria_label("Open image gallery")
                     .aria_keyshortcuts("G")
                     .absolute()
                     .top(px(14.))
                     .right(px(18.))
+                    .h(px(36.))
+                    .px(px(12.))
                     .rounded_xl()
-                    .border_1()
-                    .border_color(theme::line())
                     .bg(theme::raised().opacity(0.96))
-                    .px_3()
-                    .py_2()
-                    .text_sm()
-                    .text_color(theme::dim())
-                    .cursor_pointer()
                     .occlude()
-                    .hover(|style| {
-                        style
-                            .border_color(theme::faint())
-                            .bg(theme::hover())
-                            .text_color(theme::ink())
-                    })
                     .tooltip(tip_with_shortcut(
                         "Browse every image on this board",
                         Some("G"),
                     ))
-                    .child("▦  Gallery")
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_gallery(&ToggleGallery, window, cx)
                     }))

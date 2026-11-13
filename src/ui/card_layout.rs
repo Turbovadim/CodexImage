@@ -2,10 +2,9 @@
 //! outputs, and the resulting card height.
 
 use super::card::{
-    ATTACHMENT_ROW_HEIGHT, COLLAPSED_PROMPT_LINES, EXPANDED_PROMPT_LINES, MEDIA_GAP,
-    PROMPT_LINE_HEIGHT, PROMPT_WRAP_COLUMNS, SHOW_MORE_HEIGHT,
+    ATTACHMENT_ROW_HEIGHT, COLLAPSED_PROMPT_LINES, EXPANDED_PROMPT_LINES, MEDIA_GAP, MEDIA_INSET,
+    MEDIA_WIDTH, PROMPT_LINE_HEIGHT, PROMPT_WRAP_COLUMNS, SHOW_MORE_HEIGHT, TILE_GAP,
 };
-use crate::layout::CARD_WIDTH;
 use crate::model::{BoardNode, NodeStatus};
 use std::collections::HashMap;
 use unicode_segmentation::UnicodeSegmentation;
@@ -88,9 +87,42 @@ fn prompt_metrics_from_line_count(total_lines: usize, expanded: bool) -> (f32, b
     )
 }
 
+/// The prompt as a card shows it: markdown heading markers and emphasis
+/// characters removed, and runs of blank lines collapsed to one.
+fn display_prompt(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut previous_blank = true;
+    for line in value.split('\n') {
+        let trimmed = line.trim_start();
+        let heading = trimmed.trim_start_matches('#');
+        let line = if heading.len() < trimmed.len() && heading.starts_with(' ') {
+            heading.trim_start()
+        } else {
+            line
+        };
+        let line = line.replace("**", "").replace("__", "").replace('`', "");
+        let blank = line.trim().is_empty();
+        if blank && previous_blank {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        if !blank {
+            out.push_str(&line);
+        }
+        previous_blank = blank;
+    }
+    while out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
 pub fn wrap_prompt(value: &str, max_graphemes: usize) -> Vec<String> {
     assert!(max_graphemes > 0, "prompt wrap width must be non-zero");
     let mut lines = Vec::new();
+    let value = display_prompt(value);
 
     for paragraph in value.split('\n') {
         if paragraph.is_empty() {
@@ -156,20 +188,27 @@ pub fn displayed_urls(node: &BoardNode) -> &[String] {
 pub fn output_layout(node: &BoardNode, ratios: &HashMap<String, f32>) -> OutputLayout {
     let urls = displayed_urls(node);
     match urls.len() {
+        // The placeholder already takes the requested shape, so the card
+        // does not jump when the image lands.
         0 if node.status == NodeStatus::Running => OutputLayout::Tiles {
-            height: CARD_WIDTH,
+            height: image_height(
+                MEDIA_WIDTH,
+                parse_aspect_ratio(&node.aspect)
+                    .unwrap_or(1.)
+                    .clamp(0.2, 5.),
+            ),
             cells: Vec::new(),
         },
         0 => OutputLayout::None,
         1 => {
-            let height = image_height(CARD_WIDTH, output_ratio(node, &urls[0], ratios));
+            let height = image_height(MEDIA_WIDTH, output_ratio(node, &urls[0], ratios));
             OutputLayout::Tiles {
                 height,
                 cells: vec![OutputCell {
                     index: 0,
-                    x: 0.,
+                    x: MEDIA_INSET,
                     y: 0.,
-                    width: CARD_WIDTH,
+                    width: MEDIA_WIDTH,
                     height,
                 }],
             }
@@ -186,7 +225,7 @@ pub fn output_layout(node: &BoardNode, ratios: &HashMap<String, f32>) -> OutputL
             let mut y = 0.;
             let mut index = 0;
             for &columns in rows {
-                let cell_width = (CARD_WIDTH - MEDIA_GAP * (columns - 1) as f32) / columns as f32;
+                let cell_width = (MEDIA_WIDTH - TILE_GAP * (columns - 1) as f32) / columns as f32;
                 let row_height = urls[index..index + columns]
                     .iter()
                     .map(|url| image_height(cell_width, output_ratio(node, url, ratios)))
@@ -194,7 +233,7 @@ pub fn output_layout(node: &BoardNode, ratios: &HashMap<String, f32>) -> OutputL
                 for column in 0..columns {
                     cells.push(OutputCell {
                         index: index + column,
-                        x: column as f32 * (cell_width + MEDIA_GAP),
+                        x: MEDIA_INSET + column as f32 * (cell_width + TILE_GAP),
                         y,
                         width: cell_width,
                         height: row_height,
@@ -203,13 +242,13 @@ pub fn output_layout(node: &BoardNode, ratios: &HashMap<String, f32>) -> OutputL
                 index += columns;
                 y += row_height;
                 if index < urls.len() {
-                    y += MEDIA_GAP;
+                    y += TILE_GAP;
                 }
             }
             OutputLayout::Tiles { height: y, cells }
         }
         _ => {
-            let hero_height = image_height(CARD_WIDTH, output_ratio(node, &urls[0], ratios));
+            let hero_height = image_height(MEDIA_WIDTH, output_ratio(node, &urls[0], ratios));
             let compact_count = if urls.len() > 6 {
                 4
             } else {
@@ -217,10 +256,10 @@ pub fn output_layout(node: &BoardNode, ratios: &HashMap<String, f32>) -> OutputL
             };
             let hidden_count = urls.len() - compact_count - 1;
             let strip_cells = compact_count + usize::from(hidden_count > 0);
-            let strip_cell_width = (CARD_WIDTH - MEDIA_GAP * strip_cells.saturating_sub(1) as f32)
+            let strip_cell_width = (MEDIA_WIDTH - TILE_GAP * strip_cells.saturating_sub(1) as f32)
                 / strip_cells as f32;
             OutputLayout::Filmstrip {
-                height: hero_height + MEDIA_GAP + strip_cell_width,
+                height: hero_height + TILE_GAP + strip_cell_width,
                 hero_height,
                 compact_count,
                 hidden_count,
@@ -324,7 +363,8 @@ mod tests {
             panic!("expected tiled layout")
         };
         assert_eq!(cells.len(), 4);
-        assert_eq!(cells[0].x, 0.);
+        assert_eq!(cells[0].x, super::MEDIA_INSET);
+        assert!(cells[3].x + cells[3].width <= super::MEDIA_INSET + super::MEDIA_WIDTH + 0.01);
         assert!(cells[1].x > cells[0].x + cells[0].width);
         assert!(cells[2].y > cells[0].y);
         assert!(height >= cells[3].y + cells[3].height);
@@ -384,6 +424,19 @@ mod tests {
             .flat_map(|line| line.chars())
             .filter(|character| !character.is_whitespace());
         assert_eq!(source.collect::<String>(), wrapped.collect::<String>());
+    }
+
+    #[test]
+    fn prompt_wrap_hides_markdown_syntax() {
+        assert_eq!(
+            wrap_prompt("# Ela — Character\n\n\n## 1. Identity\nEla, **16–17**", 40),
+            vec!["Ela — Character", "", "1. Identity", "Ela, 16–17"]
+        );
+        // A hash that is not a heading marker stays.
+        assert_eq!(
+            wrap_prompt("#FFFFFF backdrop", 40),
+            vec!["#FFFFFF backdrop"]
+        );
     }
 
     #[test]

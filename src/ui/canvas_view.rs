@@ -10,9 +10,10 @@ use super::canvas::{
 };
 use super::card::{
     ATTACHMENT_ROW_HEIGHT, COLLAPSED_PROMPT_LINES, CanvasNode, CardRect, EXPANDED_PROMPT_LINES,
-    MEDIA_GAP, OutputLayout, PROMPT_LINE_HEIGHT, SHOW_MORE_HEIGHT, attached_text_height,
-    status_area_height,
+    MEDIA_GAP, OutputLayout, PROMPT_LINE_HEIGHT, SHOW_MORE_HEIGHT, TILE_GAP, attached_text_height,
+    filmstrip_cell_x, status_area_height,
 };
+use super::icons::Icon;
 use super::keymap::{FitCanvas, ResetZoom, ZoomIn, ZoomOut, platform_shortcut};
 use super::theme;
 use super::tooltip::{tip, tip_with_shortcut};
@@ -31,8 +32,12 @@ use std::time::{Duration, Instant};
 pub(super) const NODE_TOOLBAR_HEIGHT: f32 = 36.;
 /// World-space toolbar metrics; everything scales with the canvas zoom so the
 /// toolbar keeps a fixed size relative to its card.
-const TOOLBAR_BUTTON_HEIGHT: f32 = 22.;
-const TOOLBAR_GAP: f32 = 4.;
+const TOOLBAR_BUTTON_HEIGHT: f32 = 26.;
+const TOOLBAR_GAP: f32 = 2.;
+/// Entrance timing of the hovered card's action bar, in seconds.
+const TOOLBAR_STAGGER: f32 = 0.025;
+const TOOLBAR_BUTTON_APPEAR: f32 = 0.2;
+const TOOLBAR_EXIT: f32 = 0.14;
 const TOOLBAR_CARD_GAP: f32 = 6.;
 const TOOLBAR_RIGHT_MARGIN: f32 = 4.;
 const MIN_ZOOM: f32 = 0.08;
@@ -42,6 +47,8 @@ const ZOOM_SETTLE_DELAY: Duration = Duration::from_millis(150);
 /// Only the elapsed-time label needs a clock. Generation activity arrives
 /// through repository events; no decorative animation keeps the canvas busy.
 const RUNNING_STATUS_INTERVAL: Duration = Duration::from_secs(1);
+/// About 30 fps: smooth for slow waves, gentle on battery and GPU.
+const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 const MINIMAP_WIDTH: f32 = 142.;
 const MINIMAP_HEIGHT: f32 = 96.;
 const MINIMAP_RIGHT: f32 = 18.;
@@ -115,16 +122,31 @@ pub(super) enum ToolbarAction {
 }
 
 impl ToolbarAction {
-    fn label(self) -> &'static str {
+    fn icon(self) -> Icon {
         match self {
-            Self::Stop => "Stop",
-            Self::Branch => "Branch",
-            Self::Combine => "Mix",
-            Self::Chat => "Chat",
-            Self::Edit => "Edit",
-            Self::Retry => "Retry",
-            Self::Copy => "Copy",
-            Self::Duplicate => "Dup",
+            Self::Stop => Icon::Stop,
+            Self::Branch => Icon::Branch,
+            Self::Combine => Icon::Mix,
+            Self::Chat => Icon::Chat,
+            Self::Edit => Icon::Pencil,
+            Self::Retry => Icon::Retry,
+            Self::Copy => Icon::Copies,
+            Self::Duplicate => Icon::Duplicate,
+            Self::Delete => Icon::Trash,
+        }
+    }
+
+    /// The name shown in the hover label above the icon button.
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Stop => "Stop generating",
+            Self::Branch => "Branch (B)",
+            Self::Combine => "Mix with another card (C)",
+            Self::Chat => "Chat (T)",
+            Self::Edit => "Edit prompt (E)",
+            Self::Retry => "Regenerate (R)",
+            Self::Copy => "Copy prompt",
+            Self::Duplicate => "Duplicate (D)",
             Self::Delete => "Delete",
         }
     }
@@ -132,7 +154,7 @@ impl ToolbarAction {
     fn color(self) -> gpui::Hsla {
         match self {
             Self::Stop | Self::Delete => theme::danger(),
-            Self::Branch => theme::ink(),
+            Self::Branch => theme::accent(),
             _ => theme::dim(),
         }
     }
@@ -156,8 +178,8 @@ const IDLE_TOOLBAR_ACTIONS: [ToolbarAction; 8] = [
     ToolbarAction::Delete,
 ];
 
-fn toolbar_button_width(action: ToolbarAction) -> f32 {
-    14. + action.label().chars().count() as f32 * 6.6
+fn toolbar_button_width(_: ToolbarAction) -> f32 {
+    TOOLBAR_BUTTON_HEIGHT + 4.
 }
 
 /// The card-local world-space rectangles of the hovered card's action buttons,
@@ -549,20 +571,43 @@ impl AppView {
                 })
             })
             .collect::<Vec<_>>();
-        self.sync_running_tick(
-            visible_nodes
-                .iter()
-                .any(|frame| frame.status_line.is_some())
-                && window.is_window_active(),
-            cx,
-        );
+        // Elapsed seconds need a redraw each second; the wave animation on a
+        // running card without an image yet needs a smooth frame rate.
+        let running_visible = visible_nodes
+            .iter()
+            .any(|frame| frame.status_line.is_some());
+        let animating = visible_nodes.iter().any(|frame| {
+            frame.status_line.is_some()
+                && self
+                    .canvas_nodes
+                    .get(frame.node_index)
+                    .is_some_and(|node| node.scene.generating_area.is_some())
+        });
+        let tick = (running_visible && window.is_window_active()).then_some(if animating {
+            ANIMATION_FRAME_INTERVAL
+        } else {
+            RUNNING_STATUS_INTERVAL
+        });
+        self.sync_running_tick(tick, cx);
 
-        let toolbar_buttons = self.hovered_node.as_deref().and_then(|hovered_id| {
+        let toolbar_for = |node_id: &str, exit: Option<f32>| {
             visible_nodes.iter().find_map(|frame| {
                 let node = self.canvas_nodes.get(frame.node_index)?;
-                (node.node.id == hovered_id).then(|| self.toolbar_paint_buttons(node, frame))
+                (node.node.id == node_id).then(|| self.toolbar_paint_buttons(node, frame, exit))
             })
+        };
+        // A bar that is fading out paints first, under any bar fading in.
+        let exiting_toolbar = self.toolbar_exit.as_ref().and_then(|(node_id, left_at)| {
+            let elapsed = left_at.elapsed().as_secs_f32();
+            (elapsed < TOOLBAR_EXIT).then(|| toolbar_for(node_id, Some(elapsed)))?
         });
+        let toolbar_buttons = self
+            .hovered_node
+            .as_deref()
+            .and_then(|hovered_id| toolbar_for(hovered_id, None));
+        if exiting_toolbar.is_none() {
+            self.toolbar_exit = None;
+        }
         let canvas_connectors = if self.transient_positions.is_empty() {
             Arc::clone(&self.canvas_connectors)
         } else {
@@ -609,8 +654,11 @@ impl AppView {
                     let entity = window.current_view();
                     window.on_next_frame(move |_, cx| cx.notify(entity));
                 }
+                if let Some(buttons) = &exiting_toolbar {
+                    paint_node_toolbar(buttons, zoom, window, cx);
+                }
                 if let Some(buttons) = &toolbar_buttons {
-                    paint_node_toolbar(buttons, zoom, window);
+                    paint_node_toolbar(buttons, zoom, window, cx);
                 }
             },
         )
@@ -652,26 +700,32 @@ impl AppView {
         layer.child(zoom_controls).into_any_element()
     }
 
-    /// Update elapsed time only while running cards are visible in the active window.
-    pub(super) fn sync_running_tick(&mut self, active: bool, cx: &mut Context<Self>) {
-        if !active {
+    /// Redraws at `interval` while running cards are visible in the active
+    /// window; `None` stops the ticker.
+    pub(super) fn sync_running_tick(&mut self, interval: Option<Duration>, cx: &mut Context<Self>) {
+        let Some(interval) = interval else {
             self.running_tick_task.take();
             return;
-        }
-        if self.running_tick_task.is_some() {
+        };
+        if self
+            .running_tick_task
+            .as_ref()
+            .is_some_and(|(current, _)| *current == interval)
+        {
             return;
         }
 
-        self.running_tick_task = Some(cx.spawn(async move |weak, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(RUNNING_STATUS_INTERVAL)
-                    .await;
-                if weak.update(cx, |_, cx| cx.notify()).is_err() {
-                    break;
+        self.running_tick_task = Some((
+            interval,
+            cx.spawn(async move |weak, cx| {
+                loop {
+                    cx.background_executor().timer(interval).await;
+                    if weak.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
                 }
-            }
-        }));
+            }),
+        ));
     }
 
     fn running_status_line(&self, node: &BoardNode, now: i64) -> SharedString {
@@ -679,11 +733,11 @@ impl AppView {
         let activity = self
             .activity
             .get(&node.id)
-            .map(String::as_str)
-            .unwrap_or("Working");
+            .map(|activity| friendly_activity(activity))
+            .unwrap_or_else(|| "Working".into());
         format!(
-            "Generating · {}s · {activity}",
-            (now - started).max(0) / 1_000
+            "{} · {activity}",
+            format_elapsed((now - started).max(0) / 1_000)
         )
         .into()
     }
@@ -779,17 +833,29 @@ impl AppView {
     }
 
     /// Screen-space paint data for the hovered card's toolbar.
+    /// The hovered card's bar, or with `exit` (seconds since the pointer
+    /// left) the same bar fading out without hover highlights.
     fn toolbar_paint_buttons(
         &self,
         canvas_node: &CanvasNode,
         frame: &CanvasNodeFrame,
+        exit: Option<f32>,
     ) -> Vec<ToolbarButtonPaint> {
         let running = canvas_node.node.status == NodeStatus::Running;
+        let elapsed = self
+            .toolbar_appeared_at
+            .map_or(f32::INFINITY, |shown| shown.elapsed().as_secs_f32());
         let below = self.node_toolbar_is_below(frame.screen_y);
         let card_height = self.card_height(&canvas_node.node);
         toolbar_layout(running, below, card_height)
             .enumerate()
             .map(|(index, (action, rect))| ToolbarButtonPaint {
+                // Buttons pop in one after another.
+                appear: match exit {
+                    Some(exit) => 1. - (exit / TOOLBAR_EXIT).clamp(0., 1.),
+                    None => ((elapsed - index as f32 * TOOLBAR_STAGGER) / TOOLBAR_BUTTON_APPEAR)
+                        .clamp(0., 1.),
+                },
                 bounds: Bounds::new(
                     point(
                         px(frame.screen_x + rect.x * self.zoom),
@@ -797,9 +863,14 @@ impl AppView {
                     ),
                     size(px(rect.width * self.zoom), px(rect.height * self.zoom)),
                 ),
-                label: action.label().into(),
+                hint: if action == ToolbarAction::Copy && !canvas_node.node.images.is_empty() {
+                    "Copy image".into()
+                } else {
+                    action.hint().into()
+                },
+                icon: action.icon(),
                 color: action.color(),
-                hovered: self.hovered_toolbar_button == Some(index),
+                hovered: exit.is_none() && self.hovered_toolbar_button == Some(index),
             })
             .collect()
     }
@@ -1025,12 +1096,12 @@ impl AppView {
                     if media_y <= *hero_height {
                         Some(0)
                     } else {
-                        let strip_y = media_y - *hero_height - MEDIA_GAP;
+                        let strip_y = media_y - *hero_height - TILE_GAP;
                         if strip_y < 0. || strip_y > *strip_cell_width {
                             None
                         } else {
                             (0..*compact_count).find_map(|compact_index| {
-                                let x = compact_index as f32 * (*strip_cell_width + MEDIA_GAP);
+                                let x = filmstrip_cell_x(compact_index, *strip_cell_width);
                                 (local_x >= x && local_x <= x + *strip_cell_width)
                                     .then_some(compact_index + 1)
                             })
@@ -1181,6 +1252,17 @@ impl AppView {
                         .map(|(button_index, _)| button_index)
                 });
                 if hovered != self.hovered_node || hovered_button != self.hovered_toolbar_button {
+                    if hovered != self.hovered_node {
+                        let now = std::time::Instant::now();
+                        self.toolbar_appeared_at = hovered.is_some().then_some(now);
+                        // The bar being left fades out; returning to a card
+                        // that is still fading out simply re-enters it.
+                        self.toolbar_exit = self
+                            .hovered_node
+                            .take()
+                            .filter(|previous| Some(previous) != hovered.as_ref())
+                            .map(|previous| (previous, now));
+                    }
                     self.hovered_node = hovered;
                     self.hovered_toolbar_button = hovered_button;
                     cx.notify();
@@ -1277,7 +1359,15 @@ impl AppView {
             ToolbarAction::Edit => self.edit_node(node_id, window, cx),
             ToolbarAction::Retry => self.regenerate_node(node_id, window, cx),
             ToolbarAction::Copy => {
-                if let Some(node) = self.node(node_id) {
+                // A finished card copies its first image; otherwise the prompt.
+                let image_path = self.node(node_id).and_then(|node| {
+                    let url = node.images.first()?;
+                    let board_id = self.board_id.as_deref()?;
+                    self.engine.repository().image_path(board_id, url)
+                });
+                if let Some(path) = image_path {
+                    self.copy_image(&path, cx);
+                } else if let Some(node) = self.node(node_id) {
                     cx.write_to_clipboard(ClipboardItem::new_string(node.prompt.clone()));
                     self.show_toast("Prompt copied".into(), false, None, cx);
                 }
@@ -1288,6 +1378,42 @@ impl AppView {
     }
 }
 
+/// "45s", "1m 52s", "1h 03m".
+fn format_elapsed(seconds: i64) -> String {
+    match seconds {
+        0..60 => format!("{seconds}s"),
+        60..3600 => format!("{}m {:02}s", seconds / 60, seconds % 60),
+        _ => format!("{}h {:02}m", seconds / 3600, seconds % 3600 / 60),
+    }
+}
+
+/// Turns Codex's raw activity (a reasoning headline or a shell command) into a
+/// short phrase that fits the card footer.
+fn friendly_activity(activity: &str) -> String {
+    const MAX_CHARS: usize = 34;
+    let phrase = if let Some(command) = activity.strip_prefix("Running: ") {
+        if command.contains("--condition-image") {
+            "Preparing a reference image".to_owned()
+        } else {
+            "Running a command".to_owned()
+        }
+    } else {
+        activity
+            .replace("**", "")
+            .replace('`', "")
+            .trim()
+            .to_owned()
+    };
+    if phrase.chars().count() > MAX_CHARS {
+        let cut: String = phrase.chars().take(MAX_CHARS - 1).collect();
+        format!("{}…", cut.trim_end())
+    } else if phrase.is_empty() {
+        "Working".to_owned()
+    } else {
+        phrase
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1295,6 +1421,26 @@ mod tests {
         generation::GenerationEngine,
         storage::{DataPaths, Repository},
     };
+
+    #[test]
+    fn footer_activity_is_short_and_readable() {
+        assert_eq!(
+            friendly_activity("Running: /usr/bin/bash -lc 'cat /home/x/prompt.md'"),
+            "Running a command"
+        );
+        assert_eq!(
+            friendly_activity("Running: codex-image --condition-image a.png b.png"),
+            "Preparing a reference image"
+        );
+        assert_eq!(
+            friendly_activity("**Planning the illustration**"),
+            "Planning the illustration"
+        );
+        assert!(friendly_activity(&"word ".repeat(30)).ends_with('…'));
+        assert_eq!(format_elapsed(5), "5s");
+        assert_eq!(format_elapsed(112), "1m 52s");
+        assert_eq!(format_elapsed(3725), "1h 02m");
+    }
     use gpui::TestAppContext;
 
     fn test_engine() -> (

@@ -1163,11 +1163,33 @@ pub fn chat_activity_key(node_id: &str) -> String {
 /// same-run conditioning stays off when that companion is not installed.
 fn same_run_conditioner_executable() -> Option<PathBuf> {
     let executable = std::env::current_exe().ok()?;
+    #[cfg(target_os = "linux")]
+    let executable = live_executable_path(executable);
     if !cfg!(target_os = "windows") {
         return Some(executable);
     }
     let companion = executable.with_file_name("codex-image-condition.exe");
     companion.is_file().then_some(companion)
+}
+
+/// Linux reports `/proc/self/exe` as `<path> (deleted)` once the running binary
+/// is replaced on disk (a rebuild or package upgrade). Codex runs the
+/// conditioner by path, so point it at the replacement installed there.
+#[cfg(target_os = "linux")]
+fn live_executable_path(executable: PathBuf) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = executable.as_os_str().as_bytes();
+    match bytes.strip_suffix(b" (deleted)") {
+        Some(original) => {
+            let original = PathBuf::from(std::ffi::OsStr::from_bytes(original));
+            if original.is_file() {
+                original
+            } else {
+                executable
+            }
+        }
+        None => executable,
+    }
 }
 
 #[cfg(test)]

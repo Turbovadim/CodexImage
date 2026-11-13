@@ -404,7 +404,7 @@ impl Repository {
         let mut state = self.inner.write();
         let board = board_mut(&mut state, board_id)?;
         if board.nodes.is_empty() {
-            board.title = prompt.chars().take(60).collect();
+            board.title = board_title_from_prompt(&prompt);
         }
         board.nodes.extend(nodes.clone());
         drop(state);
@@ -929,8 +929,17 @@ fn load_boards(path: &Path) -> Result<Vec<Board>> {
         return Ok(Vec::new());
     }
     let bytes = fs::read(path)?;
-    match serde_json::from_slice(&bytes) {
-        Ok(boards) => Ok(boards),
+    match serde_json::from_slice::<Vec<Board>>(&bytes) {
+        Ok(mut boards) => {
+            // Older versions titled boards with the raw first 60 characters of
+            // the prompt, markdown and line breaks included.
+            for board in &mut boards {
+                if looks_like_raw_prompt(&board.title) {
+                    board.title = board_title_from_prompt(&board.title);
+                }
+            }
+            Ok(boards)
+        }
         Err(error) => {
             let backup = path.with_extension(format!("json.corrupt-{}", now_ms()));
             fs::copy(path, &backup).with_context(|| {
@@ -945,6 +954,76 @@ fn load_boards(path: &Path) -> Result<Vec<Board>> {
             ))
         }
     }
+}
+
+const BOARD_TITLE_MAX_CHARS: usize = 48;
+
+/// Names a board after its first prompt: the first meaningful line with
+/// markdown syntax removed, shortened at a word boundary.
+pub(crate) fn board_title_from_prompt(prompt: &str) -> String {
+    let line = prompt
+        .lines()
+        .map(strip_markdown_line)
+        .find(|line| line.chars().any(char::is_alphanumeric))
+        .unwrap_or_default();
+    let mut title = line.as_str();
+    // "Ela — Character Prompt" reads better as "Ela — Character".
+    for suffix in [" prompt", " Prompt", " PROMPT"] {
+        if let Some(stripped) = title.strip_suffix(suffix)
+            && stripped.chars().any(char::is_alphanumeric)
+        {
+            title = stripped.trim_end_matches([' ', '-', '—', '–', ':']);
+        }
+    }
+    let title = shorten_at_word(title, BOARD_TITLE_MAX_CHARS);
+    if title.is_empty() {
+        "New board".into()
+    } else {
+        title
+    }
+}
+
+fn looks_like_raw_prompt(title: &str) -> bool {
+    title.contains('\n') || title.trim_start().starts_with('#') || title.contains("**")
+}
+
+fn strip_markdown_line(line: &str) -> String {
+    let mut rest = line.trim();
+    loop {
+        let before = rest;
+        rest = rest.trim_start_matches(['#', '>', ' ', '\t']);
+        for marker in ["- ", "* ", "+ ", "• "] {
+            rest = rest.strip_prefix(marker).unwrap_or(rest);
+        }
+        // Ordered list markers such as "1." or "2)".
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        if digits > 0 && rest[digits..].starts_with(['.', ')']) {
+            rest = &rest[digits + 1..];
+        }
+        if rest == before {
+            break;
+        }
+    }
+    let cleaned: String = rest
+        .chars()
+        .filter(|c| !matches!(c, '*' | '_' | '`'))
+        .collect();
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn shorten_at_word(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_owned();
+    }
+    let cut: String = text.chars().take(max_chars).collect();
+    let cut = match cut.rfind(' ') {
+        Some(space) if space > max_chars / 2 => &cut[..space],
+        _ => cut.as_str(),
+    };
+    format!(
+        "{}…",
+        cut.trim_end_matches([' ', ',', '-', '—', '–', ':', ';'])
+    )
 }
 
 fn board_mut<'a>(state: &'a mut RepositoryState, board_id: &str) -> Result<&'a mut Board> {
@@ -1159,8 +1238,8 @@ pub fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DataPaths, Repository, RepositoryEvent, atomic_write, board_mut, create_thumbnail,
-        thumbnail_path_for,
+        DataPaths, Repository, RepositoryEvent, atomic_write, board_mut, board_title_from_prompt,
+        create_thumbnail, thumbnail_path_for,
     };
     use crate::model::{AttachmentEdit, BoardNode, NewNodesRequest, NodeStatus};
     use async_channel::{Receiver, unbounded};
@@ -1168,6 +1247,27 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
+
+    #[test]
+    fn board_titles_drop_markdown_and_line_breaks() {
+        assert_eq!(
+            board_title_from_prompt(
+                "# Ela — Unified 4K Character Prompt\n\n## 1. Identity\nEla, **16–17**"
+            ),
+            "Ela — Unified 4K Character"
+        );
+        assert_eq!(
+            board_title_from_prompt("\n\n- **A cozy cabin** in a snowy forest at dusk"),
+            "A cozy cabin in a snowy forest at dusk"
+        );
+        assert_eq!(
+            board_title_from_prompt(
+                "Isometric illustration of a tiny home office with plants, pastel palette"
+            ),
+            "Isometric illustration of a tiny home office…"
+        );
+        assert_eq!(board_title_from_prompt("## \n***"), "New board");
+    }
 
     fn repository(directory: &TempDir) -> (Repository, Receiver<RepositoryEvent>) {
         let generated = directory.path().join("generated");

@@ -5,6 +5,7 @@ members = ["."]
 exclude = [
     "vendor/zed-gpui-occlusion/crates/gpui_apple",
     "vendor/zed-gpui-occlusion/crates/gpui_macos",
+    "vendor/zed-gpui-occlusion/crates/gpui_linux",
 ]
 resolver = "2"
 
@@ -37,6 +38,15 @@ core-foundation = "0.10"
 core-graphics = "0.25.0"
 foreign-types = "0.5"
 
+# GPUI's Linux windowing backends are opt-in. Without them gpui_linux silently
+# falls back to a headless platform: the app runs but never opens a window.
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "d01f1258376ec2fb498d8386e734b0dabdbb9fe5", package = "gpui_platform", features = ["font-kit", "wayland", "x11"] }
+
+# Builds the file:// URL GPUI's desktop opener takes on Linux and the BSDs.
+[target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
+url = "2"
+
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
@@ -58,6 +68,9 @@ tempfile = "3"
 [patch."https://github.com/zed-industries/zed"]
 gpui_apple = { path = "vendor/zed-gpui-occlusion/crates/gpui_apple" }
 gpui_macos = { path = "vendor/zed-gpui-occlusion/crates/gpui_macos" }
+# GPUI's Wayland clipboard only offers text; the vendored copy also offers
+# images so "Copy image" reaches other apps.
+gpui_linux = { path = "vendor/zed-gpui-occlusion/crates/gpui_linux" }
 
 [profile.release]
 lto = "thin"

@@ -1,23 +1,27 @@
 //! Painting the infinite canvas: the dot grid, the dashed parent connectors,
 //! and each visible card (as a cached sprite when one is ready).
 
+use super::card::MEDIA_RADIUS;
 use super::card::{
     CARD_SPRITE_WIDTHS, CanvasNode, CardImageFit, CardPrimitive, CardRect, CardScene,
     FINEST_SPRITE_TIER,
 };
 use super::card_scene::MIN_LEGIBLE_FONT_SIZE;
+use super::icons::Icon;
 use super::image_cache::{
     CardSpriteCache, DECODED_LONG_EDGE_CAP, DecodedImageCache, THUMBNAIL_DECODE_CAP,
 };
 use super::theme;
 use crate::layout::CARD_WIDTH;
 use gpui::{
-    App, BorderStyle, Bounds, ContentMask, Entity, ObjectFit, Pixels, Point, Resource,
-    SharedString, TextAlign, TextRun, Window, fill, point, px, quad, size,
+    App, BorderStyle, Bounds, ContentMask, Entity, Hsla, ObjectFit, PathBuilder, Pixels, Point,
+    Resource, SharedString, TextAlign, TextRun, TransformationMatrix, Window, fill,
+    linear_color_stop, linear_gradient, point, px, quad, size,
 };
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 const GRID_GAP: f32 = 28.;
 const GRID_DOT_SIZE: f32 = 1.4;
@@ -701,6 +705,22 @@ pub fn paint_canvas_node(
         paint_high_resolution_card_images(frame, &canvas_node.scene, zoom, image_cache, window, cx);
     }
 
+    if frame.status_line.is_some()
+        && let Some(area) = canvas_node.scene.generating_area
+    {
+        paint_generating_waves(
+            MEDIA_RADIUS * zoom,
+            canvas_bounds(
+                frame.screen_x + area.x * zoom,
+                frame.screen_y + area.y * zoom,
+                area.width * zoom,
+                area.height * zoom,
+            ),
+            zoom,
+            window,
+        );
+    }
+
     if let Some(status_line) = &frame.status_line {
         paint_canvas_text(
             status_line.clone(),
@@ -727,6 +747,178 @@ pub fn paint_canvas_node(
     deferred_sprite_source
 }
 
+/// Seconds since the first animated frame; every animation shares this clock
+/// so cards generating side by side move in step.
+fn animation_seconds() -> f32 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs_f32()
+}
+
+/// Layered, drifting sine waves with a light sweep and a pulsing label, painted
+/// live over a running card's empty media area.
+fn paint_generating_waves(radius: f32, bounds: Bounds<Pixels>, zoom: f32, window: &mut Window) {
+    let width = f32::from(bounds.size.width);
+    let height = f32::from(bounds.size.height);
+    if width < 24. || height < 24. {
+        return;
+    }
+    let t = animation_seconds();
+    let left = f32::from(bounds.left());
+    let top = f32::from(bounds.top());
+    let bottom = f32::from(bounds.bottom());
+    window.with_content_mask(Some(ContentMask { bounds }), |window| {
+        // A faint accent glow rising from the bottom.
+        window.paint_quad(fill(
+            bounds,
+            linear_gradient(
+                180.,
+                linear_color_stop(theme::accent_strong().opacity(0.), 0.2),
+                linear_color_stop(theme::accent_strong().opacity(0.16), 1.),
+            ),
+        ));
+
+        // (baseline, amplitude, wavelength, speed, phase, top alpha), back to front.
+        const LAYERS: [(f32, f32, f32, f32, f32, f32); 4] = [
+            (0.42, 0.075, 1.15, 0.55, 0.0, 0.10),
+            (0.54, 0.065, 0.85, -0.8, 1.7, 0.14),
+            (0.66, 0.055, 1.35, 1.05, 3.1, 0.20),
+            (0.78, 0.045, 0.7, -1.35, 4.6, 0.28),
+        ];
+        let steps = ((width / 6.).ceil() as usize).clamp(24, 96);
+        for (baseline, amplitude, wavelength, speed, phase, alpha) in LAYERS {
+            let base_y = top + height * baseline;
+            let amplitude = height * amplitude * (0.85 + 0.15 * (t * 0.7 + phase).sin());
+            let lambda = width * wavelength;
+            let mut path = PathBuilder::fill();
+            path.move_to(point(px(left), px(bottom)));
+            for step in 0..=steps {
+                let x = left + width * step as f32 / steps as f32;
+                let u = (x - left) / lambda * std::f32::consts::TAU;
+                let y = base_y
+                    + amplitude * (u + t * speed + phase).sin()
+                    + amplitude * 0.35 * (u * 2.3 - t * speed * 1.6 + phase).sin();
+                path.line_to(point(px(x), px(y)));
+            }
+            path.line_to(point(px(left + width), px(bottom)));
+            path.close();
+            if let Ok(path) = path.build() {
+                window.paint_path(
+                    path,
+                    linear_gradient(
+                        180.,
+                        linear_color_stop(theme::accent().opacity(alpha), 0.),
+                        linear_color_stop(theme::accent_strong().opacity(alpha * 0.25), 1.),
+                    ),
+                );
+            }
+        }
+
+        // A soft sheen sweeping across every few seconds.
+        let period = 3.2;
+        let progress = (t % period) / period;
+        let sheen_width = width * 0.45;
+        let sheen_x = left - sheen_width + (width + sheen_width * 2.) * progress;
+        let half = sheen_width / 2.;
+        for (x, from, to) in [(sheen_x, 0., 0.05), (sheen_x + half, 0.05, 0.)] {
+            window.paint_quad(fill(
+                Bounds::new(
+                    point(px(x), bounds.top()),
+                    size(px(half), bounds.size.height),
+                ),
+                linear_gradient(
+                    90.,
+                    linear_color_stop(gpui::white().opacity(from), 0.),
+                    linear_color_stop(gpui::white().opacity(to), 1.),
+                ),
+            ));
+        }
+
+        // "Generating" with three dots that pulse in sequence.
+        let label_height = 20. * zoom;
+        let label_top = top + height * 0.24;
+        paint_canvas_text(
+            "Generating".into(),
+            canvas_bounds(left, label_top, width, label_height),
+            CanvasTextStyle {
+                font_size: 12.5,
+                zoom,
+                line_height: label_height,
+                color: theme::ink().opacity(0.75),
+                align: TextAlign::Center,
+            },
+            window,
+        );
+        let dot = 4. * zoom;
+        let gap = 5. * zoom;
+        let dots_left = left + width / 2. - (dot * 3. + gap * 2.) / 2.;
+        let dots_top = label_top + label_height + 6. * zoom;
+        for index in 0..3 {
+            let pulse = ((t * 3.2 - index as f32 * 0.6).sin() * 0.5 + 0.5).powf(1.5);
+            window.paint_quad(
+                fill(
+                    Bounds::new(
+                        point(px(dots_left + index as f32 * (dot + gap)), px(dots_top)),
+                        size(px(dot), px(dot)),
+                    ),
+                    theme::accent().opacity(0.25 + 0.75 * pulse),
+                )
+                .corner_radii(px(dot / 2.)),
+            );
+        }
+        paint_rounded_corner_masks(bounds, radius, theme::raised(), window);
+    });
+}
+
+/// Rounds a rectangular paint by covering its four corners with `color`
+/// (the surface behind it), since content masks only clip to rectangles.
+fn paint_rounded_corner_masks(
+    bounds: Bounds<Pixels>,
+    radius: f32,
+    color: Hsla,
+    window: &mut Window,
+) {
+    if radius < 0.5 {
+        return;
+    }
+    let r = px(radius);
+    let (left, right, top, bottom) = (bounds.left(), bounds.right(), bounds.top(), bounds.bottom());
+    // (corner, point along the horizontal edge, point along the vertical edge)
+    let corners = [
+        (point(left, top), point(left + r, top), point(left, top + r)),
+        (
+            point(right, top),
+            point(right - r, top),
+            point(right, top + r),
+        ),
+        (
+            point(left, bottom),
+            point(left + r, bottom),
+            point(left, bottom - r),
+        ),
+        (
+            point(right, bottom),
+            point(right - r, bottom),
+            point(right, bottom - r),
+        ),
+    ];
+    // Control points 0.552r from the edge points approximate a quarter circle.
+    const K: f32 = 0.552;
+    for (corner, horizontal, vertical) in corners {
+        let mut path = PathBuilder::fill();
+        path.move_to(corner);
+        path.line_to(horizontal);
+        path.cubic_bezier_to(
+            vertical,
+            horizontal + (corner - horizontal) * K,
+            vertical + (corner - vertical) * K,
+        );
+        path.close();
+        if let Ok(path) = path.build() {
+            window.paint_path(path, color);
+        }
+    }
+}
+
 /// The smallest sprite tier that still covers the card's on-screen width, or
 /// `None` above the last tier, where cards are painted directly.
 fn sprite_tier_for_zoom(zoom: f32) -> Option<usize> {
@@ -748,43 +940,137 @@ fn paint_target_outline(bounds: Bounds<Pixels>, zoom: f32, window: &mut Window) 
 
 pub struct ToolbarButtonPaint {
     pub bounds: Bounds<Pixels>,
-    pub label: SharedString,
+    pub hint: SharedString,
+    pub icon: Icon,
     pub color: gpui::Hsla,
     pub hovered: bool,
+    /// Entrance progress from 0 (hidden) to 1 (settled).
+    pub appear: f32,
 }
 
-/// Draws the hovered card's action buttons in the same paint pass as the cards
-/// themselves. Painting them (rather than laying them out as elements) keeps
-/// them glued to the card during zoom: element layout re-rounds fractional
-/// sizes every frame and shimmers, painted quads and text do not.
-pub fn paint_node_toolbar(buttons: &[ToolbarButtonPaint], zoom: f32, window: &mut Window) {
+fn ease_out_cubic(t: f32) -> f32 {
+    1. - (1. - t).powi(3)
+}
+
+/// Ease-out with a small overshoot, for a playful pop.
+fn ease_out_back(t: f32) -> f32 {
+    const C1: f32 = 1.70158;
+    const C3: f32 = C1 + 1.;
+    1. + C3 * (t - 1.).powi(3) + C1 * (t - 1.).powi(2)
+}
+
+/// Draws the hovered card's action bar in the same paint pass as the cards
+/// themselves. Painting it (rather than laying it out as elements) keeps it
+/// glued to the card during zoom: element layout re-rounds fractional sizes
+/// every frame and shimmers, painted quads and glyphs do not.
+pub fn paint_node_toolbar(
+    buttons: &[ToolbarButtonPaint],
+    zoom: f32,
+    window: &mut Window,
+    cx: &App,
+) {
+    let (Some(first), Some(last)) = (buttons.first(), buttons.last()) else {
+        return;
+    };
+    // The bar fades in and rises a few pixels, led by the first button.
+    let bar_progress = ease_out_cubic((first.appear * 1.6).min(1.));
+    let rise = px((1. - bar_progress) * 6. * zoom);
+    let pad = px(3. * zoom);
+    let bar = Bounds::from_corners(
+        point(first.bounds.left() - pad, first.bounds.top() - pad + rise),
+        point(last.bounds.right() + pad, last.bounds.bottom() + pad + rise),
+    );
+    // A soft drop shadow lifts the bar off the canvas.
+    window.paint_quad(
+        fill(
+            bar + point(px(0.), px(2. * zoom)),
+            theme::background().opacity(0.6 * bar_progress),
+        )
+        .corner_radii(px(10. * zoom)),
+    );
+    window.paint_quad(quad(
+        bar,
+        px(10. * zoom),
+        theme::raised().opacity(bar_progress),
+        px(zoom),
+        theme::line().opacity(bar_progress),
+        BorderStyle::Solid,
+    ));
     for button in buttons {
-        let (background, border) = if button.hovered {
-            (theme::hover(), theme::faint())
+        let fade = ease_out_cubic(button.appear);
+        let bounds = button.bounds + point(px(0.), rise);
+        if button.hovered {
+            window
+                .paint_quad(fill(bounds, theme::hover().opacity(fade)).corner_radii(px(7. * zoom)));
+        }
+        let icon_size = 15. * zoom * (0.55 + 0.45 * ease_out_back(button.appear));
+        let center = bounds.center();
+        let icon_bounds = Bounds::new(
+            point(center.x - px(icon_size / 2.), center.y - px(icon_size / 2.)),
+            size(px(icon_size), px(icon_size)),
+        );
+        let color = if button.hovered {
+            button.color
         } else {
-            (theme::raised().opacity(0.96), theme::line())
+            button.color.opacity(0.85)
         };
-        window.paint_quad(quad(
-            button.bounds,
-            px(5. * zoom),
-            background,
-            px(zoom),
-            border,
-            BorderStyle::Solid,
-        ));
-        paint_canvas_text(
-            button.label.clone(),
-            button.bounds,
-            CanvasTextStyle {
-                font_size: 11.,
-                zoom,
-                line_height: f32::from(button.bounds.size.height),
-                color: button.color,
-                align: TextAlign::Center,
-            },
-            window,
+        let color = color.opacity(fade);
+        let _ = window.paint_svg(
+            icon_bounds,
+            button.icon.path().into(),
+            None,
+            TransformationMatrix::unit(),
+            color,
+            cx,
         );
     }
+    if let Some(hovered) = buttons.iter().find(|button| button.hovered) {
+        paint_toolbar_hint(hovered, bar, zoom, window);
+    }
+    if buttons.iter().any(|button| button.appear < 1.) {
+        window.request_animation_frame();
+    }
+}
+
+/// The hovered action's name in a small label just above the bar.
+fn paint_toolbar_hint(
+    button: &ToolbarButtonPaint,
+    bar: Bounds<Pixels>,
+    zoom: f32,
+    window: &mut Window,
+) {
+    let width = (button.hint.chars().count() as f32 * 6.3 + 18.) * zoom;
+    let height = 22. * zoom;
+    let center_x = f32::from(button.bounds.center().x);
+    // Keep the label inside the bar's horizontal span so it never drifts far
+    // from the card at the edges.
+    let left = (center_x - width / 2.)
+        .min(f32::from(bar.right()) - width)
+        .max(f32::from(bar.left()));
+    let bounds = Bounds::new(
+        point(px(left), bar.top() - px(height + 5. * zoom)),
+        size(px(width), px(height)),
+    );
+    window.paint_quad(quad(
+        bounds,
+        px(6. * zoom),
+        theme::hover(),
+        px(zoom),
+        theme::line(),
+        BorderStyle::Solid,
+    ));
+    paint_canvas_text(
+        button.hint.clone(),
+        bounds,
+        CanvasTextStyle {
+            font_size: 10.5,
+            zoom,
+            line_height: height,
+            color: theme::ink(),
+            align: TextAlign::Center,
+        },
+        window,
+    );
 }
 
 fn paint_card_scene(

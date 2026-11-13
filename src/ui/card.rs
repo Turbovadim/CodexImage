@@ -23,6 +23,17 @@ pub const PROMPT_WRAP_COLUMNS: usize = 42;
 pub const COLLAPSED_PROMPT_LINES: usize = 6;
 pub const EXPANDED_PROMPT_LINES: usize = 18;
 pub const MEDIA_GAP: f32 = 1.;
+/// Outputs sit inset from the card edge on rounded tiles.
+pub const MEDIA_INSET: f32 = 10.;
+pub const MEDIA_WIDTH: f32 = crate::layout::CARD_WIDTH - 2. * MEDIA_INSET;
+pub const MEDIA_RADIUS: f32 = 12.;
+/// Space between tiles of a multi-image card.
+pub const TILE_GAP: f32 = 4.;
+
+/// Card-local x of a filmstrip thumbnail; shared by painting and hit testing.
+pub fn filmstrip_cell_x(compact_index: usize, strip_cell_width: f32) -> f32 {
+    MEDIA_INSET + compact_index as f32 * (strip_cell_width + TILE_GAP)
+}
 /// SVG widths of the far-out sprite tiers; GPUI rasterizes each at 2x. Tier
 /// `i` serves zoom levels up to `width / CARD_WIDTH` (0.125, 0.25, 0.5). Above
 /// the last tier cards rest as direct paint, since a sprite for a 340 px card

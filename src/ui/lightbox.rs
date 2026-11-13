@@ -4,8 +4,9 @@
 use super::app::AppView;
 use super::app::Overlay;
 use super::canvas_view::DragState;
-use super::composer::control_button;
+use super::composer::{bar_button, bar_divider};
 use super::format::image_format_for_path;
+use super::icons::Icon;
 use super::image_cache::DECODED_LONG_EDGE_CAP;
 use super::keymap::{LightboxDown, LightboxLeft, LightboxRight, LightboxUp, ToggleCompare};
 use super::theme;
@@ -676,6 +677,7 @@ impl AppView {
         let copy_path = path.clone();
         let save_path = path.clone();
         let open_path = path.clone();
+        let reveal_path = path.clone();
         let branch_node = lightbox.node_id.clone();
         let branch_image = lightbox.image.clone();
         let combine_node = lightbox.node_id.clone();
@@ -693,64 +695,119 @@ impl AppView {
         } else {
             gpui::CursorStyle::Arrow
         };
-        let mut toolbar = div()
-            .absolute()
-            .top(px(16.))
-            .right(px(16.))
+        // One floating bar: labelled primary actions, icon-only file actions
+        // (named by their tooltips), then a separate close button.
+        let mut actions = div()
             .flex()
-            .gap_2()
-            .occlude();
+            .items_center()
+            .gap(px(2.))
+            .p(px(4.))
+            .rounded_xl()
+            .border_1()
+            .border_color(theme::line())
+            .bg(theme::raised().opacity(0.96))
+            .shadow_lg();
         if compare_source.is_some() {
-            toolbar = toolbar.child(control_button(
+            actions = actions.child(bar_button(
+                "lightbox-compare",
+                Icon::Compare,
+                Some(if compare.is_some() { "Done" } else { "Compare" }),
                 if compare.is_some() {
-                    "Done comparing (X)"
+                    "Stop comparing"
                 } else {
-                    "Compare (X)"
+                    "Compare with the source image"
                 },
+                Some("X"),
                 cx.listener(|this, _, window, cx| this.toggle_compare(&ToggleCompare, window, cx)),
             ));
         }
-        let toolbar = toolbar
-            .child(control_button(
-                "Branch (B)",
+        let actions = actions
+            .child(bar_button(
+                "lightbox-branch",
+                Icon::Branch,
+                Some("Branch"),
+                "Branch a new prompt from this image",
+                Some("B"),
                 cx.listener(move |this, _, window, cx| {
                     this.branch_node(&branch_node, Some(branch_image.clone()), window, cx);
                 }),
             ))
-            .child(control_button(
-                "Combine (C)",
+            .child(bar_button(
+                "lightbox-combine",
+                Icon::Mix,
+                Some("Combine"),
+                "Combine this image with another card",
+                Some("C"),
                 cx.listener(move |this, _, window, cx| {
                     this.combine_node(&combine_node, Some(combine_image.clone()), window, cx);
                 }),
             ))
-            .child(control_button(
+            .child(bar_divider())
+            .child(bar_button(
+                "lightbox-locate",
+                Icon::Locate,
+                None,
                 "Show on canvas",
+                None,
                 cx.listener(move |this, _, window, cx| this.locate_node(&locate_node, window, cx)),
             ))
-            .child(control_button(
-                "Copy",
+            .child(bar_button(
+                "lightbox-copy",
+                Icon::Copies,
+                None,
+                "Copy image",
+                None,
                 cx.listener(move |this, _, _, cx| this.copy_image(&copy_path, cx)),
             ))
-            .child(control_button(
-                "Save…",
+            .child(bar_button(
+                "lightbox-save",
+                Icon::Download,
+                None,
+                "Save a copy…",
+                None,
                 cx.listener(move |this, _, _, cx| this.save_image(save_path.clone(), cx)),
             ))
-            .child(control_button(
-                "Open original",
-                cx.listener(move |_, _, _, _| {
-                    let path = open_path.clone();
-                    smol::unblock(move || {
-                        let _ = crate::platform::open_path(&path);
-                    })
-                    .detach();
-                }),
+            .child(bar_button(
+                "lightbox-open",
+                Icon::ExternalLink,
+                None,
+                "Open in default app",
+                None,
+                cx.listener(move |_, _, _, cx| crate::platform::open_path(&open_path, cx)),
             ))
-            .child(control_button(
-                "×",
-                cx.listener(|this, _, window, cx| {
-                    this.close_overlay(window, cx);
-                }),
+            .child(bar_button(
+                "lightbox-reveal",
+                Icon::Folder,
+                None,
+                crate::platform::REVEAL_LABEL,
+                None,
+                cx.listener(move |_, _, _, cx| cx.reveal_path(&reveal_path)),
             ));
+        let close = div()
+            .p(px(4.))
+            .rounded_xl()
+            .border_1()
+            .border_color(theme::line())
+            .bg(theme::raised().opacity(0.96))
+            .shadow_lg()
+            .child(bar_button(
+                "lightbox-close",
+                Icon::X,
+                None,
+                "Close",
+                Some("Esc"),
+                cx.listener(|this, _, window, cx| this.close_overlay(window, cx)),
+            ));
+        let toolbar = div()
+            .absolute()
+            .top(px(16.))
+            .right(px(16.))
+            .flex()
+            .items_center()
+            .gap_2()
+            .occlude()
+            .child(actions)
+            .child(close);
 
         let mut root = div()
             .id("lightbox")
@@ -999,21 +1056,19 @@ impl AppView {
     }
 
     /// Copies the full-resolution original. Originals run to several megabytes,
-    /// so the read happens off the main thread; only the clipboard write, which
-    /// is a platform call, comes back to it.
-    fn copy_image(&mut self, path: &Path, cx: &mut Context<Self>) {
+    /// so the read (and any PNG conversion) happens off the main thread; only
+    /// the clipboard write, which is a platform call, comes back to it.
+    pub(super) fn copy_image(&mut self, path: &Path, cx: &mut Context<Self>) {
         let Some(format) = image_format_for_path(path) else {
             self.show_error("Unsupported image format", cx);
             return;
         };
         let path = path.to_owned();
         cx.spawn(async move |weak, cx| {
-            let bytes = smol::unblock(move || fs::read(path)).await;
-            let _ = weak.update(cx, |view, cx| match bytes {
-                Ok(bytes) => {
-                    cx.write_to_clipboard(ClipboardItem::new_image(&Image::from_bytes(
-                        format, bytes,
-                    )));
+            let image = smol::unblock(move || clipboard_image(&path, format)).await;
+            let _ = weak.update(cx, |view, cx| match image {
+                Ok(image) => {
+                    cx.write_to_clipboard(ClipboardItem::new_image(&image));
                     view.show_toast("Image copied".into(), false, None, cx);
                 }
                 Err(error) => view.show_error(error, cx),
@@ -1043,6 +1098,22 @@ impl AppView {
         })
         .detach();
     }
+}
+
+/// Reads an image for the clipboard. Most Linux applications only accept
+/// `image/png` pastes, so other formats are converted there.
+fn clipboard_image(path: &Path, format: gpui::ImageFormat) -> anyhow::Result<Image> {
+    let bytes = fs::read(path)?;
+    if cfg!(target_os = "linux")
+        && format != gpui::ImageFormat::Png
+        && format != gpui::ImageFormat::Svg
+    {
+        let decoded = image::load_from_memory(&bytes)?;
+        let mut png = std::io::Cursor::new(Vec::new());
+        decoded.write_to(&mut png, image::ImageFormat::Png)?;
+        return Ok(Image::from_bytes(gpui::ImageFormat::Png, png.into_inner()));
+    }
+    Ok(Image::from_bytes(format, bytes))
 }
 
 #[cfg(test)]
