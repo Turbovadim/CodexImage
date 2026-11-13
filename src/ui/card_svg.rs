@@ -1,14 +1,22 @@
 //! Encodes a card scene as an SVG sprite so the canvas can blit one image per
 //! card instead of replaying every primitive at low zoom.
 
-use super::card_scene::{CardImageFit, CardPrimitive, CardScene};
+use super::card_scene::{CardImageFit, CardPrimitive, CardScene, MIN_LEGIBLE_FONT_SIZE};
 use super::theme::{CARD_FONT_ASCENT, CARD_FONT_DESCENT, CARD_FONT_SVG_FAMILIES};
 use crate::layout::CARD_WIDTH;
 use gpui::TextAlign;
 use std::fmt::Write as _;
 
+/// How a line of illegibly small text is drawn as a bar: the average advance
+/// and x-height of the card face in ems, and the share of that box its glyphs
+/// actually ink.
+const GREEKED_CHARACTER_WIDTH: f32 = 0.5;
+const GREEKED_X_HEIGHT: f32 = 0.52;
+const GREEKED_INK: f32 = 0.4;
+
 pub fn card_scene_svg(scene: &CardScene, rendered_width: f32) -> String {
-    let rendered_height = scene.height * rendered_width / CARD_WIDTH;
+    let scale = rendered_width / CARD_WIDTH;
+    let rendered_height = scene.height * scale;
     let mut svg = String::with_capacity(scene.primitives.len() * 180);
     write!(
         svg,
@@ -55,13 +63,6 @@ pub fn card_scene_svg(scene: &CardScene, rendered_width: f32) -> String {
                 color,
                 align,
             } => {
-                let clip_id = format!("text-{index}");
-                write!(
-                    svg,
-                    "<clipPath id=\"{clip_id}\"><rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"/></clipPath>",
-                    bounds.x, bounds.y, bounds.width, bounds.height
-                )
-                .expect("writing to a String cannot fail");
                 let (anchor, x) = match align {
                     TextAlign::Left => ("start", bounds.x),
                     TextAlign::Center => ("middle", bounds.x + bounds.width / 2.),
@@ -71,6 +72,41 @@ pub fn card_scene_svg(scene: &CardScene, rendered_width: f32) -> String {
                 let baseline = bounds.y
                     + (line_height - (CARD_FONT_ASCENT + CARD_FONT_DESCENT) * font_size) * 0.5
                     + CARD_FONT_ASCENT * font_size;
+                let (fill, opacity) = color.svg();
+                // A tier rests at or below its own scale, so text the painter
+                // would skip here is illegible everywhere the sprite is shown.
+                // Resolving a face for it is most of a small sprite's cost, so
+                // a bar over the line's x-height stands in for the smear.
+                if font_size * scale < MIN_LEGIBLE_FONT_SIZE {
+                    let width = (text.trim_end().chars().count() as f32
+                        * font_size
+                        * GREEKED_CHARACTER_WIDTH)
+                        .min(bounds.width);
+                    if width > 0. {
+                        let height = font_size * GREEKED_X_HEIGHT;
+                        let left = match align {
+                            TextAlign::Left => x,
+                            TextAlign::Center => x - width / 2.,
+                            TextAlign::Right => x - width,
+                        };
+                        write!(
+                            svg,
+                            "<rect x=\"{left}\" y=\"{}\" width=\"{width}\" height=\"{height}\" rx=\"{}\" fill=\"#{fill:06x}\" fill-opacity=\"{}\"/>",
+                            baseline - height,
+                            height / 2.,
+                            opacity * GREEKED_INK
+                        )
+                        .expect("writing to a String cannot fail");
+                    }
+                    continue;
+                }
+                let clip_id = format!("text-{index}");
+                write!(
+                    svg,
+                    "<clipPath id=\"{clip_id}\"><rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"/></clipPath>",
+                    bounds.x, bounds.y, bounds.width, bounds.height
+                )
+                .expect("writing to a String cannot fail");
                 let (fill, opacity) = color.svg();
                 write!(
                     svg,
@@ -178,8 +214,16 @@ mod tests {
         for width in CARD_SPRITE_WIDTHS {
             let svg = card_scene_svg(&scene, width);
             assert!(svg.contains("viewBox=\"0 0 340 510\""));
-            assert!(svg.contains("A &lt;stable&gt; &amp; exact card"));
             assert!(svg.contains(&format!("width=\"{width}\"")));
+            // Text survives only in the tiers that show it at a legible size;
+            // below that a bar keeps its place.
+            let legible = 14. * width / CARD_WIDTH >= super::MIN_LEGIBLE_FONT_SIZE;
+            assert_eq!(
+                svg.contains("A &lt;stable&gt; &amp; exact card"),
+                legible,
+                "tier {width}"
+            );
+            assert_eq!(svg.contains("fill-opacity=\"0.4\""), !legible);
         }
     }
 

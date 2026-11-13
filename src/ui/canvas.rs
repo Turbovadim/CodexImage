@@ -5,6 +5,7 @@ use super::card::{
     CARD_SPRITE_WIDTHS, CanvasNode, CardImageFit, CardPrimitive, CardRect, CardScene,
     FINEST_SPRITE_TIER,
 };
+use super::card_scene::MIN_LEGIBLE_FONT_SIZE;
 use super::image_cache::{
     CardSpriteCache, DECODED_LONG_EDGE_CAP, DecodedImageCache, THUMBNAIL_DECODE_CAP,
 };
@@ -404,21 +405,13 @@ fn bounds_are_visible(bounds: Bounds<Pixels>, window: &Window) -> bool {
 
 #[derive(Clone, Copy)]
 struct CanvasTextStyle {
+    /// The font size in world space, before `zoom`.
     font_size: f32,
+    zoom: f32,
+    /// The line height on screen.
     line_height: f32,
     color: gpui::Hsla,
     align: TextAlign,
-}
-
-impl CanvasTextStyle {
-    fn new(font_size: f32, line_height: f32, color: gpui::Hsla, align: TextAlign) -> Self {
-        Self {
-            font_size,
-            line_height,
-            color,
-            align,
-        }
-    }
 }
 
 fn paint_canvas_text(
@@ -426,12 +419,15 @@ fn paint_canvas_text(
     bounds: Bounds<Pixels>,
     style: CanvasTextStyle,
     window: &mut Window,
-    cx: &mut App,
 ) {
-    // Below ~3 logical px, text is an illegible smear; skipping it spares the
-    // shaping pass, which dominates a full direct redraw of a large board at
-    // far-out zoom (hundreds of cards, thousands of runs per frame).
-    if text.is_empty() || style.font_size < 3. || !bounds_are_visible(bounds, window) {
+    // Skipping illegible text spares the shaping pass, which dominates a full
+    // direct redraw of a large board at far-out zoom (hundreds of cards,
+    // thousands of runs per frame).
+    let screen_font_size = style.font_size * style.zoom;
+    if text.is_empty()
+        || screen_font_size < MIN_LEGIBLE_FONT_SIZE
+        || !bounds_are_visible(bounds, window)
+    {
         return;
     }
     let run = TextRun {
@@ -440,21 +436,41 @@ fn paint_canvas_text(
         font: gpui::font(theme::CARD_FONT_FAMILY),
         ..Default::default()
     };
-    // Zoom is continuous, and GPUI keys shaped lines and atlas glyphs on the
-    // exact font size, so quarter-pixel steps keep both caches hitting.
-    let font_size = (style.font_size * 4.).round() / 4.;
+    // Shaped once in world space: the layout is the same at every zoom, so
+    // GPUI's line cache keeps hitting through a zoom gesture and each glyph
+    // only moves to its scaled position. Text then tracks its card exactly
+    // instead of jumping between the widths of discrete font sizes.
     let line = window
         .text_system()
-        .shape_line(text, px(font_size), &[run], None);
+        .shape_line(text, px(style.font_size), &[run], None);
+    // GPUI keys atlas glyphs on the exact font size, so quarter-pixel steps
+    // bound how many sizes a continuous zoom rasterizes.
+    let glyph_size = px((screen_font_size * 4.).round() / 4.);
+    let width = line.width * style.zoom;
+    let left = bounds.left()
+        + match style.align {
+            TextAlign::Left => px(0.),
+            TextAlign::Center => (bounds.size.width - width) / 2.,
+            TextAlign::Right => bounds.size.width - width,
+        };
+    // The same baseline placement as GPUI's line painter.
+    let baseline = bounds.top()
+        + (px(style.line_height) - (line.ascent + line.descent) * style.zoom) / 2.
+        + line.ascent * style.zoom;
     window.with_content_mask(Some(ContentMask { bounds }), |window| {
-        let _ = line.paint(
-            bounds.origin,
-            px(style.line_height),
-            style.align,
-            Some(bounds.size.width),
-            window,
-            cx,
-        );
+        for run in &line.runs {
+            for glyph in &run.glyphs {
+                let origin = point(
+                    left + glyph.position.x * style.zoom,
+                    baseline + glyph.position.y * style.zoom,
+                );
+                let _ = if glyph.is_emoji {
+                    window.paint_emoji(origin, run.font_id, glyph.id, glyph_size)
+                } else {
+                    window.paint_glyph(origin, run.font_id, glyph.id, glyph_size, style.color)
+                };
+            }
+        }
     });
 }
 
@@ -464,6 +480,8 @@ struct CanvasImageStyle {
     blurred: bool,
     /// The largest long edge this paint can need, which picks the decode tier.
     decode_cap: u32,
+    /// Whether a missing image starts decoding or is simply left unpainted.
+    decode_missing: bool,
 }
 
 fn paint_canvas_image(
@@ -487,7 +505,11 @@ fn paint_canvas_image(
         data
     } else {
         let Some(Ok(data)) = image_cache.update(cx, |cache, cx| {
-            cache.load(&resource, style.decode_cap, window, cx)
+            if style.decode_missing {
+                cache.load(&resource, style.decode_cap, window, cx)
+            } else {
+                cache.ready(&resource, style.decode_cap, window, cx)
+            }
         }) else {
             return;
         };
@@ -534,6 +556,10 @@ const MAX_TEXT_CARDS_DURING_GESTURE: usize = 48;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SceneLayers {
     All,
+    /// Everything, but only the images already decoded: the card's sprite is
+    /// rasterizing and replaces this paint, so a decode started now would be
+    /// thrown away, after loading the same thumbnails the sprite reads itself.
+    AwaitingSprite,
     /// A crowded overview mid-gesture: prioritize image continuity.
     NoText,
     /// Crisp display thumbnails laid over a scaled sprite's small copies.
@@ -580,12 +606,12 @@ pub fn paint_canvas_node(
     // directly instead of rasterizing the blurred image into a card sprite.
     let sprites_allowed = !canvas_node.scene.has_blurred_images;
     let zoom_tier = sprite_tier_for_zoom(zoom);
-    // Above the tiers a card rests as direct paint, but a moving gesture still
-    // scales the finest sprite: a raster scales on the GPU without touching a
-    // glyph, whereas direct paint reshapes and re-rasterizes every line at
-    // its new size on every frame, which reads as text flickering.
+    // Above the tiers a card rests as direct paint. The finest sprite is still
+    // rasterized there as the gesture fallback: a raster scales on the GPU
+    // without touching a glyph, which a crowded view cannot afford per frame.
     let raster_tier = sprites_allowed.then(|| zoom_tier.unwrap_or(FINEST_SPRITE_TIER));
     let mut sprite = None;
+    let mut sprite_rasterizing = false;
     let mut deferred_sprite_source = false;
     let previous_tier = canvas_node.last_ready_sprite_tier.load(Ordering::Relaxed) as usize;
     if let Some(raster_tier) = raster_tier {
@@ -610,6 +636,8 @@ pub fn paint_canvas_node(
                 canvas_node
                     .last_ready_sprite_tier
                     .store(raster_tier as u8, Ordering::Relaxed);
+            } else {
+                sprite_rasterizing = !deferred_sprite_source;
             }
             if zoom_tier.is_some() {
                 sprite = rendered
@@ -617,6 +645,18 @@ pub fn paint_canvas_node(
             }
         } else {
             sprite = ready_sprite(canvas_node, fallback_tiers, sprite_cache, cx);
+            // Above the tiers the sprite is scaled up, which blurs its text
+            // until the settle repaints it. Glyphs keep their layout at any
+            // zoom, so a view sparse enough to paint them every frame stays
+            // crisp through the gesture. A card whose images are still
+            // decoding keeps its sprite, so nothing blinks in.
+            if zoom_tier.is_none()
+                && phase.gesture_text
+                && sprite.is_some()
+                && direct_images_are_decoded(&canvas_node.scene, zoom, image_cache, window, cx)
+            {
+                sprite = None;
+            }
         }
     }
     match sprite {
@@ -638,7 +678,9 @@ pub fn paint_canvas_node(
             }
         }
         None => {
-            let layers = if phase.settled || phase.gesture_text || zoom_tier.is_none() {
+            let layers = if sprite_rasterizing && zoom_tier.is_some() {
+                SceneLayers::AwaitingSprite
+            } else if phase.settled || phase.gesture_text || zoom_tier.is_none() {
                 SceneLayers::All
             } else {
                 SceneLayers::NoText
@@ -668,9 +710,14 @@ pub fn paint_canvas_node(
                 (CARD_WIDTH - 28.) * zoom,
                 42. * zoom,
             ),
-            CanvasTextStyle::new(10.8 * zoom, 42. * zoom, theme::dim(), TextAlign::Left),
+            CanvasTextStyle {
+                font_size: 10.8,
+                zoom,
+                line_height: 42. * zoom,
+                color: theme::dim(),
+                align: TextAlign::Left,
+            },
             window,
-            cx,
         );
     }
 
@@ -710,12 +757,7 @@ pub struct ToolbarButtonPaint {
 /// themselves. Painting them (rather than laying them out as elements) keeps
 /// them glued to the card during zoom: element layout re-rounds fractional
 /// sizes every frame and shimmers, painted quads and text do not.
-pub fn paint_node_toolbar(
-    buttons: &[ToolbarButtonPaint],
-    zoom: f32,
-    window: &mut Window,
-    cx: &mut App,
-) {
+pub fn paint_node_toolbar(buttons: &[ToolbarButtonPaint], zoom: f32, window: &mut Window) {
     for button in buttons {
         let (background, border) = if button.hovered {
             (theme::hover(), theme::faint())
@@ -733,14 +775,14 @@ pub fn paint_node_toolbar(
         paint_canvas_text(
             button.label.clone(),
             button.bounds,
-            CanvasTextStyle::new(
-                11. * zoom,
-                f32::from(button.bounds.size.height),
-                button.color,
-                TextAlign::Center,
-            ),
+            CanvasTextStyle {
+                font_size: 11.,
+                zoom,
+                line_height: f32::from(button.bounds.size.height),
+                color: button.color,
+                align: TextAlign::Center,
+            },
             window,
-            cx,
         );
     }
 }
@@ -760,7 +802,6 @@ fn paint_card_scene(
         CARD_WIDTH * zoom,
         frame.height,
     );
-    let past_sprite_tiers = sprite_tier_for_zoom(zoom).is_none();
     let scale_factor = window.scale_factor();
     window.with_content_mask(
         Some(ContentMask {
@@ -769,7 +810,9 @@ fn paint_card_scene(
         |window| {
             for primitive in &scene.primitives {
                 let skipped = match primitive {
-                    CardPrimitive::Text { .. } => layers != SceneLayers::All,
+                    CardPrimitive::Text { .. } => {
+                        matches!(layers, SceneLayers::NoText | SceneLayers::ImagesOnly)
+                    }
                     CardPrimitive::Quad { .. } => layers == SceneLayers::ImagesOnly,
                     CardPrimitive::Image { .. } => false,
                 };
@@ -806,44 +849,31 @@ fn paint_card_scene(
                     } => paint_canvas_text(
                         text.clone(),
                         transform_card_rect(*bounds, frame, zoom),
-                        CanvasTextStyle::new(
-                            font_size * zoom,
-                            line_height * zoom,
-                            color.hsla(),
-                            *align,
-                        ),
+                        CanvasTextStyle {
+                            font_size: *font_size,
+                            zoom,
+                            line_height: line_height * zoom,
+                            color: color.hsla(),
+                            align: *align,
+                        },
                         window,
-                        cx,
                     ),
                     CardPrimitive::Image {
-                        asset,
                         bounds,
                         fit,
                         radius,
                         blurred,
+                        ..
                     } => paint_canvas_image(
-                        // Past the sprite tiers this is the card's resting
-                        // look, so it earns the thumbnail; the original takes
-                        // over once even that is too small. Within the tiers
-                        // direct painting is a transient stand-in until the
-                        // sprite lands, and the tiny thumbnail avoids
-                        // re-reading hundreds of MB of sidecars per tier
-                        // crossing. Small frames (attachment rows, grid
-                        // cells) never outgrow the tiny thumbnail at all.
-                        if past_sprite_tiers
-                            && (*blurred
-                                || !sprite_thumbnail_suffices(*bounds, *fit, zoom, scale_factor))
-                        {
-                            &asset.thumbnail
-                        } else {
-                            &asset.sprite
-                        },
+                        direct_image_path(primitive, zoom, scale_factor)
+                            .expect("an image primitive has a path"),
                         transform_card_rect(*bounds, frame, zoom),
                         CanvasImageStyle {
                             fit: (*fit).into(),
                             corner_radius: radius * zoom,
                             blurred: *blurred,
                             decode_cap: THUMBNAIL_DECODE_CAP,
+                            decode_missing: layers != SceneLayers::AwaitingSprite,
                         },
                         image_cache,
                         window,
@@ -853,6 +883,59 @@ fn paint_card_scene(
             }
         },
     );
+}
+
+/// The file a direct paint shows for an image primitive, or `None` for any
+/// other primitive.
+///
+/// Past the sprite tiers this is the card's resting look, so it earns the
+/// thumbnail; the original takes over once even that is too small. Within the
+/// tiers direct painting is a transient stand-in until the sprite lands, and
+/// the tiny thumbnail avoids re-reading hundreds of MB of sidecars per tier
+/// crossing. Small frames (attachment rows, grid cells) never outgrow the tiny
+/// thumbnail at all.
+fn direct_image_path(
+    primitive: &CardPrimitive,
+    zoom: f32,
+    scale_factor: f32,
+) -> Option<&Arc<Path>> {
+    let CardPrimitive::Image {
+        asset,
+        bounds,
+        fit,
+        blurred,
+        ..
+    } = primitive
+    else {
+        return None;
+    };
+    let past_sprite_tiers = sprite_tier_for_zoom(zoom).is_none();
+    Some(
+        if past_sprite_tiers
+            && (*blurred || !sprite_thumbnail_suffices(*bounds, *fit, zoom, scale_factor))
+        {
+            &asset.thumbnail
+        } else {
+            &asset.sprite
+        },
+    )
+}
+
+/// Whether a direct paint of the scene would show every image right away.
+fn direct_images_are_decoded(
+    scene: &CardScene,
+    zoom: f32,
+    image_cache: &Entity<DecodedImageCache>,
+    window: &Window,
+    cx: &App,
+) -> bool {
+    let scale_factor = window.scale_factor();
+    let image_cache = image_cache.read(cx);
+    scene
+        .primitives
+        .iter()
+        .filter_map(|primitive| direct_image_path(primitive, zoom, scale_factor))
+        .all(|path| image_cache.is_decoded(&Resource::Path(path.clone()), THUMBNAIL_DECODE_CAP))
 }
 
 fn paint_high_resolution_card_images(
@@ -893,6 +976,7 @@ fn paint_high_resolution_card_images(
                 corner_radius: radius * zoom,
                 blurred: false,
                 decode_cap: DECODED_LONG_EDGE_CAP,
+                decode_missing: true,
             },
             image_cache,
             window,

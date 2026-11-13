@@ -506,6 +506,8 @@ impl AppView {
             WindowVisibility::Visible => {
                 self.hidden_release_task.take();
                 // Images and sprites repopulate on demand in the next render.
+                self.image_cache
+                    .update(cx, |cache, _| cache.begin_restore());
                 cx.notify();
                 window.refresh();
             }

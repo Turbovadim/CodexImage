@@ -374,6 +374,12 @@ pub(super) struct DecodedImageCache {
     budget: Budget<DecodeKey>,
     next_load_serial: u64,
     first_paint_bytes_this_frame: usize,
+    /// The window just came back from hiding with these caches emptied. Nobody
+    /// is interacting yet, so landed decodes upload unthrottled: one long
+    /// frame reads better than the viewport popping in over several.
+    restoring: bool,
+    /// A paint this frame asked for an image that is still decoding.
+    awaited_decode_this_frame: bool,
     weak_self: WeakEntity<Self>,
 }
 
@@ -387,6 +393,9 @@ impl Weighted for DecodedImageCache {
     fn begin_frame(&mut self) {
         self.budget.used_this_frame.clear();
         self.first_paint_bytes_this_frame = 0;
+        // The restore burst is over once a frame waited on no decode.
+        self.restoring &= self.awaited_decode_this_frame;
+        self.awaited_decode_this_frame = false;
     }
 
     fn budget_ref(&self) -> &Budget<DecodeKey> {
@@ -440,8 +449,18 @@ impl DecodedImageCache {
             budget: Budget::new(byte_budget, DECODED_IMAGE_CACHE_MAX_ITEMS),
             next_load_serial: 0,
             first_paint_bytes_this_frame: 0,
+            restoring: false,
+            awaited_decode_this_frame: false,
             weak_self: cx.weak_entity(),
         }
+    }
+
+    /// Call when the window becomes visible again. Lifts the first-paint
+    /// throttle until the viewport's decodes have all landed and painted.
+    pub fn begin_restore(&mut self) {
+        self.restoring = true;
+        // Keeps the flag alive through the `begin_frame` of the first render.
+        self.awaited_decode_this_frame = true;
     }
 
     /// Loads an image decoded to at most `max_dimension` on its long edge:
@@ -459,6 +478,41 @@ impl DecodedImageCache {
                 resource: resource.clone(),
                 max_dimension: Some(max_dimension),
             },
+            true,
+            window,
+            cx,
+        )
+    }
+
+    /// Whether `load` would return this image now. Empty paths count: there
+    /// is nothing to wait for.
+    pub fn is_decoded(&self, resource: &Resource, max_dimension: u32) -> bool {
+        if matches!(resource, Resource::Path(path) if path.as_os_str().is_empty()) {
+            return true;
+        }
+        self.entries
+            .get(&DecodeKey {
+                resource: resource.clone(),
+                max_dimension: Some(max_dimension),
+            })
+            .is_some_and(|entry| entry.image.is_some() && !entry.unpainted)
+    }
+
+    /// Like [`Self::load`] for an image some earlier paint already asked for,
+    /// but never starts a decode for one nobody has.
+    pub fn ready(
+        &mut self,
+        resource: &Resource,
+        max_dimension: u32,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<DecodeResult> {
+        self.load_key(
+            DecodeKey {
+                resource: resource.clone(),
+                max_dimension: Some(max_dimension),
+            },
+            false,
             window,
             cx,
         )
@@ -491,6 +545,7 @@ impl DecodedImageCache {
                 resource: resource.clone(),
                 max_dimension: None,
             },
+            true,
             window,
             cx,
         )
@@ -499,10 +554,14 @@ impl DecodedImageCache {
     fn load_key(
         &mut self,
         key: DecodeKey,
+        start_missing: bool,
         window: &mut Window,
         cx: &mut App,
     ) -> Option<DecodeResult> {
         if matches!(&key.resource, Resource::Path(path) if path.as_os_str().is_empty()) {
+            return None;
+        }
+        if !start_missing && !self.entries.contains_key(&key) {
             return None;
         }
         let last_used = self.record_use(key.clone());
@@ -514,11 +573,13 @@ impl DecodedImageCache {
                 if !entry.notify_targets.contains(&target) {
                     entry.notify_targets.push(target);
                 }
+                self.awaited_decode_this_frame = true;
                 return None;
             };
             if entry.unpainted {
                 // The first image of a frame always paints, however large.
-                if self.first_paint_bytes_this_frame > 0
+                if !self.restoring
+                    && self.first_paint_bytes_this_frame > 0
                     && self.first_paint_bytes_this_frame + entry.decoded_bytes
                         > FIRST_PAINT_BYTES_PER_FRAME
                 {
@@ -531,6 +592,7 @@ impl DecodedImageCache {
             return Some(result);
         }
 
+        self.awaited_decode_this_frame = true;
         self.start_load(key, last_used, Some(target), window, cx);
         None
     }

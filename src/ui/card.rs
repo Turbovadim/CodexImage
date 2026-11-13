@@ -26,8 +26,9 @@ pub const MEDIA_GAP: f32 = 1.;
 /// SVG widths of the far-out sprite tiers; GPUI rasterizes each at 2x. Tier
 /// `i` serves zoom levels up to `width / CARD_WIDTH` (0.125, 0.25, 0.5). Above
 /// the last tier cards rest as direct paint, since a sprite for a 340 px card
-/// at zoom 1 would cost several megabytes each; a moving gesture up there
-/// scales the finest tier instead, so text never re-rasterizes mid-gesture.
+/// at zoom 1 would cost several megabytes each. A moving gesture up there
+/// paints directly too, falling back to the scaled finest tier for a crowded
+/// view or a card whose images are still decoding.
 pub const CARD_SPRITE_WIDTHS: [f32; 3] = [42.5, 85., 170.];
 pub const FINEST_SPRITE_TIER: usize = CARD_SPRITE_WIDTHS.len() - 1;
 pub const NO_SPRITE_TIER: u8 = u8::MAX;

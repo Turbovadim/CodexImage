@@ -610,7 +610,7 @@ impl AppView {
                     window.on_next_frame(move |_, cx| cx.notify(entity));
                 }
                 if let Some(buttons) = &toolbar_buttons {
-                    paint_node_toolbar(buttons, zoom, window, cx);
+                    paint_node_toolbar(buttons, zoom, window);
                 }
             },
         )

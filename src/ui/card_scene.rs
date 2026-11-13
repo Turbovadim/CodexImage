@@ -12,6 +12,10 @@ use crate::layout::CARD_WIDTH;
 use crate::model::NodeStatus;
 use gpui::{SharedString, TextAlign};
 
+/// Below this many logical px, text is an illegible smear. Neither the direct
+/// painter nor a sprite spends shaping work on it.
+pub const MIN_LEGIBLE_FONT_SIZE: f32 = 3.;
+
 #[derive(Clone, Copy)]
 pub struct CardRect {
     pub x: f32,
