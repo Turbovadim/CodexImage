@@ -25,6 +25,11 @@ jobs:
         with:
           toolchain: 1.98.1
           components: clippy,rustfmt
+      # gpui_apple's build script runs an offline `cargo metadata` over the
+      # vendored workspace, so its crates must already be downloaded.
+      - name: Fetch vendored GPUI crates
+        if: runner.os == 'macOS'
+        run: cargo fetch --locked --manifest-path vendor/zed-gpui-occlusion/Cargo.toml
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Test
