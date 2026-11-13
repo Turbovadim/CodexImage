@@ -44,9 +44,10 @@ const MIN_ZOOM: f32 = 0.08;
 const MAX_ZOOM: f32 = 2.;
 /// How long zoom must hold still before sprites re-render for the new tier.
 const ZOOM_SETTLE_DELAY: Duration = Duration::from_millis(150);
-/// Only the elapsed-time label needs a clock. Generation activity arrives
-/// through repository events; no decorative animation keeps the canvas busy.
+/// Redraw rate for the elapsed-time label once every visible running card has
+/// an image. Generation activity itself arrives through repository events.
 const RUNNING_STATUS_INTERVAL: Duration = Duration::from_secs(1);
+/// Redraw rate while a visible running card still shows the generating waves.
 /// About 30 fps: smooth for slow waves, gentle on battery and GPU.
 const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 const MINIMAP_WIDTH: f32 = 142.;
