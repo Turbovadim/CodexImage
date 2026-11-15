@@ -1,12 +1,5 @@
 [workspace]
 members = ["."]
-# The vendored GPUI occlusion patch is its own workspace; it is consumed through
-# the `[patch]` table below rather than as a workspace member.
-exclude = [
-    "vendor/zed-gpui-occlusion/crates/gpui_apple",
-    "vendor/zed-gpui-occlusion/crates/gpui_macos",
-    "vendor/zed-gpui-occlusion/crates/gpui_linux",
-]
 resolver = "2"
 
 [package]
@@ -21,8 +14,8 @@ anyhow = "1"
 async-channel = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 dirs = "6"
-gpui = { git = "https://github.com/zed-industries/zed", rev = "d01f1258376ec2fb498d8386e734b0dabdbb9fe5", package = "gpui" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "d01f1258376ec2fb498d8386e734b0dabdbb9fe5", package = "gpui_platform", features = ["font-kit"] }
+gpui = { git = "https://github.com/Bisquit-Host/gpui-bisquit", rev = "9a8dc3e3b4f40e78f61ce36fca429e570828373a", package = "gpui" }
+gpui_platform = { git = "https://github.com/Bisquit-Host/gpui-bisquit", rev = "9a8dc3e3b4f40e78f61ce36fca429e570828373a", package = "gpui_platform", features = ["font-kit"] }
 image = { version = "0.25", default-features = false, features = ["avif", "bmp", "gif", "ico", "jpeg", "png", "pnm", "tiff", "webp"] }
 libc = "0.2"
 lz4_flex = "0.14.0"
@@ -41,7 +34,7 @@ foreign-types = "0.5"
 # GPUI's Linux windowing backends are opt-in. Without them gpui_linux silently
 # falls back to a headless platform: the app runs but never opens a window.
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "d01f1258376ec2fb498d8386e734b0dabdbb9fe5", package = "gpui_platform", features = ["font-kit", "wayland", "x11"] }
+gpui_platform = { git = "https://github.com/Bisquit-Host/gpui-bisquit", rev = "9a8dc3e3b4f40e78f61ce36fca429e570828373a", package = "gpui_platform", features = ["font-kit", "wayland", "x11"] }
 
 # Builds the file:// URL GPUI's desktop opener takes on Linux and the BSDs.
 [target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
@@ -59,18 +52,8 @@ windows-sys = { version = "0.61", features = [
 embed-resource = "3"
 
 [dev-dependencies]
-gpui = { git = "https://github.com/zed-industries/zed", rev = "d01f1258376ec2fb498d8386e734b0dabdbb9fe5", features = ["test-support"] }
+gpui = { git = "https://github.com/Bisquit-Host/gpui-bisquit", rev = "9a8dc3e3b4f40e78f61ce36fca429e570828373a", features = ["test-support"] }
 tempfile = "3"
-
-# Replaces GPUI's macOS platform crates with the vendored occlusion patch, which
-# tears down a fully occluded window's Metal layer and renderer-owned GPU memory.
-# Cargo only honours this table in the workspace root.
-[patch."https://github.com/zed-industries/zed"]
-gpui_apple = { path = "vendor/zed-gpui-occlusion/crates/gpui_apple" }
-gpui_macos = { path = "vendor/zed-gpui-occlusion/crates/gpui_macos" }
-# GPUI's Wayland clipboard only offers text; the vendored copy also offers
-# images so "Copy image" reaches other apps.
-gpui_linux = { path = "vendor/zed-gpui-occlusion/crates/gpui_linux" }
 
 [profile.release]
 lto = "thin"
