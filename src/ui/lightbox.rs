@@ -1068,7 +1068,7 @@ impl AppView {
             let image = smol::unblock(move || clipboard_image(&path, format)).await;
             let _ = weak.update(cx, |view, cx| match image {
                 Ok(image) => {
-                    cx.write_to_clipboard(ClipboardItem::new_image(&image));
+                    cx.write_to_clipboard(ClipboardItem::from(image));
                     view.show_toast("Image copied".into(), false, None, cx);
                 }
                 Err(error) => view.show_error(error, cx),

@@ -123,7 +123,12 @@ fn resolve_image_jobs(batch: Vec<ImageJob>) -> Vec<ResolvedImage> {
             .map(|_| {
                 scope.spawn(|| {
                     let mut resolved = Vec::new();
-                    while let Some(job) = jobs.lock().unwrap().next() {
+                    loop {
+                        // Taken in its own statement: a `while let` on the
+                        // lock would hold it through the job and run the
+                        // batch one image at a time.
+                        let job = jobs.lock().unwrap().next();
+                        let Some(job) = job else { break };
                         resolved.push(resolve_image_job(job));
                     }
                     resolved
@@ -217,8 +222,7 @@ pub(super) struct AppView {
     pub(super) camera_glide: Option<CameraGlide>,
     pub(super) zoom_settled: bool,
     pub(super) zoom_settle_task: Option<Task<()>>,
-    /// The redraw ticker for running cards and the interval it ticks at.
-    pub(super) running_tick_task: Option<(Duration, Task<()>)>,
+    pub(super) running_tick_task: Option<Task<()>>,
     /// Drops the render caches once the window has stayed hidden for a while.
     hidden_release_task: Option<Task<()>>,
     repository_task: Option<Task<()>>,
@@ -1133,7 +1137,7 @@ impl Render for AppView {
             .is_none_or(|board| board.nodes.is_empty());
         let overlay_covers_canvas = matches!(self.overlay, Overlay::Gallery | Overlay::Lightbox(_));
         if empty || overlay_covers_canvas {
-            self.sync_running_tick(None, cx);
+            self.sync_running_tick(false, cx);
         }
         let mut root = div()
             .image_cache(self.image_cache.clone())

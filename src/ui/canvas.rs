@@ -1,7 +1,6 @@
 //! Painting the infinite canvas: the dot grid, the dashed parent connectors,
 //! and each visible card (as a cached sprite when one is ready).
 
-use super::card::MEDIA_RADIUS;
 use super::card::{
     CARD_SPRITE_WIDTHS, CanvasNode, CardImageFit, CardPrimitive, CardRect, CardScene,
     FINEST_SPRITE_TIER,
@@ -14,14 +13,12 @@ use super::image_cache::{
 use super::theme;
 use crate::layout::CARD_WIDTH;
 use gpui::{
-    App, BorderStyle, Bounds, ContentMask, Entity, Hsla, ObjectFit, PathBuilder, Pixels, Point,
-    Resource, SharedString, TextAlign, TextRun, TransformationMatrix, Window, fill,
-    linear_color_stop, linear_gradient, point, px, quad, size,
+    App, BorderStyle, Bounds, ContentMask, Entity, ObjectFit, Pixels, Point, Resource,
+    SharedString, TextAlign, TextRun, TransformationMatrix, Window, fill, point, px, quad, size,
 };
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
 
 const GRID_GAP: f32 = 28.;
 const GRID_DOT_SIZE: f32 = 1.4;
@@ -423,6 +420,7 @@ fn paint_canvas_text(
     bounds: Bounds<Pixels>,
     style: CanvasTextStyle,
     window: &mut Window,
+    cx: &mut App,
 ) {
     // Skipping illegible text spares the shaping pass, which dominates a full
     // direct redraw of a large board at far-out zoom (hundreds of cards,
@@ -447,34 +445,16 @@ fn paint_canvas_text(
     let line = window
         .text_system()
         .shape_line(text, px(style.font_size), &[run], None);
-    // GPUI keys atlas glyphs on the exact font size, so quarter-pixel steps
-    // bound how many sizes a continuous zoom rasterizes.
-    let glyph_size = px((screen_font_size * 4.).round() / 4.);
-    let width = line.width * style.zoom;
-    let left = bounds.left()
-        + match style.align {
-            TextAlign::Left => px(0.),
-            TextAlign::Center => (bounds.size.width - width) / 2.,
-            TextAlign::Right => bounds.size.width - width,
-        };
-    // The same baseline placement as GPUI's line painter.
-    let baseline = bounds.top()
-        + (px(style.line_height) - (line.ascent + line.descent) * style.zoom) / 2.
-        + line.ascent * style.zoom;
     window.with_content_mask(Some(ContentMask { bounds }), |window| {
-        for run in &line.runs {
-            for glyph in &run.glyphs {
-                let origin = point(
-                    left + glyph.position.x * style.zoom,
-                    baseline + glyph.position.y * style.zoom,
-                );
-                let _ = if glyph.is_emoji {
-                    window.paint_emoji(origin, run.font_id, glyph.id, glyph_size)
-                } else {
-                    window.paint_glyph(origin, run.font_id, glyph.id, glyph_size, style.color)
-                };
-            }
-        }
+        let _ = line.paint_glyphs_scaled(
+            bounds.origin,
+            px(style.line_height),
+            style.align,
+            Some(bounds.size.width),
+            style.zoom,
+            window,
+            cx,
+        );
     });
 }
 
@@ -615,7 +595,7 @@ pub fn paint_canvas_node(
     // without touching a glyph, which a crowded view cannot afford per frame.
     let raster_tier = sprites_allowed.then(|| zoom_tier.unwrap_or(FINEST_SPRITE_TIER));
     let mut sprite = None;
-    let mut sprite_rasterizing = false;
+    let mut awaiting_sprite = false;
     let mut deferred_sprite_source = false;
     let previous_tier = canvas_node.last_ready_sprite_tier.load(Ordering::Relaxed) as usize;
     if let Some(raster_tier) = raster_tier {
@@ -641,7 +621,9 @@ pub fn paint_canvas_node(
                     .last_ready_sprite_tier
                     .store(raster_tier as u8, Ordering::Relaxed);
             } else {
-                sprite_rasterizing = !deferred_sprite_source;
+                // Rasterizing now, or past this frame's source budget and
+                // starting on one of the next few.
+                awaiting_sprite = true;
             }
             if zoom_tier.is_some() {
                 sprite = rendered
@@ -682,7 +664,7 @@ pub fn paint_canvas_node(
             }
         }
         None => {
-            let layers = if sprite_rasterizing && zoom_tier.is_some() {
+            let layers = if awaiting_sprite && zoom_tier.is_some() {
                 SceneLayers::AwaitingSprite
             } else if phase.settled || phase.gesture_text || zoom_tier.is_none() {
                 SceneLayers::All
@@ -705,22 +687,6 @@ pub fn paint_canvas_node(
         paint_high_resolution_card_images(frame, &canvas_node.scene, zoom, image_cache, window, cx);
     }
 
-    if frame.status_line.is_some()
-        && let Some(area) = canvas_node.scene.generating_area
-    {
-        paint_generating_waves(
-            MEDIA_RADIUS * zoom,
-            canvas_bounds(
-                frame.screen_x + area.x * zoom,
-                frame.screen_y + area.y * zoom,
-                area.width * zoom,
-                area.height * zoom,
-            ),
-            zoom,
-            window,
-        );
-    }
-
     if let Some(status_line) = &frame.status_line {
         paint_canvas_text(
             status_line.clone(),
@@ -738,6 +704,7 @@ pub fn paint_canvas_node(
                 align: TextAlign::Left,
             },
             window,
+            cx,
         );
     }
 
@@ -745,178 +712,6 @@ pub fn paint_canvas_node(
         paint_target_outline(bounds, zoom, window);
     }
     deferred_sprite_source
-}
-
-/// Seconds since the first animated frame; every animation shares this clock
-/// so cards generating side by side move in step.
-fn animation_seconds() -> f32 {
-    static START: OnceLock<Instant> = OnceLock::new();
-    START.get_or_init(Instant::now).elapsed().as_secs_f32()
-}
-
-/// Layered, drifting sine waves with a light sweep and a pulsing label, painted
-/// live over a running card's empty media area.
-fn paint_generating_waves(radius: f32, bounds: Bounds<Pixels>, zoom: f32, window: &mut Window) {
-    let width = f32::from(bounds.size.width);
-    let height = f32::from(bounds.size.height);
-    if width < 24. || height < 24. {
-        return;
-    }
-    let t = animation_seconds();
-    let left = f32::from(bounds.left());
-    let top = f32::from(bounds.top());
-    let bottom = f32::from(bounds.bottom());
-    window.with_content_mask(Some(ContentMask { bounds }), |window| {
-        // A faint accent glow rising from the bottom.
-        window.paint_quad(fill(
-            bounds,
-            linear_gradient(
-                180.,
-                linear_color_stop(theme::accent_strong().opacity(0.), 0.2),
-                linear_color_stop(theme::accent_strong().opacity(0.16), 1.),
-            ),
-        ));
-
-        // (baseline, amplitude, wavelength, speed, phase, top alpha), back to front.
-        const LAYERS: [(f32, f32, f32, f32, f32, f32); 4] = [
-            (0.42, 0.075, 1.15, 0.55, 0.0, 0.10),
-            (0.54, 0.065, 0.85, -0.8, 1.7, 0.14),
-            (0.66, 0.055, 1.35, 1.05, 3.1, 0.20),
-            (0.78, 0.045, 0.7, -1.35, 4.6, 0.28),
-        ];
-        let steps = ((width / 6.).ceil() as usize).clamp(24, 96);
-        for (baseline, amplitude, wavelength, speed, phase, alpha) in LAYERS {
-            let base_y = top + height * baseline;
-            let amplitude = height * amplitude * (0.85 + 0.15 * (t * 0.7 + phase).sin());
-            let lambda = width * wavelength;
-            let mut path = PathBuilder::fill();
-            path.move_to(point(px(left), px(bottom)));
-            for step in 0..=steps {
-                let x = left + width * step as f32 / steps as f32;
-                let u = (x - left) / lambda * std::f32::consts::TAU;
-                let y = base_y
-                    + amplitude * (u + t * speed + phase).sin()
-                    + amplitude * 0.35 * (u * 2.3 - t * speed * 1.6 + phase).sin();
-                path.line_to(point(px(x), px(y)));
-            }
-            path.line_to(point(px(left + width), px(bottom)));
-            path.close();
-            if let Ok(path) = path.build() {
-                window.paint_path(
-                    path,
-                    linear_gradient(
-                        180.,
-                        linear_color_stop(theme::accent().opacity(alpha), 0.),
-                        linear_color_stop(theme::accent_strong().opacity(alpha * 0.25), 1.),
-                    ),
-                );
-            }
-        }
-
-        // A soft sheen sweeping across every few seconds.
-        let period = 3.2;
-        let progress = (t % period) / period;
-        let sheen_width = width * 0.45;
-        let sheen_x = left - sheen_width + (width + sheen_width * 2.) * progress;
-        let half = sheen_width / 2.;
-        for (x, from, to) in [(sheen_x, 0., 0.05), (sheen_x + half, 0.05, 0.)] {
-            window.paint_quad(fill(
-                Bounds::new(
-                    point(px(x), bounds.top()),
-                    size(px(half), bounds.size.height),
-                ),
-                linear_gradient(
-                    90.,
-                    linear_color_stop(gpui::white().opacity(from), 0.),
-                    linear_color_stop(gpui::white().opacity(to), 1.),
-                ),
-            ));
-        }
-
-        // "Generating" with three dots that pulse in sequence.
-        let label_height = 20. * zoom;
-        let label_top = top + height * 0.24;
-        paint_canvas_text(
-            "Generating".into(),
-            canvas_bounds(left, label_top, width, label_height),
-            CanvasTextStyle {
-                font_size: 12.5,
-                zoom,
-                line_height: label_height,
-                color: theme::ink().opacity(0.75),
-                align: TextAlign::Center,
-            },
-            window,
-        );
-        let dot = 4. * zoom;
-        let gap = 5. * zoom;
-        let dots_left = left + width / 2. - (dot * 3. + gap * 2.) / 2.;
-        let dots_top = label_top + label_height + 6. * zoom;
-        for index in 0..3 {
-            let pulse = ((t * 3.2 - index as f32 * 0.6).sin() * 0.5 + 0.5).powf(1.5);
-            window.paint_quad(
-                fill(
-                    Bounds::new(
-                        point(px(dots_left + index as f32 * (dot + gap)), px(dots_top)),
-                        size(px(dot), px(dot)),
-                    ),
-                    theme::accent().opacity(0.25 + 0.75 * pulse),
-                )
-                .corner_radii(px(dot / 2.)),
-            );
-        }
-        paint_rounded_corner_masks(bounds, radius, theme::raised(), window);
-    });
-}
-
-/// Rounds a rectangular paint by covering its four corners with `color`
-/// (the surface behind it), since content masks only clip to rectangles.
-fn paint_rounded_corner_masks(
-    bounds: Bounds<Pixels>,
-    radius: f32,
-    color: Hsla,
-    window: &mut Window,
-) {
-    if radius < 0.5 {
-        return;
-    }
-    let r = px(radius);
-    let (left, right, top, bottom) = (bounds.left(), bounds.right(), bounds.top(), bounds.bottom());
-    // (corner, point along the horizontal edge, point along the vertical edge)
-    let corners = [
-        (point(left, top), point(left + r, top), point(left, top + r)),
-        (
-            point(right, top),
-            point(right - r, top),
-            point(right, top + r),
-        ),
-        (
-            point(left, bottom),
-            point(left + r, bottom),
-            point(left, bottom - r),
-        ),
-        (
-            point(right, bottom),
-            point(right - r, bottom),
-            point(right, bottom - r),
-        ),
-    ];
-    // Control points 0.552r from the edge points approximate a quarter circle.
-    const K: f32 = 0.552;
-    for (corner, horizontal, vertical) in corners {
-        let mut path = PathBuilder::fill();
-        path.move_to(corner);
-        path.line_to(horizontal);
-        path.cubic_bezier_to(
-            vertical,
-            horizontal + (corner - horizontal) * K,
-            vertical + (corner - vertical) * K,
-        );
-        path.close();
-        if let Ok(path) = path.build() {
-            window.paint_path(path, color);
-        }
-    }
 }
 
 /// The smallest sprite tier that still covers the card's on-screen width, or
@@ -967,7 +762,7 @@ pub fn paint_node_toolbar(
     buttons: &[ToolbarButtonPaint],
     zoom: f32,
     window: &mut Window,
-    cx: &App,
+    cx: &mut App,
 ) {
     let (Some(first), Some(last)) = (buttons.first(), buttons.last()) else {
         return;
@@ -1025,7 +820,7 @@ pub fn paint_node_toolbar(
         );
     }
     if let Some(hovered) = buttons.iter().find(|button| button.hovered) {
-        paint_toolbar_hint(hovered, bar, zoom, window);
+        paint_toolbar_hint(hovered, bar, zoom, window, cx);
     }
     if buttons.iter().any(|button| button.appear < 1.) {
         window.request_animation_frame();
@@ -1038,6 +833,7 @@ fn paint_toolbar_hint(
     bar: Bounds<Pixels>,
     zoom: f32,
     window: &mut Window,
+    cx: &mut App,
 ) {
     let width = (button.hint.chars().count() as f32 * 6.3 + 18.) * zoom;
     let height = 22. * zoom;
@@ -1070,6 +866,7 @@ fn paint_toolbar_hint(
             align: TextAlign::Center,
         },
         window,
+        cx,
     );
 }
 
@@ -1143,6 +940,7 @@ fn paint_card_scene(
                             align: *align,
                         },
                         window,
+                        cx,
                     ),
                     CardPrimitive::Image {
                         bounds,

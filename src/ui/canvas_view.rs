@@ -44,12 +44,9 @@ const MIN_ZOOM: f32 = 0.08;
 const MAX_ZOOM: f32 = 2.;
 /// How long zoom must hold still before sprites re-render for the new tier.
 const ZOOM_SETTLE_DELAY: Duration = Duration::from_millis(150);
-/// Redraw rate for the elapsed-time label once every visible running card has
-/// an image. Generation activity itself arrives through repository events.
+/// Only the elapsed-time label needs a clock. Generation activity arrives
+/// through repository events; no decorative animation keeps the canvas busy.
 const RUNNING_STATUS_INTERVAL: Duration = Duration::from_secs(1);
-/// Redraw rate while a visible running card still shows the generating waves.
-/// About 30 fps: smooth for slow waves, gentle on battery and GPU.
-const ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(33);
 const MINIMAP_WIDTH: f32 = 142.;
 const MINIMAP_HEIGHT: f32 = 96.;
 const MINIMAP_RIGHT: f32 = 18.;
@@ -561,7 +558,7 @@ impl AppView {
                     viewport_height,
                     VIEWPORT_CULL_MARGIN,
                 )
-                .then_some(CanvasNodeFrame {
+                .then(|| CanvasNodeFrame {
                     node_index,
                     screen_x,
                     screen_y,
@@ -572,24 +569,13 @@ impl AppView {
                 })
             })
             .collect::<Vec<_>>();
-        // Elapsed seconds need a redraw each second; the wave animation on a
-        // running card without an image yet needs a smooth frame rate.
-        let running_visible = visible_nodes
-            .iter()
-            .any(|frame| frame.status_line.is_some());
-        let animating = visible_nodes.iter().any(|frame| {
-            frame.status_line.is_some()
-                && self
-                    .canvas_nodes
-                    .get(frame.node_index)
-                    .is_some_and(|node| node.scene.generating_area.is_some())
-        });
-        let tick = (running_visible && window.is_window_active()).then_some(if animating {
-            ANIMATION_FRAME_INTERVAL
-        } else {
-            RUNNING_STATUS_INTERVAL
-        });
-        self.sync_running_tick(tick, cx);
+        self.sync_running_tick(
+            visible_nodes
+                .iter()
+                .any(|frame| frame.status_line.is_some())
+                && window.is_window_active(),
+            cx,
+        );
 
         let toolbar_for = |node_id: &str, exit: Option<f32>| {
             visible_nodes.iter().find_map(|frame| {
@@ -701,32 +687,26 @@ impl AppView {
         layer.child(zoom_controls).into_any_element()
     }
 
-    /// Redraws at `interval` while running cards are visible in the active
-    /// window; `None` stops the ticker.
-    pub(super) fn sync_running_tick(&mut self, interval: Option<Duration>, cx: &mut Context<Self>) {
-        let Some(interval) = interval else {
+    /// Update elapsed time only while running cards are visible in the active window.
+    pub(super) fn sync_running_tick(&mut self, active: bool, cx: &mut Context<Self>) {
+        if !active {
             self.running_tick_task.take();
             return;
-        };
-        if self
-            .running_tick_task
-            .as_ref()
-            .is_some_and(|(current, _)| *current == interval)
-        {
+        }
+        if self.running_tick_task.is_some() {
             return;
         }
 
-        self.running_tick_task = Some((
-            interval,
-            cx.spawn(async move |weak, cx| {
-                loop {
-                    cx.background_executor().timer(interval).await;
-                    if weak.update(cx, |_, cx| cx.notify()).is_err() {
-                        break;
-                    }
+        self.running_tick_task = Some(cx.spawn(async move |weak, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(RUNNING_STATUS_INTERVAL)
+                    .await;
+                if weak.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
                 }
-            }),
-        ));
+            }
+        }));
     }
 
     fn running_status_line(&self, node: &BoardNode, now: i64) -> SharedString {

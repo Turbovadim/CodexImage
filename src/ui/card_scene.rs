@@ -125,10 +125,6 @@ pub struct CardScene {
     /// visible node was measurable during camera movement.
     pub has_blurred_images: bool,
     pub max_high_resolution_dimension: f32,
-    /// Card-local media area of a running card that has no image yet. The
-    /// canvas paints the live "generating" animation over it each frame; the
-    /// cached scene and sprite keep only the plain backdrop.
-    pub generating_area: Option<CardRect>,
 }
 
 impl CardScene {
@@ -360,10 +356,6 @@ pub fn build_card_scene(canvas_node: &CanvasNode) -> CardScene {
             let media = CardRect::new(MEDIA_INSET, cursor_y, MEDIA_WIDTH, *height);
             if cells.is_empty() {
                 scene.quad(media, MEDIA_RADIUS, CardColor::Hover, None);
-            }
-            if cells.is_empty() && running {
-                scene.generating_area = Some(media);
-            } else if cells.is_empty() {
                 scene.text(
                     "Generating…",
                     media,

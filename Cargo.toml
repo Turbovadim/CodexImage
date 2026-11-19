@@ -14,9 +14,9 @@ anyhow = "1"
 async-channel = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 dirs = "6"
-gpui = { git = "https://github.com/Bisquit-Host/gpui-bisquit", rev = "9a8dc3e3b4f40e78f61ce36fca429e570828373a", package = "gpui" }
-gpui_platform = { git = "https://github.com/Bisquit-Host/gpui-bisquit", rev = "9a8dc3e3b4f40e78f61ce36fca429e570828373a", package = "gpui_platform", features = ["font-kit"] }
-image = { version = "0.25", default-features = false, features = ["avif", "bmp", "gif", "ico", "jpeg", "png", "pnm", "tiff", "webp"] }
+gpui = { git = "https://github.com/Bisquit-Host/gpui-bisquit", rev = "e3260a4f2891fd645dbb3e0f8b3f8d820c69338c", package = "gpui" }
+gpui_platform = { git = "https://github.com/Bisquit-Host/gpui-bisquit", rev = "e3260a4f2891fd645dbb3e0f8b3f8d820c69338c", package = "gpui_platform", features = ["font-kit"] }
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "pnm", "tiff", "webp"] }
 libc = "0.2"
 lz4_flex = "0.14.0"
 parking_lot = "0.12"
@@ -34,7 +34,7 @@ foreign-types = "0.5"
 # GPUI's Linux windowing backends are opt-in. Without them gpui_linux silently
 # falls back to a headless platform: the app runs but never opens a window.
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
-gpui_platform = { git = "https://github.com/Bisquit-Host/gpui-bisquit", rev = "9a8dc3e3b4f40e78f61ce36fca429e570828373a", package = "gpui_platform", features = ["font-kit", "wayland", "x11"] }
+gpui_platform = { git = "https://github.com/Bisquit-Host/gpui-bisquit", rev = "e3260a4f2891fd645dbb3e0f8b3f8d820c69338c", package = "gpui_platform", features = ["font-kit", "wayland", "x11"] }
 
 # Builds the file:// URL GPUI's desktop opener takes on Linux and the BSDs.
 [target.'cfg(not(any(target_os = "macos", target_os = "windows")))'.dependencies]
@@ -52,7 +52,7 @@ windows-sys = { version = "0.61", features = [
 embed-resource = "3"
 
 [dev-dependencies]
-gpui = { git = "https://github.com/Bisquit-Host/gpui-bisquit", rev = "9a8dc3e3b4f40e78f61ce36fca429e570828373a", features = ["test-support"] }
+gpui = { git = "https://github.com/Bisquit-Host/gpui-bisquit", rev = "e3260a4f2891fd645dbb3e0f8b3f8d820c69338c", features = ["test-support"] }
 tempfile = "3"
 
 [profile.release]
