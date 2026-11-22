@@ -531,6 +531,7 @@ impl AppView {
                                     input.set_mode(TextInputMode::SingleLine, cx);
                                     input.set_placeholder("Board name", cx);
                                     input.set_content(title, cx);
+                                    input.select_content(cx);
                                 });
                                 this.overlay = Overlay::RenameBoard(rename_id.clone());
                                 window.focus(&this.modal_input.focus_handle(cx), cx);

@@ -4,12 +4,15 @@ use super::input::{LINE_HEIGHT, RevealKey, TextInput, TextInputMode};
 use super::input_layout::{TextLayout, selection_quads};
 use super::theme;
 use gpui::{
-    App, Bounds, ContentMask, Element, ElementId, ElementInputHandler, Entity, Font,
-    GlobalElementId, Hsla, LayoutId, PaintQuad, Pixels, Point, SharedString, Style, TextRun,
-    UnderlineStyle, Window, fill, point, prelude::*, px, relative, size,
+    App, Bounds, ContentMask, DispatchPhase, Element, ElementId, ElementInputHandler, Entity, Font,
+    GlobalElementId, Hsla, LayoutId, MouseMoveEvent, PaintQuad, Pixels, Point, SharedString, Style,
+    TextRun, UnderlineStyle, Window, fill, point, px, relative, size,
 };
 use std::ops::Range;
 use std::sync::Arc;
+
+/// Trims the caret to roughly the height of the glyphs within the line.
+const CARET_INSET: f32 = 2.;
 
 pub(super) struct TextElement {
     pub(super) input: Entity<TextInput>,
@@ -42,14 +45,7 @@ pub(super) struct Prepaint {
     vertical_inset: f32,
     shape_key: TextShapeKey,
     revealed: Option<RevealKey>,
-}
-
-impl IntoElement for TextElement {
-    type Element = Self;
-
-    fn into_element(self) -> Self {
-        self
-    }
+    restart_blink: bool,
 }
 
 impl Element for TextElement {
@@ -90,10 +86,13 @@ impl Element for TextElement {
         let style = window.text_style();
         let content = input.content.clone();
         let selected = input.selected.clone();
-        let cursor_index = input.cursor();
+        let cursor = input.caret();
         let marked = input.marked.clone();
         let mode = input.mode;
         let focused = input.focus.is_focused(window);
+        let draws_caret = input.draws_caret(window);
+        let caret_visible = input.caret_visible;
+        let blinking = input.caret_blink.is_some();
         let previous_scroll_x = input.scroll_x;
         let previous_scroll_y = input.scroll_y;
         let previously_revealed = input.revealed;
@@ -130,35 +129,31 @@ impl Element for TextElement {
                     underline: None,
                     strikethrough: None,
                 };
-                let runs = if !is_placeholder {
-                    if let Some(marked) = &marked {
-                        vec![
-                            TextRun {
-                                len: marked.start,
-                                ..base.clone()
-                            },
-                            TextRun {
-                                len: marked.end - marked.start,
-                                underline: Some(UnderlineStyle {
-                                    color: Some(color),
-                                    thickness: px(1.),
-                                    wavy: false,
-                                }),
-                                ..base.clone()
-                            },
-                            TextRun {
-                                len: display_text.len() - marked.end,
-                                ..base
-                            },
-                        ]
-                        .into_iter()
-                        .filter(|run| run.len > 0)
-                        .collect()
-                    } else {
-                        vec![base]
-                    }
-                } else {
-                    vec![base]
+                let marked = marked.clone().filter(|_| !is_placeholder);
+                let runs: Vec<TextRun> = match marked {
+                    Some(marked) => [
+                        TextRun {
+                            len: marked.start,
+                            ..base.clone()
+                        },
+                        TextRun {
+                            len: marked.len(),
+                            underline: Some(UnderlineStyle {
+                                color: Some(color),
+                                thickness: px(1.),
+                                wavy: false,
+                            }),
+                            ..base.clone()
+                        },
+                        TextRun {
+                            len: display_text.len() - marked.end,
+                            ..base
+                        },
+                    ]
+                    .into_iter()
+                    .filter(|run| run.len > 0)
+                    .collect(),
+                    None => vec![base],
                 };
                 let shaped = window
                     .text_system()
@@ -178,7 +173,7 @@ impl Element for TextElement {
             0.
         };
 
-        let caret = layout.position_for_index(cursor_index);
+        let caret = layout.position_for(cursor);
         let mut scroll_x = if mode.is_multiline() {
             0.
         } else {
@@ -191,8 +186,9 @@ impl Element for TextElement {
         };
         // Follow the caret only after it, the text or the viewport changed;
         // otherwise keep the user's own scroll position.
-        let reveal_key = focused.then(|| (cursor_index, content.len(), viewport_height.to_bits()));
-        if reveal_key.is_some() && reveal_key != previously_revealed {
+        let reveal_key = focused.then(|| (cursor, content.len(), viewport_height.to_bits()));
+        let moved = reveal_key.is_some() && reveal_key != previously_revealed;
+        if moved {
             if mode.is_multiline() {
                 let max_scroll = (total_height - viewport_height).max(0.);
                 let caret_top = f32::from(caret.y);
@@ -226,12 +222,19 @@ impl Element for TextElement {
             scroll_x,
             scroll_y,
             vertical_inset,
+            if focused {
+                theme::accent().opacity(0.28)
+            } else {
+                theme::faint().opacity(0.28)
+            },
         );
-        let cursor = selected.is_empty().then(|| {
+        // A caret that just moved shows at once and blinks from there.
+        let restart_blink = draws_caret && (moved || !blinking);
+        let cursor = (draws_caret && (caret_visible || restart_blink)).then(|| {
             fill(
                 Bounds::new(
-                    point(origin.x + caret.x, origin.y + caret.y),
-                    size(px(1.5), px(LINE_HEIGHT)),
+                    point(origin.x + caret.x, origin.y + caret.y + px(CARET_INSET)),
+                    size(px(1.5), px(LINE_HEIGHT - 2. * CARET_INSET)),
                 ),
                 theme::accent(),
             )
@@ -247,6 +250,7 @@ impl Element for TextElement {
             vertical_inset,
             shape_key,
             revealed: reveal_key,
+            restart_blink,
         }
     }
 
@@ -266,6 +270,14 @@ impl Element for TextElement {
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
+        // Window-wide, because a div's own mouse-move listener stops firing
+        // once a drag leaves it.
+        let input = self.input.clone();
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+            if phase == DispatchPhase::Bubble && input.read(cx).drag.is_some() {
+                input.update(cx, |input, cx| input.mouse_move(event, cx));
+            }
+        });
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             for selection in prepaint.selections.drain(..) {
                 window.paint_quad(selection);
@@ -284,14 +296,15 @@ impl Element for TextElement {
                     cx,
                 );
             }
-            if focus.is_focused(window)
-                && let Some(cursor) = prepaint.cursor.take()
-            {
+            if let Some(cursor) = prepaint.cursor.take() {
                 window.paint_quad(cursor);
             }
             paint_scrollbar(bounds, prepaint, window);
         });
-        let grew = self.input.update(cx, |input, _| {
+        let grew = self.input.update(cx, |input, cx| {
+            if prepaint.restart_blink {
+                input.restart_caret_blink(window, cx);
+            }
             let height_changed = input.measured_visual_lines != prepaint.layout.visual_line_count;
             input.last_layout = Some(prepaint.layout.clone());
             if input

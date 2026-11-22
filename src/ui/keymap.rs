@@ -1,26 +1,10 @@
 //! Global actions, their key bindings, and the application menu.
 
-use super::input::{
-    Backspace as InputBackspace, Copy as InputCopy, Cut as InputCut, Delete as InputDelete,
-    DeleteWordBackward as InputDeleteWordBackward, DeleteWordForward as InputDeleteWordForward,
-    DocumentEnd as InputDocumentEnd, DocumentStart as InputDocumentStart, Down as InputDown,
-    End as InputEnd, Home as InputHome, InsertNewline, Left as InputLeft, Paste as InputPaste,
-    Redo as InputRedo, Right as InputRight, SelectAll as InputSelectAll,
-    SelectDocumentEnd as InputSelectDocumentEnd, SelectDocumentStart as InputSelectDocumentStart,
-    SelectDown as InputSelectDown, SelectEnd as InputSelectEnd, SelectHome as InputSelectHome,
-    SelectLeft as InputSelectLeft, SelectRight as InputSelectRight, SelectUp as InputSelectUp,
-    SelectWordLeft as InputSelectWordLeft, SelectWordRight as InputSelectWordRight,
-    Undo as InputUndo, Up as InputUp, WordLeft as InputWordLeft, WordRight as InputWordRight,
-};
-#[cfg(target_os = "macos")]
-use super::input::{
-    DeleteToLineEnd as InputDeleteToLineEnd, DeleteToLineStart as InputDeleteToLineStart,
-    ShowCharacterPalette as InputShowCharacterPalette,
-};
+use super::input::{self, Delete, Motion, Move, Select};
 use crate::APP_NAME;
 #[cfg(target_os = "macos")]
 use gpui::SystemMenuType;
-use gpui::{App, KeyBinding, Menu, MenuItem, OsAction, actions};
+use gpui::{Action, App, KeyBinding, Menu, MenuItem, OsAction, actions};
 
 actions!(
     codex_image,
@@ -63,12 +47,25 @@ pub(super) const fn platform_shortcut(
     }
 }
 
+fn input_key(keystrokes: &'static str, action: impl Action) -> KeyBinding {
+    KeyBinding::new(keystrokes, action, Some("CodexImageInput"))
+}
+
+/// Binds each keystroke to move by its motion, and with shift to select by it.
+macro_rules! motion_keys {
+    ($($keys:literal => $motion:ident),* $(,)?) => {
+        [$(
+            input_key($keys, Move(Motion::$motion)),
+            input_key(concat!("shift-", $keys), Select(Motion::$motion)),
+        )*]
+    };
+}
+
 pub fn bind_keys(cx: &mut App) {
     const CANVAS_CONTEXT: &str = "CodexImage && !CodexImageInput";
 
     cx.bind_keys([
         KeyBinding::new("enter", Generate, None),
-        KeyBinding::new("shift-enter", InsertNewline, Some("CodexImageInput")),
         KeyBinding::new("/", FocusPrompt, Some(CANVAS_CONTEXT)),
         KeyBinding::new("g", ToggleGallery, Some(CANVAS_CONTEXT)),
         KeyBinding::new("f", FitCanvas, Some(CANVAS_CONTEXT)),
@@ -86,21 +83,18 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("up", LightboxUp, Some(CANVAS_CONTEXT)),
         KeyBinding::new("down", LightboxDown, Some(CANVAS_CONTEXT)),
         KeyBinding::new("x", ToggleCompare, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("backspace", InputBackspace, Some("CodexImageInput")),
-        KeyBinding::new("shift-backspace", InputBackspace, Some("CodexImageInput")),
-        KeyBinding::new("delete", InputDelete, Some("CodexImageInput")),
-        KeyBinding::new("left", InputLeft, Some("CodexImageInput")),
-        KeyBinding::new("right", InputRight, Some("CodexImageInput")),
-        KeyBinding::new("up", InputUp, Some("CodexImageInput")),
-        KeyBinding::new("down", InputDown, Some("CodexImageInput")),
-        KeyBinding::new("shift-left", InputSelectLeft, Some("CodexImageInput")),
-        KeyBinding::new("shift-right", InputSelectRight, Some("CodexImageInput")),
-        KeyBinding::new("shift-up", InputSelectUp, Some("CodexImageInput")),
-        KeyBinding::new("shift-down", InputSelectDown, Some("CodexImageInput")),
-        KeyBinding::new("shift-home", InputSelectHome, Some("CodexImageInput")),
-        KeyBinding::new("shift-end", InputSelectEnd, Some("CodexImageInput")),
-        KeyBinding::new("home", InputHome, Some("CodexImageInput")),
-        KeyBinding::new("end", InputEnd, Some("CodexImageInput")),
+        input_key("shift-enter", input::InsertNewline),
+        input_key("backspace", Delete(Motion::Left)),
+        input_key("shift-backspace", Delete(Motion::Left)),
+        input_key("delete", Delete(Motion::Right)),
+    ]);
+    cx.bind_keys(motion_keys![
+        "left" => Left,
+        "right" => Right,
+        "up" => Up,
+        "down" => Down,
+        "home" => LineStart,
+        "end" => LineEnd,
     ]);
     bind_platform_keys(cx);
 }
@@ -115,73 +109,37 @@ fn bind_platform_keys(cx: &mut App) {
         KeyBinding::new("cmd-o", AddAttachment, None),
         KeyBinding::new("cmd-,", OpenSettings, None),
         KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("ctrl-h", InputBackspace, Some("CodexImageInput")),
-        KeyBinding::new("ctrl-d", InputDelete, Some("CodexImageInput")),
-        KeyBinding::new("alt-left", InputWordLeft, Some("CodexImageInput")),
-        KeyBinding::new("alt-right", InputWordRight, Some("CodexImageInput")),
-        KeyBinding::new(
-            "alt-shift-left",
-            InputSelectWordLeft,
-            Some("CodexImageInput"),
-        ),
-        KeyBinding::new(
-            "alt-shift-right",
-            InputSelectWordRight,
-            Some("CodexImageInput"),
-        ),
-        KeyBinding::new("cmd-left", InputHome, Some("CodexImageInput")),
-        KeyBinding::new("cmd-right", InputEnd, Some("CodexImageInput")),
-        KeyBinding::new("cmd-shift-left", InputSelectHome, Some("CodexImageInput")),
-        KeyBinding::new("cmd-shift-right", InputSelectEnd, Some("CodexImageInput")),
-        KeyBinding::new("cmd-up", InputDocumentStart, Some("CodexImageInput")),
-        KeyBinding::new("cmd-down", InputDocumentEnd, Some("CodexImageInput")),
-        KeyBinding::new(
-            "cmd-shift-up",
-            InputSelectDocumentStart,
-            Some("CodexImageInput"),
-        ),
-        KeyBinding::new(
-            "cmd-shift-down",
-            InputSelectDocumentEnd,
-            Some("CodexImageInput"),
-        ),
-        KeyBinding::new(
-            "alt-backspace",
-            InputDeleteWordBackward,
-            Some("CodexImageInput"),
-        ),
-        KeyBinding::new("ctrl-w", InputDeleteWordBackward, Some("CodexImageInput")),
-        KeyBinding::new(
-            "alt-delete",
-            InputDeleteWordForward,
-            Some("CodexImageInput"),
-        ),
-        KeyBinding::new(
-            "cmd-backspace",
-            InputDeleteToLineStart,
-            Some("CodexImageInput"),
-        ),
-        KeyBinding::new("cmd-delete", InputDeleteToLineEnd, Some("CodexImageInput")),
-        KeyBinding::new("ctrl-k", InputDeleteToLineEnd, Some("CodexImageInput")),
-        KeyBinding::new("cmd-a", InputSelectAll, Some("CodexImageInput")),
-        KeyBinding::new("cmd-v", InputPaste, Some("CodexImageInput")),
-        KeyBinding::new("cmd-c", InputCopy, Some("CodexImageInput")),
-        KeyBinding::new("cmd-x", InputCut, Some("CodexImageInput")),
-        KeyBinding::new("cmd-z", InputUndo, Some("CodexImageInput")),
-        KeyBinding::new("cmd-shift-z", InputRedo, Some("CodexImageInput")),
-        KeyBinding::new(
-            "ctrl-cmd-space",
-            InputShowCharacterPalette,
-            Some("CodexImageInput"),
-        ),
-        KeyBinding::new("ctrl-a", InputHome, Some("CodexImageInput")),
-        KeyBinding::new("ctrl-e", InputEnd, Some("CodexImageInput")),
-        KeyBinding::new("ctrl-b", InputLeft, Some("CodexImageInput")),
-        KeyBinding::new("ctrl-f", InputRight, Some("CodexImageInput")),
-        KeyBinding::new("ctrl-p", InputUp, Some("CodexImageInput")),
-        KeyBinding::new("ctrl-n", InputDown, Some("CodexImageInput")),
-        KeyBinding::new("cmd-home", InputDocumentStart, Some("CodexImageInput")),
-        KeyBinding::new("cmd-end", InputDocumentEnd, Some("CodexImageInput")),
+        input_key("ctrl-h", Delete(Motion::Left)),
+        input_key("ctrl-d", Delete(Motion::Right)),
+        input_key("alt-backspace", Delete(Motion::WordLeft)),
+        input_key("ctrl-w", Delete(Motion::WordLeft)),
+        input_key("alt-delete", Delete(Motion::WordRight)),
+        input_key("cmd-backspace", Delete(Motion::LineStart)),
+        input_key("cmd-delete", Delete(Motion::LineEnd)),
+        input_key("ctrl-k", Delete(Motion::LineEnd)),
+        input_key("cmd-a", input::SelectAll),
+        input_key("cmd-v", input::Paste),
+        input_key("cmd-c", input::Copy),
+        input_key("cmd-x", input::Cut),
+        input_key("cmd-z", input::Undo),
+        input_key("cmd-shift-z", input::Redo),
+        input_key("ctrl-cmd-space", input::ShowCharacterPalette),
+    ]);
+    cx.bind_keys(motion_keys![
+        "alt-left" => WordLeft,
+        "alt-right" => WordRight,
+        "cmd-left" => LineStart,
+        "cmd-right" => LineEnd,
+        "cmd-up" => DocumentStart,
+        "cmd-down" => DocumentEnd,
+        "cmd-home" => DocumentStart,
+        "cmd-end" => DocumentEnd,
+        "ctrl-a" => LineStart,
+        "ctrl-e" => LineEnd,
+        "ctrl-b" => Left,
+        "ctrl-f" => Right,
+        "ctrl-p" => Up,
+        "ctrl-n" => Down,
     ]);
 }
 
@@ -195,53 +153,27 @@ fn bind_platform_keys(cx: &mut App) {
         KeyBinding::new("ctrl-o", AddAttachment, None),
         KeyBinding::new("ctrl-,", OpenSettings, None),
         KeyBinding::new("ctrl-q", Quit, None),
-        KeyBinding::new("ctrl-left", InputWordLeft, Some("CodexImageInput")),
-        KeyBinding::new("ctrl-right", InputWordRight, Some("CodexImageInput")),
-        KeyBinding::new(
-            "ctrl-shift-left",
-            InputSelectWordLeft,
-            Some("CodexImageInput"),
-        ),
-        KeyBinding::new(
-            "ctrl-shift-right",
-            InputSelectWordRight,
-            Some("CodexImageInput"),
-        ),
-        KeyBinding::new("ctrl-home", InputDocumentStart, Some("CodexImageInput")),
-        KeyBinding::new("ctrl-end", InputDocumentEnd, Some("CodexImageInput")),
-        KeyBinding::new(
-            "ctrl-shift-home",
-            InputSelectDocumentStart,
-            Some("CodexImageInput"),
-        ),
-        KeyBinding::new(
-            "ctrl-shift-end",
-            InputSelectDocumentEnd,
-            Some("CodexImageInput"),
-        ),
-        KeyBinding::new(
-            "ctrl-backspace",
-            InputDeleteWordBackward,
-            Some("CodexImageInput"),
-        ),
-        KeyBinding::new(
-            "ctrl-delete",
-            InputDeleteWordForward,
-            Some("CodexImageInput"),
-        ),
-        KeyBinding::new("ctrl-a", InputSelectAll, Some("CodexImageInput")),
-        KeyBinding::new("ctrl-v", InputPaste, Some("CodexImageInput")),
-        KeyBinding::new("ctrl-c", InputCopy, Some("CodexImageInput")),
-        KeyBinding::new("ctrl-x", InputCut, Some("CodexImageInput")),
-        KeyBinding::new("ctrl-z", InputUndo, Some("CodexImageInput")),
-        KeyBinding::new("ctrl-y", InputRedo, Some("CodexImageInput")),
-        KeyBinding::new("ctrl-shift-z", InputRedo, Some("CodexImageInput")),
+        input_key("ctrl-backspace", Delete(Motion::WordLeft)),
+        input_key("ctrl-delete", Delete(Motion::WordRight)),
+        input_key("ctrl-a", input::SelectAll),
+        input_key("ctrl-v", input::Paste),
+        input_key("ctrl-c", input::Copy),
+        input_key("ctrl-x", input::Cut),
+        input_key("ctrl-z", input::Undo),
+        input_key("ctrl-y", input::Redo),
+        input_key("ctrl-shift-z", input::Redo),
+    ]);
+    cx.bind_keys(motion_keys![
+        "ctrl-left" => WordLeft,
+        "ctrl-right" => WordRight,
+        "ctrl-home" => DocumentStart,
+        "ctrl-end" => DocumentEnd,
     ]);
 }
 
 pub fn configure_menus(cx: &mut App) {
     #[cfg(target_os = "macos")]
-    cx.set_menus([
+    let leading = [
         Menu::new(APP_NAME).items([
             MenuItem::action("Settings…", OpenSettings),
             MenuItem::separator(),
@@ -250,43 +182,25 @@ pub fn configure_menus(cx: &mut App) {
             MenuItem::action(format!("Quit {APP_NAME}"), Quit),
         ]),
         Menu::new("File").items([MenuItem::action("Attach Images…", AddAttachment)]),
-        Menu::new("Edit").items([
-            MenuItem::os_action("Undo", InputUndo, OsAction::Undo),
-            MenuItem::os_action("Redo", InputRedo, OsAction::Redo),
-            MenuItem::separator(),
-            MenuItem::os_action("Cut", InputCut, OsAction::Cut),
-            MenuItem::os_action("Copy", InputCopy, OsAction::Copy),
-            MenuItem::os_action("Paste", InputPaste, OsAction::Paste),
-            MenuItem::separator(),
-            MenuItem::os_action("Select All", InputSelectAll, OsAction::SelectAll),
-        ]),
-        Menu::new("View").items([
-            MenuItem::action("Boards", OpenBoards),
-            MenuItem::action("Gallery", ToggleGallery),
-            MenuItem::action("Fit Canvas", FitCanvas),
-            MenuItem::action("Zoom In", ZoomIn),
-            MenuItem::action("Zoom Out", ZoomOut),
-            MenuItem::action("Actual Size", ResetZoom),
-        ]),
-    ]);
-
+    ];
     #[cfg(not(target_os = "macos"))]
-    cx.set_menus([
-        Menu::new("File").items([
-            MenuItem::action("Attach Images…", AddAttachment),
-            MenuItem::action("Settings…", OpenSettings),
-            MenuItem::separator(),
-            MenuItem::action(format!("Exit {APP_NAME}"), Quit),
-        ]),
+    let leading = [Menu::new("File").items([
+        MenuItem::action("Attach Images…", AddAttachment),
+        MenuItem::action("Settings…", OpenSettings),
+        MenuItem::separator(),
+        MenuItem::action(format!("Exit {APP_NAME}"), Quit),
+    ])];
+
+    cx.set_menus(leading.into_iter().chain([
         Menu::new("Edit").items([
-            MenuItem::os_action("Undo", InputUndo, OsAction::Undo),
-            MenuItem::os_action("Redo", InputRedo, OsAction::Redo),
+            MenuItem::os_action("Undo", input::Undo, OsAction::Undo),
+            MenuItem::os_action("Redo", input::Redo, OsAction::Redo),
             MenuItem::separator(),
-            MenuItem::os_action("Cut", InputCut, OsAction::Cut),
-            MenuItem::os_action("Copy", InputCopy, OsAction::Copy),
-            MenuItem::os_action("Paste", InputPaste, OsAction::Paste),
+            MenuItem::os_action("Cut", input::Cut, OsAction::Cut),
+            MenuItem::os_action("Copy", input::Copy, OsAction::Copy),
+            MenuItem::os_action("Paste", input::Paste, OsAction::Paste),
             MenuItem::separator(),
-            MenuItem::os_action("Select All", InputSelectAll, OsAction::SelectAll),
+            MenuItem::os_action("Select All", input::SelectAll, OsAction::SelectAll),
         ]),
         Menu::new("View").items([
             MenuItem::action("Boards", OpenBoards),
@@ -296,5 +210,5 @@ pub fn configure_menus(cx: &mut App) {
             MenuItem::action("Zoom Out", ZoomOut),
             MenuItem::action("Actual Size", ResetZoom),
         ]),
-    ]);
+    ]));
 }

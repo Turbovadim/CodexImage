@@ -69,6 +69,7 @@ impl AppView {
             input.set_mode(super::input::TextInputMode::SingleLine, cx);
             input.set_placeholder("Model id, blank for the CLI default…", cx);
             input.set_content(model, cx);
+            input.select_content(cx);
         });
         self.overlay = Overlay::Settings;
         // The id field only shows while Codex has not listed any models.

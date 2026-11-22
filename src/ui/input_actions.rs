@@ -2,12 +2,10 @@
 //! clipboard, and undo history.
 
 use super::input::{
-    Backspace, Copy, Cut, Delete, DeleteToLineEnd, DeleteToLineStart, DeleteWordBackward,
-    DeleteWordForward, DocumentEnd, DocumentStart, Down, EditKind, End, Home, InsertNewline, Left,
-    Paste, Redo, Right, SelectAll, SelectDocumentEnd, SelectDocumentStart, SelectDown, SelectEnd,
-    SelectHome, SelectLeft, SelectRight, SelectUp, SelectWordLeft, SelectWordRight,
-    ShowCharacterPalette, TextInput, TextInputEvent, Undo, Up, WordLeft, WordRight,
+    Copy, Cut, Delete, EditKind, InsertNewline, Motion, Move, Paste, Redo, Select, SelectAll,
+    ShowCharacterPalette, TextInput, TextInputEvent, Undo,
 };
+use super::input_layout::Caret;
 use super::input_text::{
     logical_line_edge, next_grapheme_boundary, next_word_boundary, previous_grapheme_boundary,
     previous_word_boundary,
@@ -15,265 +13,98 @@ use super::input_text::{
 use gpui::{ClipboardEntry, ClipboardItem, Context, Window, point, px};
 
 impl TextInput {
-    pub(super) fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
-        if self.selected.is_empty() {
-            self.move_to(previous_grapheme_boundary(&self.content, self.cursor()), cx);
-        } else {
-            self.move_to(self.selected.start, cx);
-        }
+    /// Where `motion` takes the cursor, and for vertical motions the column
+    /// to keep aiming for, so repeated up/down holds its place across short
+    /// lines.
+    fn motion_target(&self, motion: Motion) -> (Caret, Option<f32>) {
+        let text = &self.content;
+        let cursor = self.cursor();
+        let layout = self.last_layout.as_ref();
+        let offset = match motion {
+            Motion::Left => previous_grapheme_boundary(text, cursor),
+            Motion::Right => next_grapheme_boundary(text, cursor),
+            Motion::WordLeft => previous_word_boundary(text, cursor),
+            Motion::WordRight => next_word_boundary(text, cursor),
+            Motion::DocumentStart => 0,
+            Motion::DocumentEnd => text.len(),
+            Motion::Up | Motion::Down => {
+                let up = motion == Motion::Up;
+                let Some(layout) = layout else {
+                    return (Caret::at(if up { 0 } else { text.len() }), None);
+                };
+                let position = layout.position_for(self.caret());
+                let preferred_x = self.preferred_x.unwrap_or_else(|| f32::from(position.x));
+                let rows = if up { -0.5 } else { 1.5 };
+                let target = point(px(preferred_x), position.y + layout.line_height * rows);
+                return (layout.caret_for_position(target), Some(preferred_x));
+            }
+            Motion::LineStart | Motion::LineEnd => {
+                let end = motion == Motion::LineEnd;
+                let edge = layout.map_or_else(
+                    || Caret::at(logical_line_edge(text, cursor, end)),
+                    |layout| layout.visual_line_edge(self.caret(), end),
+                );
+                return (edge, None);
+            }
+        };
+        (Caret::at(offset), None)
     }
 
-    pub(super) fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
-        if self.selected.is_empty() {
-            self.move_to(next_grapheme_boundary(&self.content, self.cursor()), cx);
-        } else {
-            self.move_to(self.selected.end, cx);
-        }
-    }
-
-    pub(super) fn word_left(&mut self, _: &WordLeft, _: &mut Window, cx: &mut Context<Self>) {
-        if self.selected.is_empty() {
-            self.move_to(previous_word_boundary(&self.content, self.cursor()), cx);
-        } else {
-            self.move_to(self.selected.start, cx);
-        }
-    }
-
-    pub(super) fn word_right(&mut self, _: &WordRight, _: &mut Window, cx: &mut Context<Self>) {
-        if self.selected.is_empty() {
-            self.move_to(next_word_boundary(&self.content, self.cursor()), cx);
-        } else {
-            self.move_to(self.selected.end, cx);
-        }
-    }
-
-    pub(super) fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
-        self.select_to(previous_grapheme_boundary(&self.content, self.cursor()), cx);
-    }
-
-    pub(super) fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
-        self.select_to(next_grapheme_boundary(&self.content, self.cursor()), cx);
-    }
-
-    pub(super) fn select_word_left(
+    pub(super) fn move_cursor(
         &mut self,
-        _: &SelectWordLeft,
+        &Move(motion): &Move,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.select_to(previous_word_boundary(&self.content, self.cursor()), cx);
+        // Stepping sideways out of a selection lands on its edge.
+        let (target, preferred_x) = match motion {
+            _ if self.selected.is_empty() => self.motion_target(motion),
+            Motion::Left | Motion::WordLeft => (Caret::at(self.selected.start), None),
+            Motion::Right | Motion::WordRight => (Caret::at(self.selected.end), None),
+            _ => self.motion_target(motion),
+        };
+        self.move_to(target, cx);
+        self.preferred_x = preferred_x;
     }
 
-    pub(super) fn select_word_right(
+    pub(super) fn select(
         &mut self,
-        _: &SelectWordRight,
+        &Select(motion): &Select,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.select_to(next_word_boundary(&self.content, self.cursor()), cx);
+        let (target, preferred_x) = self.motion_target(motion);
+        self.select_to(target, cx);
+        self.preferred_x = preferred_x;
     }
 
-    fn vertical_target(&self, delta: i32) -> Option<(usize, f32)> {
-        let layout = self.last_layout.as_ref()?;
-        let position = layout.position_for_index(self.cursor());
-        let preferred_x = self.preferred_x.unwrap_or_else(|| f32::from(position.x));
-        let target_y = position.y + layout.line_height * delta as f32 + layout.line_height / 2.;
-        Some((
-            layout.index_for_position(point(px(preferred_x), target_y)),
-            preferred_x,
-        ))
-    }
-
-    pub(super) fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some((target, preferred_x)) = self.vertical_target(-1) {
-            self.move_to_with_preference(target, Some(preferred_x), cx);
-        } else {
-            self.move_to(0, cx);
-        }
-    }
-
-    pub(super) fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some((target, preferred_x)) = self.vertical_target(1) {
-            self.move_to_with_preference(target, Some(preferred_x), cx);
-        } else {
-            self.move_to(self.content.len(), cx);
-        }
-    }
-
-    pub(super) fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some((target, preferred_x)) = self.vertical_target(-1) {
-            self.select_to_vertical(target, preferred_x, cx);
-        } else {
-            self.select_to(0, cx);
-        }
-    }
-
-    pub(super) fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some((target, preferred_x)) = self.vertical_target(1) {
-            self.select_to_vertical(target, preferred_x, cx);
-        } else {
-            self.select_to(self.content.len(), cx);
-        }
-    }
-
-    fn visual_line_edge(&self, end: bool) -> usize {
-        self.last_layout
-            .as_ref()
-            .map(|layout| layout.visual_line_edge(self.cursor(), end))
-            .unwrap_or_else(|| logical_line_edge(&self.content, self.cursor(), end))
-    }
-
-    pub(super) fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_to(self.visual_line_edge(false), cx);
-    }
-
-    pub(super) fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_to(self.visual_line_edge(true), cx);
-    }
-
-    pub(super) fn select_home(&mut self, _: &SelectHome, _: &mut Window, cx: &mut Context<Self>) {
-        self.select_to(self.visual_line_edge(false), cx);
-    }
-
-    pub(super) fn select_end(&mut self, _: &SelectEnd, _: &mut Window, cx: &mut Context<Self>) {
-        self.select_to(self.visual_line_edge(true), cx);
-    }
-
-    pub(super) fn document_start(
+    /// Rings the bell when there is nothing in that direction to delete.
+    pub(super) fn delete(
         &mut self,
-        _: &DocumentStart,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.move_to(0, cx);
-    }
-
-    pub(super) fn document_end(&mut self, _: &DocumentEnd, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_to(self.content.len(), cx);
-    }
-
-    pub(super) fn select_document_start(
-        &mut self,
-        _: &SelectDocumentStart,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.select_to(0, cx);
-    }
-
-    pub(super) fn select_document_end(
-        &mut self,
-        _: &SelectDocumentEnd,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.select_to(self.content.len(), cx);
-    }
-
-    pub(super) fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
-        self.selected = 0..self.content.len();
-        self.selection_reversed = false;
-        self.preferred_x = None;
-        self.break_history_group();
-        cx.notify();
-    }
-
-    /// Deletes the selection, or the range `to_boundary` reaches from the
-    /// cursor when nothing is selected. Rings the bell when the cursor already
-    /// sits at the edge it would delete towards.
-    fn delete_to(
-        &mut self,
-        to_boundary: impl FnOnce(&Self) -> usize,
-        kind: EditKind,
+        &Delete(motion): &Delete,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let range = if self.selected.is_empty() {
-            let boundary = to_boundary(self);
+            let target = self.motion_target(motion).0.offset;
             let cursor = self.cursor();
-            boundary.min(cursor)..boundary.max(cursor)
+            target.min(cursor)..target.max(cursor)
         } else {
             self.selected.clone()
         };
         if range.is_empty() {
             window.play_system_bell();
-        } else {
-            self.apply_edit(range, "", kind, cx);
+            return;
         }
+        let kind = match motion {
+            Motion::Left | Motion::WordLeft | Motion::LineStart => EditKind::DeleteBackward,
+            _ => EditKind::DeleteForward,
+        };
+        self.replace(range, "", kind, cx);
     }
 
-    pub(super) fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
-        self.delete_to(
-            |input| previous_grapheme_boundary(&input.content, input.cursor()),
-            EditKind::DeleteBackward,
-            window,
-            cx,
-        );
-    }
-
-    pub(super) fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
-        self.delete_to(
-            |input| next_grapheme_boundary(&input.content, input.cursor()),
-            EditKind::DeleteForward,
-            window,
-            cx,
-        );
-    }
-
-    pub(super) fn delete_word_backward(
-        &mut self,
-        _: &DeleteWordBackward,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.delete_to(
-            |input| previous_word_boundary(&input.content, input.cursor()),
-            EditKind::DeleteBackward,
-            window,
-            cx,
-        );
-    }
-
-    pub(super) fn delete_word_forward(
-        &mut self,
-        _: &DeleteWordForward,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.delete_to(
-            |input| next_word_boundary(&input.content, input.cursor()),
-            EditKind::DeleteForward,
-            window,
-            cx,
-        );
-    }
-
-    pub(super) fn delete_to_line_start(
-        &mut self,
-        _: &DeleteToLineStart,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.delete_to(
-            |input| input.visual_line_edge(false),
-            EditKind::DeleteBackward,
-            window,
-            cx,
-        );
-    }
-
-    pub(super) fn delete_to_line_end(
-        &mut self,
-        _: &DeleteToLineEnd,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.delete_to(
-            |input| input.visual_line_edge(true),
-            EditKind::DeleteForward,
-            window,
-            cx,
-        );
+    pub(super) fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_content(cx);
     }
 
     pub(super) fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
@@ -300,8 +131,7 @@ impl TextInput {
             cx.emit(TextInputEvent::PastedPaths(paths));
         }
         if let Some(text) = text {
-            let range = self.selected.clone();
-            self.apply_edit(range, &text, EditKind::Replace, cx);
+            self.replace(self.selected.clone(), &text, EditKind::Replace, cx);
         } else if was_empty {
             window.play_system_bell();
         }
@@ -321,29 +151,30 @@ impl TextInput {
             return;
         }
         self.copy(&Copy, window, cx);
-        self.apply_edit(self.selected.clone(), "", EditKind::Replace, cx);
+        self.replace(self.selected.clone(), "", EditKind::Replace, cx);
     }
 
     pub(super) fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(previous) = self.undo_stack.pop() else {
-            window.play_system_bell();
-            return;
-        };
-        let current = self.snapshot();
-        self.redo_stack.push(current);
-        self.restore(previous);
-        self.break_history_group();
-        cx.notify();
+        self.step_history(true, window, cx);
     }
 
     pub(super) fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(next) = self.redo_stack.pop() else {
+        self.step_history(false, window, cx);
+    }
+
+    fn step_history(&mut self, undo: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.snapshot();
+        let (from, to) = if undo {
+            (&mut self.undo_stack, &mut self.redo_stack)
+        } else {
+            (&mut self.redo_stack, &mut self.undo_stack)
+        };
+        let Some(snapshot) = from.pop() else {
             window.play_system_bell();
             return;
         };
-        let current = self.snapshot();
-        self.undo_stack.push(current);
-        self.restore(next);
+        to.push(current);
+        self.restore(snapshot);
         self.break_history_group();
         cx.notify();
     }
@@ -355,7 +186,7 @@ impl TextInput {
         cx: &mut Context<Self>,
     ) {
         if self.mode.is_multiline() {
-            self.apply_edit(self.selected.clone(), "\n", EditKind::Replace, cx);
+            self.replace(self.selected.clone(), "\n", EditKind::Replace, cx);
         } else {
             window.play_system_bell();
         }
