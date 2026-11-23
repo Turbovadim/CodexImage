@@ -2,64 +2,89 @@
 //! thinks, and how much of a card's chain travels with a generation.
 
 use super::app::{AppView, Overlay};
-use super::composer::control_button;
+use super::dialog::{
+    ButtonKind, button, field, footer, header, hint, panel, present, scrim, segment, segmented,
+    title,
+};
+use super::icons::{Icon, icon};
 use super::theme;
 use super::tooltip::tip;
 use crate::generation::CodexModel;
 use crate::settings::{MAX_LINEAGE_REFS, SettingsData};
 use gpui::{
-    AnyElement, Context, Focusable, FontWeight, Role, SharedString, Stateful, Window, div,
-    prelude::*, px,
+    AnyElement, Context, Div, Focusable, Role, SharedString, Stateful, Window, div, prelude::*, px,
 };
 use std::sync::Arc;
 
-fn pill(
-    id: impl Into<SharedString>,
-    label: impl Into<SharedString>,
-    active: bool,
-) -> Stateful<gpui::Div> {
-    let label = label.into();
-    div()
-        .id(id.into())
-        .role(Role::Button)
-        .aria_label(label.clone())
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .border_1()
-        .border_color(if active {
-            theme::accent()
-        } else {
-            theme::line()
-        })
-        .text_xs()
-        .text_color(if active { theme::ink() } else { theme::dim() })
-        .cursor_pointer()
-        .hover(|style| style.border_color(theme::faint()).text_color(theme::ink()))
-        .child(label)
-}
+const LABEL_WIDTH: f32 = 132.;
+const MODEL_ROW_HEIGHT: f32 = 30.;
 
-fn row(label: &'static str, detail: &'static str, control: AnyElement) -> AnyElement {
+/// One setting: its name on the left, explained by a tooltip, and its control.
+fn row(label: &'static str, explanation: &'static str, control: impl IntoElement) -> Div {
     div()
-        .mt_4()
         .flex()
         .items_start()
         .gap_4()
         .child(
             div()
-                .w(px(180.))
+                .id(label)
+                .w(px(LABEL_WIDTH))
+                .h(px(32.))
+                .flex()
                 .flex_none()
-                .child(div().text_sm().text_color(theme::ink()).child(label))
-                .child(
-                    div()
-                        .mt_1()
-                        .text_xs()
-                        .text_color(theme::faint())
-                        .child(detail),
-                ),
+                .items_center()
+                .text_sm()
+                .text_color(theme::dim())
+                .tooltip(tip(explanation))
+                .child(label),
         )
-        .child(div().flex_1().min_w_0().child(control))
-        .into_any_element()
+        .child(div().flex_1().min_w_0().flex().child(control))
+}
+
+/// A line of the model list: a check mark on the chosen one, the name, and
+/// whatever Codex says about it.
+fn model_row(
+    id: impl Into<SharedString>,
+    name: impl Into<SharedString>,
+    detail: impl Into<SharedString>,
+    active: bool,
+) -> Stateful<Div> {
+    let name = name.into();
+    div()
+        .id(id.into())
+        .role(Role::Button)
+        .aria_label(name.clone())
+        .h(px(MODEL_ROW_HEIGHT))
+        .px_2()
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap_2()
+        .rounded_md()
+        .cursor_pointer()
+        .when(active, |row| row.bg(theme::hover()))
+        .hover(|style| style.bg(theme::hover()))
+        .child(icon(Icon::Check, 14.).text_color(if active {
+            theme::accent()
+        } else {
+            gpui::transparent_black()
+        }))
+        .child(
+            div()
+                .flex_none()
+                .text_sm()
+                .text_color(if active { theme::ink() } else { theme::dim() })
+                .child(name),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_xs()
+                .text_color(theme::faint())
+                .child(detail.into()),
+        )
 }
 
 impl AppView {
@@ -169,16 +194,15 @@ impl AppView {
         self.close_overlay(window, cx);
     }
 
-    pub(super) fn render_settings(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_settings(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let settings = self.engine.settings().get();
         let active = self.listed_model(&settings.model);
-        let model_control = self.render_model_choices(&settings, cx);
-        let mut efforts = div().flex().flex_wrap().gap_2().child(
-            pill(
+        let mut efforts = segmented().child(
+            segment(
                 "effort-default",
                 match active.and_then(|model| model.default_reasoning_effort.as_deref()) {
-                    Some(effort) => format!("Default ({effort})"),
-                    None => "CLI default".to_owned(),
+                    Some(effort) => format!("Default · {effort}"),
+                    None => "Default".to_owned(),
                 },
                 settings.reasoning_effort.is_empty(),
             )
@@ -190,12 +214,14 @@ impl AppView {
         for option in listed_efforts {
             let effort = option.reasoning_effort.clone();
             efforts = efforts.child(
-                pill(
+                segment(
                     format!("effort-{effort}"),
                     effort.clone(),
                     settings.reasoning_effort == effort,
                 )
-                .tooltip(tip(option.description.clone()))
+                .when(!option.description.is_empty(), |segment| {
+                    segment.tooltip(tip(option.description.clone()))
+                })
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let effort = effort.clone();
                     this.change_settings(|settings| settings.reasoning_effort = effort, cx)
@@ -207,125 +233,129 @@ impl AppView {
                 .iter()
                 .all(|option| option.reasoning_effort != settings.reasoning_effort)
         {
-            efforts = efforts.child(pill(
+            efforts = efforts.child(segment(
                 "effort-custom",
                 settings.reasoning_effort.clone(),
                 true,
             ));
         }
         let lineage = settings.lineage_refs;
-        div()
-            .id("settings-overlay")
-            .absolute()
-            .inset_0()
-            .bg(gpui::black().opacity(0.72))
-            .flex()
-            .items_center()
-            .justify_center()
-            .occlude()
+        let references = segmented().children((0..=MAX_LINEAGE_REFS).map(|count| {
+            segment(
+                format!("lineage-{count}"),
+                if count == 0 {
+                    "Off".to_owned()
+                } else {
+                    count.to_string()
+                },
+                lineage == count,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.change_settings(|settings| settings.lineage_refs = count, cx)
+            }))
+        }));
+        let panel = panel("settings-panel", "Codex settings", 620.)
+            .child(header(title("Codex settings"), None, cx))
             .child(
                 div()
-                    .id("settings-panel")
-                    .role(Role::Dialog)
-                    .aria_label("Codex settings")
-                    .w(px(680.))
-                    .rounded_xl()
-                    .border_1()
-                    .border_color(theme::line())
-                    .bg(theme::raised())
-                    .p_5()
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::ink())
-                            .child("Codex settings"),
-                    )
-                    .child(div().mt_1().text_sm().text_color(theme::dim()).child(
-                        "These apply to this app only. Your Codex CLI config is left alone.",
+                    .min_h_0()
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(row(
+                        "Model",
+                        "Passed as codex exec -m",
+                        self.render_model_choices(&settings, window, cx),
                     ))
-                    .child(row("Model", "Passed as codex exec -m", model_control))
                     .child(row(
                         "Reasoning effort",
                         "Passed as model_reasoning_effort",
-                        efforts.into_any_element(),
+                        efforts,
                     ))
                     .child(row(
                         "Chain references",
-                        "Earlier images from a card's own chain sent along as identity reference",
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .gap_2()
-                            .children((0..=MAX_LINEAGE_REFS).map(|count| {
-                                pill(
-                                    format!("lineage-{count}"),
-                                    if count == 0 {
-                                        "Off".to_owned()
-                                    } else {
-                                        count.to_string()
-                                    },
-                                    lineage == count,
-                                )
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        this.change_settings(
-                                            |settings| settings.lineage_refs = count,
-                                            cx,
-                                        )
-                                    },
-                                ))
-                            }))
-                            .into_any_element(),
-                    ))
-                    .child(
-                        div()
-                            .mt_5()
-                            .flex()
-                            .justify_end()
-                            .gap_2()
-                            .child(control_button(
-                                "Cancel",
-                                cx.listener(|this, _, window, cx| {
-                                    this.close_overlay(window, cx);
-                                }),
-                            ))
-                            .child(
-                                div()
-                                    .id("settings-save")
-                                    .role(Role::Button)
-                                    .aria_label("Save settings")
-                                    .rounded_lg()
-                                    .bg(theme::accent_strong())
-                                    .px_4()
-                                    .py_2()
-                                    .text_sm()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(gpui::white())
-                                    .cursor_pointer()
-                                    .child("Save")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.save_model(window, cx)
-                                    })),
-                            ),
-                    ),
+                        "Earlier images from a card's own chain, sent along as identity reference",
+                        references,
+                    )),
             )
-            .into_any_element()
+            .child(
+                footer().child(hint("Applies to this app only")).child(
+                    button("settings-save", "Done", ButtonKind::Primary)
+                        .on_click(cx.listener(|this, _, window, cx| this.save_model(window, cx))),
+                ),
+            );
+        present(
+            scrim("settings-overlay")
+                .on_click(cx.listener(|this, _, window, cx| this.close_overlay(window, cx))),
+            panel,
+        )
     }
 
-    /// One button per model Codex lists. Until it lists any, a free-text id
+    /// One row per model Codex lists. Until it lists any, a free-text id
     /// field stands in so a missing or signed-out CLI never blocks the choice.
-    fn render_model_choices(&self, settings: &SettingsData, cx: &mut Context<Self>) -> AnyElement {
-        let mut choices = div().flex().flex_wrap().gap_2().child(
-            pill("model-default", "CLI default", settings.model.is_empty())
+    fn render_model_choices(
+        &self,
+        settings: &SettingsData,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if self.codex_models.is_empty() {
+            let status = if self.codex_models_task.is_some() {
+                "Loading models from Codex…"
+            } else {
+                "Codex did not list any models. Type an id instead."
+            };
+            return div()
+                .w_full()
+                .child(field(&self.modal_input, window, cx))
+                .child(
+                    div()
+                        .mt_2()
+                        .text_xs()
+                        .text_color(theme::faint())
+                        .child(status),
+                )
+                .into_any_element();
+        }
+        // The list scrolls rather than pushing the dialog past a short window.
+        let max_height =
+            (f32::from(window.viewport_size().height) - 330.).max(4. * MODEL_ROW_HEIGHT);
+        let default_model = self
+            .codex_models
+            .iter()
+            .find(|model| model.is_default)
+            .map(|model| model.label().to_owned())
+            .unwrap_or_default();
+        let mut choices = div()
+            .id("model-list")
+            .w_full()
+            .max_h(px(max_height))
+            .overflow_y_scroll()
+            .px_1()
+            .py(px(2.))
+            .flex()
+            .flex_col()
+            .rounded_lg()
+            .border_1()
+            .border_color(theme::line())
+            .bg(theme::background())
+            .child(
+                model_row(
+                    "model-default",
+                    "CLI default",
+                    default_model,
+                    settings.model.is_empty(),
+                )
                 .on_click(cx.listener(|this, _, _, cx| this.pick_model(String::new(), cx))),
-        );
+            );
         for model in self.codex_models.iter() {
             let id = model.model.clone();
             choices = choices.child(
-                pill(
+                model_row(
                     format!("model-{id}"),
                     model.label().to_owned(),
+                    model.description.clone(),
                     settings.model == id,
                 )
                 .tooltip(tip(if model.description.is_empty() {
@@ -336,35 +366,13 @@ impl AppView {
                 .on_click(cx.listener(move |this, _, _, cx| this.pick_model(id.clone(), cx))),
             );
         }
-        if self.codex_models.is_empty() {
-            let status = if self.codex_models_task.is_some() {
-                "Loading models from Codex…"
-            } else {
-                "Codex did not list any models. Type an id instead."
-            };
-            return div()
-                .child(
-                    div()
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(theme::line())
-                        .bg(theme::background())
-                        .px_3()
-                        .py_2()
-                        .child(self.modal_input.clone()),
-                )
-                .child(div().mt_2().child(choices))
-                .child(
-                    div()
-                        .mt_2()
-                        .text_xs()
-                        .text_color(theme::faint())
-                        .child(status),
-                )
-                .into_any_element();
-        }
         if !settings.model.is_empty() && self.listed_model(&settings.model).is_none() {
-            choices = choices.child(pill("model-custom", settings.model.clone(), true));
+            choices = choices.child(model_row(
+                "model-custom",
+                settings.model.clone(),
+                "Not listed by Codex",
+                true,
+            ));
         }
         choices.into_any_element()
     }

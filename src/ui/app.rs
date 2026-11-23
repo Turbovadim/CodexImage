@@ -1220,23 +1220,8 @@ impl Render for AppView {
             Overlay::Boards => root.child(self.render_boards(window, false, cx)),
             Overlay::Gallery => root.child(self.render_gallery(cx)),
             Overlay::Lightbox(lightbox) => root.child(self.render_lightbox(lightbox, window, cx)),
-            Overlay::EditNode(edit) => {
-                let attachments = self.render_edit_attachments(edit, cx);
-                root.child(self.render_modal(
-                    "Edit prompt",
-                    "Update the request and reference images, then regenerate this node in a fresh Codex session.",
-                    "Save & regenerate",
-                    Some(attachments),
-                    cx,
-                ))
-            }
-            Overlay::RenameBoard(_) => root.child(self.render_modal(
-                "Rename board",
-                "Choose a concise name for this exploration.",
-                "Rename",
-                None,
-                cx,
-            )),
+            Overlay::EditNode(edit) => root.child(self.render_edit_prompt(edit, window, cx)),
+            Overlay::RenameBoard(_) => root.child(self.render_rename_board(window, cx)),
             Overlay::NodeText(node_id) => {
                 let node_id = node_id.clone();
                 root.child(self.render_node_text(&node_id, cx))
@@ -1245,7 +1230,7 @@ impl Render for AppView {
                 let node_id = node_id.clone();
                 root.child(self.render_chat(&node_id, window, cx))
             }
-            Overlay::Settings => root.child(self.render_settings(cx)),
+            Overlay::Settings => root.child(self.render_settings(window, cx)),
             Overlay::QuitConfirm => root.child(self.render_quit_confirm(cx)),
         };
         if let Some(toast) = &self.toast {

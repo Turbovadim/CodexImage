@@ -215,7 +215,7 @@ impl AppView {
             return;
         };
         self.modal_input.update(cx, |input, cx| {
-            input.set_mode(TextInputMode::AutoGrow { max_lines: 24 }, cx);
+            input.set_mode(TextInputMode::AutoGrow { max_lines: 16 }, cx);
             input.set_placeholder("Edit prompt…", cx);
             input.set_content(prompt, cx);
         });

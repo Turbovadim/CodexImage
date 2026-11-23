@@ -2,44 +2,50 @@
 //! that card's chain, images, summary, and failure already in the prompt.
 
 use super::app::{AppView, Overlay};
-use super::composer::control_button;
+use super::dialog::{header, panel, present, scrim, title};
+use super::icons::{Icon, icon};
 use super::theme;
-use super::tooltip::tip;
+use super::tooltip::{tip, tip_with_shortcut};
 use crate::generation::chat_activity_key;
 use crate::model::{ChatMessage, ChatRole};
 use gpui::{
-    AnyElement, Context, Focusable, FontWeight, Role, SharedString, Window, div, list, prelude::*,
-    px,
+    AnyElement, Context, Focusable, ObjectFit, Role, SharedString, StyledImage, Window, div, img,
+    list, prelude::*, px,
 };
 
 const PANEL_WIDTH: f32 = 720.;
-const BUBBLE_WIDTH: f32 = 560.;
+const BUBBLE_WIDTH: f32 = 520.;
+const REPLY_WIDTH: f32 = 620.;
 
+/// The user's turns sit in a bubble on the right; Codex answers as plain text
+/// on the left, so long replies read like a page instead of a stack of boxes.
 fn render_message(message: &ChatMessage) -> AnyElement {
-    let (align, background, color) = match message.role {
-        ChatRole::User => (true, theme::hover(), theme::ink()),
-        ChatRole::Agent => (false, theme::background(), theme::ink()),
-        ChatRole::Error => (false, theme::background(), theme::danger()),
-    };
-    div()
-        .w_full()
-        .py_1p5()
-        .flex()
-        .when(align, |row| row.justify_end())
-        .child(
+    let row = div().w_full().py_2().flex().text_sm();
+    match message.role {
+        ChatRole::User => row.justify_end().child(
             div()
                 .max_w(px(BUBBLE_WIDTH))
-                .rounded_lg()
-                .border_1()
-                .border_color(theme::line())
-                .bg(background)
+                .rounded_xl()
+                .bg(theme::hover())
                 .px_3()
                 .py_2()
-                .text_sm()
-                .text_color(color)
+                .text_color(theme::ink())
                 .child(message.text.clone()),
-        )
-        .into_any_element()
+        ),
+        ChatRole::Agent => row.child(
+            div()
+                .max_w(px(REPLY_WIDTH))
+                .text_color(theme::ink())
+                .child(message.text.clone()),
+        ),
+        ChatRole::Error => row.child(
+            div()
+                .max_w(px(REPLY_WIDTH))
+                .text_color(theme::danger())
+                .child(message.text.clone()),
+        ),
+    }
+    .into_any_element()
 }
 
 impl AppView {
@@ -95,161 +101,146 @@ impl AppView {
         let height = (f32::from(window.viewport_size().height) * 0.78).max(420.);
         let transcript = if messages.is_empty() {
             div()
-                .flex_1()
-                .min_h_0()
+                .size_full()
                 .flex()
+                .flex_col()
                 .items_center()
                 .justify_center()
+                .gap_2()
                 .text_sm()
                 .text_color(theme::faint())
-                .child("Ask what Codex thinks of this result, why it came out this way, or what to try next.")
+                .child(icon(Icon::Chat, 22.).text_color(theme::faint()))
+                .child("Ask why it came out this way, or what to try next")
                 .into_any_element()
         } else {
-            div()
-                .flex_1()
-                .min_h_0()
-                .child(
-                    list(self.chat_list_state.clone(), move |index, _window, _cx| {
-                        render_message(&messages[index])
-                    })
-                    .w_full()
-                    .h_full(),
-                )
-                .into_any_element()
+            list(self.chat_list_state.clone(), move |index, _window, _cx| {
+                render_message(&messages[index])
+            })
+            .size_full()
+            .into_any_element()
         };
         let ready = !self.chat_input.read(cx).content().trim().is_empty() && !thinking;
-        let chat_node = node_id.to_owned();
-        div()
-            .id("chat-overlay")
-            .absolute()
-            .inset_0()
-            .bg(gpui::black().opacity(0.72))
+        let focused = self.chat_input.focus_handle(cx).is_focused(window);
+        // One line: line breaks in the prompt would defeat the truncation.
+        let prompt: String = node
+            .prompt
+            .chars()
+            .take(200)
+            .map(|character| {
+                if character.is_whitespace() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect();
+        let lead = div()
+            .min_w_0()
             .flex()
             .items_center()
-            .justify_center()
-            .occlude()
+            .gap(px(10.))
+            .children(node.images.first().map(|url| {
+                img(self.sprite_image_path(url))
+                    .size(px(26.))
+                    .flex_none()
+                    .rounded_md()
+                    .object_fit(ObjectFit::Cover)
+            }))
+            .child(title("Chat"))
             .child(
                 div()
-                    .id("chat-panel")
-                    .role(Role::Dialog)
-                    .aria_label("Chat about this card")
-                    .w(px(PANEL_WIDTH))
-                    .h(px(height))
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .text_color(theme::dim())
+                    .child(prompt),
+            );
+        let action = if thinking {
+            let stop_node = node_id.to_owned();
+            div()
+                .id("stop-chat")
+                .role(Role::Button)
+                .aria_label("Stop this answer")
+                .bg(theme::danger().opacity(0.16))
+                .cursor_pointer()
+                .hover(|style| style.bg(theme::danger().opacity(0.28)))
+                .tooltip(tip("Stop this answer"))
+                .child(icon(Icon::Stop, 14.).text_color(theme::danger()))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.engine.stop_chat(&stop_node);
+                    cx.notify();
+                }))
+        } else {
+            div()
+                .id("send-chat")
+                .role(Role::Button)
+                .aria_label("Send message")
+                .tooltip(tip_with_shortcut("Send · ⇧↵ for a new line", Some("↵")))
+                .child(icon(Icon::ArrowUp, 15.).text_color(if ready {
+                    gpui::white()
+                } else {
+                    theme::faint()
+                }))
+                .when(ready, |send| {
+                    send.bg(theme::accent_strong())
+                        .cursor_pointer()
+                        .hover(|style| style.bg(theme::accent()))
+                        .on_click(cx.listener(|this, _, _, cx| this.send_chat_message(cx)))
+                })
+                .when(!ready, |send| send.bg(theme::hover()))
+        };
+        let panel = panel("chat-panel", "Chat about this card", PANEL_WIDTH)
+            .h(px(height))
+            .child(header(lead, None, cx))
+            .child(div().flex_1().min_h_0().px_4().py_2().child(transcript))
+            .when(thinking, |panel| {
+                panel.child(
+                    div()
+                        .flex_none()
+                        .px_5()
+                        .pb_2()
+                        .truncate()
+                        .text_xs()
+                        .text_color(theme::faint())
+                        .child(SharedString::from(
+                            activity.unwrap_or_else(|| "Thinking".to_owned()),
+                        )),
+                )
+            })
+            .child(
+                div()
+                    .flex_none()
+                    .mx_4()
+                    .mb_4()
+                    .flex()
+                    .items_end()
+                    .gap_2()
                     .rounded_xl()
                     .border_1()
-                    .border_color(theme::line())
-                    .bg(theme::raised())
-                    .p_5()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .flex_none()
-                            .flex()
-                            .items_start()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .child(
-                                        div()
-                                            .text_lg()
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(theme::ink())
-                                            .child("Chat about this card"),
-                                    )
-                                    .child(
-                                        div().mt_1().text_xs().text_color(theme::dim()).child(
-                                            node.prompt.chars().take(160).collect::<String>(),
-                                        ),
-                                    ),
-                            )
-                            .child(control_button(
-                                "Close",
-                                cx.listener(|this, _, window, cx| {
-                                    this.close_overlay(window, cx);
-                                }),
-                            )),
-                    )
-                    .child(div().mt_3().flex_1().min_h_0().flex().child(transcript))
-                    .when(thinking, |panel| {
-                        let stop_node = chat_node;
-                        panel.child(
-                            div()
-                                .flex_none()
-                                .mt_2()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .text_xs()
-                                .text_color(theme::faint())
-                                .child(SharedString::from(
-                                    activity.unwrap_or_else(|| "Thinking".to_owned()),
-                                ))
-                                .child(div().flex_1())
-                                .child(
-                                    div()
-                                        .id("stop-chat")
-                                        .role(Role::Button)
-                                        .aria_label("Stop this answer")
-                                        .text_color(theme::danger())
-                                        .cursor_pointer()
-                                        .child("Stop")
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.engine.stop_chat(&stop_node);
-                                            cx.notify();
-                                        })),
-                                ),
-                        )
+                    .border_color(if focused {
+                        theme::accent().opacity(0.55)
+                    } else {
+                        theme::line()
                     })
+                    .bg(theme::background())
+                    .pl_3()
+                    .pr_1p5()
+                    .py_1p5()
+                    .child(div().flex_1().min_w_0().child(self.chat_input.clone()))
                     .child(
-                        div()
-                            .flex_none()
-                            .mt_3()
+                        action
+                            .size(px(30.))
                             .flex()
-                            .items_end()
-                            .gap_2()
-                            .rounded_lg()
-                            .border_1()
-                            .border_color(theme::line())
-                            .bg(theme::background())
-                            .px_3()
-                            .py_2()
-                            .child(div().flex_1().child(self.chat_input.clone()))
-                            .child(
-                                div()
-                                    .id("send-chat")
-                                    .role(Role::Button)
-                                    .aria_label("Send message")
-                                    .size(px(28.))
-                                    .rounded_lg()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .when(ready, |send| {
-                                        send.bg(theme::accent_strong().opacity(0.18))
-                                            .text_color(theme::accent())
-                                            .cursor_pointer()
-                                            .hover(|style| {
-                                                style.bg(theme::accent_strong().opacity(0.32))
-                                            })
-                                    })
-                                    .when(!ready, |send| {
-                                        send.bg(theme::hover()).text_color(theme::faint())
-                                    })
-                                    .tooltip(tip("Send · ⇧↵ for a new line"))
-                                    .child("↑")
-                                    .when(ready, |send| {
-                                        send.on_click(
-                                            cx.listener(|this, _, _, cx| {
-                                                this.send_chat_message(cx)
-                                            }),
-                                        )
-                                    }),
-                            ),
+                            .flex_none()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full(),
                     ),
-            )
-            .into_any_element()
+            );
+        present(
+            scrim("chat-overlay")
+                .on_click(cx.listener(|this, _, window, cx| this.close_overlay(window, cx))),
+            panel,
+        )
     }
 }

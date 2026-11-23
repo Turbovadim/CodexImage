@@ -3,16 +3,19 @@
 
 use super::app::AppView;
 use super::app::{NodeEdit, Overlay};
-use super::composer::{attachment_thumb, control_button};
+use super::composer::{attachment_thumb, chip};
+use super::dialog::{
+    ButtonKind, button, field, footer, header, hint, panel, present, scrim, title,
+};
 use super::format::{format_date, format_tokens, node_depths, status_label, time_ago};
 use super::icons::{Icon, icon};
 use super::input::TextInputMode;
-use super::keymap::{AddAttachment, Generate, OpenBoards, ToggleGallery};
+use super::keymap::{AddAttachment, Generate, OpenBoards, ToggleGallery, platform_shortcut};
 use super::theme;
 use super::tooltip::{tip, tip_with_shortcut};
 use crate::model::{AttachmentEdit, BoardSummary, MAX_ATTACHMENTS};
 use gpui::{
-    Animation, AnimationExt, AnyElement, ClipboardItem, Context, ExternalPaths, Focusable,
+    Animation, AnimationExt, AnyElement, ClipboardItem, Context, Div, ExternalPaths, Focusable,
     FontWeight, ObjectFit, Role, SharedString, StyledImage, WeakEntity, Window, div,
     ease_out_quint, img, list, prelude::*, px,
 };
@@ -219,12 +222,21 @@ fn render_gallery_row(
                         .id(SharedString::from(format!("locate-{}", row.node_id)))
                         .role(Role::Button)
                         .aria_label("Show this generation on the canvas")
+                        .group("locate")
                         .mt_2()
+                        .flex()
+                        .items_center()
+                        .gap_1()
                         .text_xs()
                         .text_color(theme::accent())
                         .cursor_pointer()
                         .hover(|style| style.text_color(theme::ink()))
-                        .child("◎ Show on canvas")
+                        .child(
+                            icon(Icon::Locate, 12.)
+                                .text_color(theme::accent())
+                                .group_hover("locate", |style| style.text_color(theme::ink())),
+                        )
+                        .child("Show on canvas")
                         .on_click(move |_, window, cx| {
                             let _ = locate_view.update(cx, |this, cx| {
                                 this.locate_node(&locate_id, window, cx);
@@ -738,11 +750,10 @@ impl AppView {
                             .size(px(28.))
                             .rounded_lg()
                             .bg(theme::accent().opacity(0.12))
-                            .text_color(theme::accent())
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child("⑂"),
+                            .child(icon(Icon::Gallery, 15.).text_color(theme::accent())),
                     )
                     .child(
                         div()
@@ -774,11 +785,10 @@ impl AppView {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_color(theme::dim())
                             .cursor_pointer()
-                            .hover(|style| style.bg(theme::hover()).text_color(theme::ink()))
+                            .hover(|style| style.bg(theme::hover()))
                             .tooltip(tip_with_shortcut("Close the gallery", Some("Esc")))
-                            .child("×")
+                            .child(icon(Icon::X, 14.).text_color(theme::dim()))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.close_overlay(window, cx);
                             })),
@@ -789,13 +799,12 @@ impl AppView {
     }
 
     /// The prompt editor's reference images: stored ones first, then files
-    /// added while editing, each removable, followed by the attach button.
-    pub(super) fn render_edit_attachments(
-        &self,
-        edit: &NodeEdit,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let mut strip = div().mt_3().flex().flex_wrap().items_center().gap_2();
+    /// added while editing, each removable. `None` while there are none.
+    fn render_edit_attachments(&self, edit: &NodeEdit, cx: &mut Context<Self>) -> Option<Div> {
+        if edit.kept.is_empty() && edit.added.is_empty() {
+            return None;
+        }
+        let mut strip = div().pt_1().flex().flex_wrap().items_center().gap_2();
         for (index, url) in edit.kept.iter().enumerate() {
             strip = strip.child(attachment_thumb(
                 format!("remove-kept-attachment-{index}"),
@@ -827,113 +836,99 @@ impl AppView {
                 }),
             ));
         }
-        let full = self.attachment_count() + self.pending_attachment_writes >= MAX_ATTACHMENTS;
-        if !full {
-            strip = strip.child(control_button(
-                if self.pending_attachment_writes == 0 {
-                    "Attach".to_owned()
-                } else {
-                    format!("Attach ({} pending)", self.pending_attachment_writes)
-                },
-                cx.listener(|this, _, window, cx| this.add_attachment(&AddAttachment, window, cx)),
-            ));
-        }
-        strip.into_any_element()
+        Some(strip)
     }
 
-    pub(super) fn render_modal(
+    pub(super) fn render_edit_prompt(
         &self,
-        title: &str,
-        detail: &str,
-        action: &str,
-        extra: Option<AnyElement>,
+        edit: &NodeEdit,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        div()
-            .id("modal-overlay")
-            .role(Role::Dialog)
-            .aria_label(title.to_owned())
-            .absolute()
-            .inset_0()
-            .bg(gpui::black().opacity(0.72))
-            .flex()
-            .items_center()
-            .justify_center()
-            .occlude()
-            .on_drop(cx.listener(|this, dropped: &ExternalPaths, _, cx| {
-                if matches!(this.overlay, Overlay::EditNode(_)) {
-                    this.queue_attachments(dropped.paths().to_vec(), cx);
-                    cx.notify();
-                }
-            }))
+        let pending = self.pending_attachment_writes;
+        let full = self.attachment_count() + pending >= MAX_ATTACHMENTS;
+        let ready = pending == 0 && !self.modal_input.read(cx).content().trim().is_empty();
+        let attach_label = match pending {
+            0 => "Attach".to_owned(),
+            pending => format!("Attaching {pending}…"),
+        };
+        let panel = panel("edit-prompt", "Edit prompt", 640.)
+            .child(header(title("Edit prompt"), None, cx))
             .child(
                 div()
-                    .w(px(760.))
-                    .max_w_full()
-                    .rounded_xl()
-                    .border_1()
-                    .border_color(theme::line())
-                    .bg(theme::raised())
-                    .p_5()
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::ink())
-                            .child(title.to_owned()),
-                    )
-                    .child(
-                        div()
-                            .mt_1()
-                            .text_sm()
-                            .text_color(theme::dim())
-                            .child(detail.to_owned()),
-                    )
-                    .child(
-                        div()
-                            .mt_4()
-                            .rounded_lg()
-                            .border_1()
-                            .border_color(theme::line())
-                            .bg(theme::background())
-                            .px_3()
-                            .py_2()
-                            .child(self.modal_input.clone()),
-                    )
-                    .children(extra)
-                    .child(
-                        div()
-                            .mt_5()
-                            .flex()
-                            .justify_end()
-                            .gap_2()
-                            .child(control_button(
-                                "Cancel",
-                                cx.listener(|this, _, window, cx| {
-                                    this.close_overlay(window, cx);
-                                }),
-                            ))
-                            .child(
-                                div()
-                                    .id("modal-submit")
-                                    .role(Role::Button)
-                                    .aria_label(action.to_owned())
-                                    .rounded_lg()
-                                    .bg(theme::accent_strong())
-                                    .px_4()
-                                    .py_2()
-                                    .text_sm()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(gpui::white())
-                                    .cursor_pointer()
-                                    .child(action.to_owned())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.generate(&Generate, window, cx)
-                                    })),
-                            ),
-                    ),
+                    .min_h_0()
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(field(&self.modal_input, window, cx))
+                    .children(self.render_edit_attachments(edit, cx)),
             )
-            .into_any_element()
+            .child(
+                footer()
+                    .child(
+                        chip("edit-attach", Icon::Paperclip, attach_label, !full)
+                            .tooltip(tip_with_shortcut(
+                                if full {
+                                    "Attachment limit reached"
+                                } else {
+                                    "Attach reference images"
+                                },
+                                Some(platform_shortcut("⌘O", "Ctrl+O")),
+                            ))
+                            .when(!full, |chip| {
+                                chip.on_click(cx.listener(|this, _, window, cx| {
+                                    this.add_attachment(&AddAttachment, window, cx)
+                                }))
+                            }),
+                    )
+                    .child(hint("↵ regenerate · ⇧↵ new line"))
+                    .child(
+                        button("modal-cancel", "Cancel", ButtonKind::Secondary).on_click(
+                            cx.listener(|this, _, window, cx| this.close_overlay(window, cx)),
+                        ),
+                    )
+                    .child(
+                        button("modal-submit", "Regenerate", ButtonKind::Primary)
+                            .when(!ready, |button| button.opacity(0.5))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.generate(&Generate, window, cx)
+                            })),
+                    ),
+            );
+        present(
+            scrim("edit-prompt-overlay").on_drop(cx.listener(
+                |this, dropped: &ExternalPaths, _, cx| {
+                    this.queue_attachments(dropped.paths().to_vec(), cx);
+                    cx.notify();
+                },
+            )),
+            panel,
+        )
+    }
+
+    pub(super) fn render_rename_board(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let panel = panel("rename-board", "Rename board", 420.)
+            .child(header(title("Rename board"), None, cx))
+            .child(div().p_4().child(field(&self.modal_input, window, cx)))
+            .child(
+                footer()
+                    .child(
+                        button("modal-cancel", "Cancel", ButtonKind::Secondary).on_click(
+                            cx.listener(|this, _, window, cx| this.close_overlay(window, cx)),
+                        ),
+                    )
+                    .child(
+                        button("modal-submit", "Rename", ButtonKind::Primary).on_click(
+                            cx.listener(|this, _, window, cx| this.generate(&Generate, window, cx)),
+                        ),
+                    ),
+            );
+        present(scrim("rename-board-overlay"), panel)
     }
 
     /// The full text and error message of one node, shown when its truncated
@@ -949,152 +944,71 @@ impl AppView {
             // The card would only offer this popup for one of the two, but a
             // stale click can race a refresh; degrade to a placeholder.
             .or_else(|| error.is_none().then(|| "No message was recorded.".into()));
-        let copy_text = text.clone();
-        let mut body = div()
-            .id("node-text-body")
-            .mt_3()
-            .max_h(px(420.))
-            .overflow_y_scroll()
-            .rounded_lg()
-            .border_1()
-            .border_color(theme::line())
-            .bg(theme::background())
-            .px_4()
-            .py_3()
-            .flex()
-            .flex_col()
-            .gap_3();
-        if let Some(error) = error {
-            body = body.child(div().text_sm().text_color(theme::danger()).child(error));
-        }
-        if let Some(text) = text {
-            body = body.child(div().text_sm().text_color(theme::ink()).child(text));
-        }
-        let mut buttons = div().mt_4().flex().justify_end().gap_2();
-        if let Some(copy_text) = copy_text {
-            buttons = buttons.child(control_button(
-                "Copy",
-                cx.listener(move |this, _, _, cx| {
+        let copy = text.clone().map(|copy_text| {
+            chip("copy-message", Icon::Copies, "Copy", true)
+                .h(px(28.))
+                .on_click(cx.listener(move |this, _, _, cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
                     this.show_toast("Message copied".into(), false, None, cx);
-                }),
-            ));
-        }
-        buttons = buttons.child(control_button(
-            "Close",
-            cx.listener(|this, _, window, cx| {
-                this.close_overlay(window, cx);
-            }),
-        ));
-        div()
-            .id("node-text-overlay")
-            .absolute()
-            .inset_0()
-            .bg(gpui::black().opacity(0.72))
-            .flex()
-            .items_center()
-            .justify_center()
-            .occlude()
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.close_overlay(window, cx);
-            }))
+                }))
+                .into_any_element()
+        });
+        let panel = panel("node-text-panel", "Codex message", 560.)
+            .child(header(title("Codex message"), copy, cx))
             .child(
                 div()
-                    .id("node-text-panel")
-                    .role(Role::Dialog)
-                    .aria_label("Codex message")
-                    .w(px(560.))
-                    .rounded_xl()
-                    .border_1()
-                    .border_color(theme::line())
-                    .bg(theme::raised())
-                    .p_5()
-                    .occlude()
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::ink())
-                            .child("Codex message"),
-                    )
-                    .child(body)
-                    .child(buttons),
-            )
-            .into_any_element()
+                    .id("node-text-body")
+                    .min_h_0()
+                    .max_h(px(460.))
+                    .overflow_y_scroll()
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .text_sm()
+                    .children(error.map(|error| div().text_color(theme::danger()).child(error)))
+                    .children(text.map(|text| div().text_color(theme::ink()).child(text))),
+            );
+        present(
+            scrim("node-text-overlay")
+                .on_click(cx.listener(|this, _, window, cx| this.close_overlay(window, cx))),
+            panel,
+        )
     }
 
     pub(super) fn render_quit_confirm(&self, cx: &mut Context<Self>) -> AnyElement {
-        let count = self.engine.active_count();
-        div()
-            .id("quit-confirm-overlay")
-            .absolute()
-            .inset_0()
-            .bg(gpui::black().opacity(0.72))
-            .flex()
-            .items_center()
-            .justify_center()
-            .occlude()
+        let running = match self.engine.active_count() {
+            1 => "1 generation is still running.".to_owned(),
+            count => format!("{count} generations are still running."),
+        };
+        let panel = panel("quit-confirm-dialog", "Quit while generating?", 420.)
+            .child(header(title("Quit while generating?"), None, cx))
             .child(
                 div()
-                    .id("quit-confirm-dialog")
-                    .w(px(480.))
-                    .role(Role::Dialog)
-                    .aria_label("Generations are still running")
-                    .rounded_xl()
-                    .border_1()
-                    .border_color(theme::line())
-                    .bg(theme::raised())
-                    .p_5()
-                    .child(
-                        div()
-                            .text_lg()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::ink())
-                            .child("Generations are still running"),
-                    )
-                    .child(
-                        div()
-                            .mt_2()
-                            .text_sm()
-                            .text_color(theme::dim())
-                            .child(format!(
-                                "{count} generation(s) are still running. Quitting will terminate them; images already received will be kept."
-                            )),
-                    )
-                    .child(
-                        div()
-                            .mt_5()
-                            .flex()
-                            .justify_end()
-                            .gap_2()
-                            .child(control_button(
-                                "Keep running",
-                                cx.listener(|this, _, window, cx| {
-                                    this.close_overlay(window, cx);
-                                }),
-                            ))
-                            .child(
-                                div()
-                                    .id("terminate-quit")
-                                    .role(Role::Button)
-                                    .aria_label("Terminate generations and quit")
-                                    .rounded_lg()
-                                    .bg(theme::danger().opacity(0.15))
-                                    .px_4()
-                                    .py_2()
-                                    .text_sm()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme::danger())
-                                    .cursor_pointer()
-                                    .child("Terminate and quit")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.engine.stop_all_for_quit();
-                                        cx.quit();
-                                    })),
-                            ),
-                    ),
+                    .p_4()
+                    .text_sm()
+                    .text_color(theme::dim())
+                    .child(format!(
+                        "{running} Quitting stops them; images already received are kept."
+                    )),
             )
-            .into_any_element()
+            .child(
+                footer()
+                    .child(
+                        button("keep-running", "Keep running", ButtonKind::Secondary).on_click(
+                            cx.listener(|this, _, window, cx| this.close_overlay(window, cx)),
+                        ),
+                    )
+                    .child(
+                        button("terminate-quit", "Stop and quit", ButtonKind::Danger).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.engine.stop_all_for_quit();
+                                cx.quit();
+                            }),
+                        ),
+                    ),
+            );
+        present(scrim("quit-confirm-overlay"), panel)
     }
 
     pub(super) fn render_toast(
@@ -1117,11 +1031,13 @@ impl AppView {
                 theme::line()
             })
             .bg(theme::raised().opacity(0.98))
-            .px_4()
-            .py_3()
+            .shadow_lg()
+            .pl_4()
+            .pr_2()
+            .py_2()
             .flex()
             .items_center()
-            .gap_3()
+            .gap_2()
             .occlude()
             .text_sm()
             .text_color(if toast.error {
@@ -1138,14 +1054,18 @@ impl AppView {
                     .id("undo")
                     .role(Role::Button)
                     .aria_label("Undo deletion")
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(theme::accent_strong())
-                    .px_3()
-                    .py_1()
+                    .h(px(26.))
+                    .px(px(10.))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .rounded_md()
+                    .bg(theme::accent_strong().opacity(0.18))
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
                     .text_color(theme::accent())
                     .cursor_pointer()
-                    .hover(|style| style.bg(theme::accent_strong().opacity(0.2)))
+                    .hover(|style| style.bg(theme::accent_strong().opacity(0.32)))
                     .child("Undo")
                     .on_click(cx.listener(move |this, _, _, cx| {
                         match this.engine.repository().undo_delete(&board_id, &undo_id) {
@@ -1164,13 +1084,16 @@ impl AppView {
                 .id("dismiss-toast")
                 .role(Role::Button)
                 .aria_label("Dismiss notification")
-                .px_1()
+                .size(px(22.))
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
                 .rounded_md()
-                .text_color(theme::faint())
                 .cursor_pointer()
-                .hover(|style| style.bg(theme::hover()).text_color(theme::ink()))
+                .hover(|style| style.bg(theme::hover()))
                 .tooltip(tip("Dismiss"))
-                .child("×")
+                .child(icon(Icon::X, 12.).text_color(theme::faint()))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.toast = None;
                     this.toast_task.take();

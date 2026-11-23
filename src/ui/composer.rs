@@ -141,26 +141,20 @@ pub(super) fn attachment_thumb(
                 .border_1()
                 .border_color(theme::line())
                 .bg(theme::background())
-                // The default line height is taller than the badge and would
-                // push the glyph off-centre, so it is pinned to the font size.
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_size(px(12.))
-                .line_height(px(12.))
-                .text_color(theme::dim())
                 .tooltip(tip("Remove attachment"))
-                .child("×")
-                .when(!removable, |remove| remove.text_color(theme::faint()))
+                .child(icon(Icon::X, 9.).text_color(if removable {
+                    theme::dim()
+                } else {
+                    theme::faint()
+                }))
                 .when(removable, |remove| {
                     // The badge overlaps the photo, so hover stays opaque.
                     remove
                         .cursor_pointer()
-                        .hover(|style| {
-                            style
-                                .border_color(theme::danger())
-                                .text_color(theme::danger())
-                        })
+                        .hover(|style| style.border_color(theme::danger()))
                         .on_click(on_remove)
                 }),
         )
@@ -223,41 +217,6 @@ pub(super) fn bar_divider() -> AnyElement {
         .h(px(20.))
         .mx(px(4.))
         .bg(theme::line())
-        .into_any_element()
-}
-
-pub(super) fn control_button(
-    label: impl Into<SharedString>,
-    listener: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
-) -> AnyElement {
-    let label = label.into();
-    div()
-        .id(label.clone())
-        .role(Role::Button)
-        .aria_label(label.clone())
-        .h(px(34.))
-        .px_3()
-        .flex()
-        .flex_none()
-        .items_center()
-        .justify_center()
-        .rounded_lg()
-        .border_1()
-        .border_color(theme::line())
-        .bg(theme::raised())
-        .text_sm()
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(theme::dim())
-        .cursor_pointer()
-        .hover(|style| {
-            style
-                .bg(theme::hover())
-                .border_color(theme::faint())
-                .text_color(theme::ink())
-        })
-        .active(|style| style.bg(theme::line()))
-        .child(label)
-        .on_click(listener)
         .into_any_element()
 }
 

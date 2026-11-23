@@ -7,6 +7,7 @@ mod card_scene;
 mod card_svg;
 mod chat;
 mod composer;
+mod dialog;
 mod format;
 mod icons;
 mod image_cache;

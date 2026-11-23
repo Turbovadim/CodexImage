@@ -15,6 +15,7 @@ pub enum Icon {
     Boards,
     Branch,
     Chat,
+    Check,
     ChevronDown,
     Compare,
     Copies,
@@ -37,12 +38,13 @@ pub enum Icon {
 }
 
 impl Icon {
-    const ALL: [Icon; 24] = [
+    const ALL: [Icon; 25] = [
         Icon::ArrowUp,
         Icon::AspectRatio,
         Icon::Boards,
         Icon::Branch,
         Icon::Chat,
+        Icon::Check,
         Icon::ChevronDown,
         Icon::Compare,
         Icon::Copies,
@@ -77,6 +79,7 @@ impl Icon {
             Icon::Sparkles => "icons/sparkles.svg",
             Icon::Branch => "icons/branch.svg",
             Icon::Chat => "icons/chat.svg",
+            Icon::Check => "icons/check.svg",
             Icon::Duplicate => "icons/duplicate.svg",
             Icon::Mix => "icons/mix.svg",
             Icon::Pencil => "icons/pencil.svg",
@@ -102,6 +105,7 @@ impl Icon {
             Icon::Boards => {
                 r#"<rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/>"#
             }
+            Icon::Check => r#"<path d="M20 6 9 17l-5-5"/>"#,
             Icon::ChevronDown => r#"<path d="m6 9 6 6 6-6"/>"#,
             Icon::Copies => {
                 r#"<rect x="8" y="8" width="13" height="13" rx="2"/><path d="M4 16a1 1 0 0 1-1-1V5a2 2 0 0 1 2-2h10a1 1 0 0 1 1 1"/>"#
