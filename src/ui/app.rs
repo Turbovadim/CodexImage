@@ -1177,14 +1177,8 @@ impl Render for AppView {
             .on_mouse_move(cx.listener(Self::mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
-            .can_drop(|value, _, _| value.downcast_ref::<ExternalPaths>().is_some())
-            .drag_over::<ExternalPaths>(|style, _, _, _| {
-                style.border_2().border_color(theme::accent())
-            })
-            .on_drop(cx.listener(|this, dropped: &ExternalPaths, _, cx| {
-                this.queue_attachments(dropped.paths().to_vec(), cx);
-                cx.notify();
-            }));
+            .drag_over::<ExternalPaths>(|style, _, _, _| style.border_2());
+        root = self.accept_attachment_drops(root, cx);
 
         if !overlay_covers_canvas {
             if !empty {

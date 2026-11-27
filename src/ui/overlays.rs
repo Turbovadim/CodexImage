@@ -15,9 +15,9 @@ use super::theme;
 use super::tooltip::{tip, tip_with_shortcut};
 use crate::model::{AttachmentEdit, BoardSummary, MAX_ATTACHMENTS};
 use gpui::{
-    Animation, AnimationExt, AnyElement, ClipboardItem, Context, Div, ExternalPaths, Focusable,
-    FontWeight, ObjectFit, Role, SharedString, StyledImage, WeakEntity, Window, div,
-    ease_out_quint, img, list, prelude::*, px,
+    Animation, AnimationExt, AnyElement, ClipboardItem, Context, Div, Focusable, FontWeight,
+    ObjectFit, Role, SharedString, StyledImage, WeakEntity, Window, div, ease_out_quint, img, list,
+    prelude::*, px,
 };
 use std::path::PathBuf;
 use std::time::Duration;
@@ -149,6 +149,7 @@ fn render_gallery_row(
             strip = strip.child(
                 div()
                     .relative()
+                    .flex()
                     .child(
                         img(image.thumbnail.clone())
                             .id(SharedString::from(format!(
@@ -897,13 +898,8 @@ impl AppView {
                     ),
             );
         present(
-            scrim("edit-prompt-overlay").on_drop(cx.listener(
-                |this, dropped: &ExternalPaths, _, cx| {
-                    this.queue_attachments(dropped.paths().to_vec(), cx);
-                    cx.notify();
-                },
-            )),
-            panel,
+            self.accept_attachment_drops(scrim("edit-prompt-overlay"), cx),
+            self.accept_attachment_drops(panel, cx),
         )
     }
 

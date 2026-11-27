@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub(super) const LINE_HEIGHT: f32 = 22.;
-const SINGLE_LINE_HEIGHT: f32 = 30.;
+pub(super) const SINGLE_LINE_HEIGHT: f32 = 30.;
 const MAX_UNDO_STATES: usize = 100;
 const UNDO_GROUP_INTERVAL: Duration = Duration::from_millis(750);
 
@@ -118,7 +118,6 @@ pub struct TextInput {
     pub(super) last_layout: Option<Arc<TextLayout>>,
     pub(super) layout_cache: Option<TextLayoutCache>,
     pub(super) last_bounds: Option<Bounds<Pixels>>,
-    pub(super) measured_visual_lines: usize,
     pub(super) scroll_x: f32,
     pub(super) scroll_y: f32,
     pub(super) vertical_inset: f32,
@@ -175,7 +174,6 @@ impl TextInput {
             last_layout: None,
             layout_cache: None,
             last_bounds: None,
-            measured_visual_lines: 1,
             scroll_x: 0.,
             scroll_y: 0.,
             vertical_inset: 0.,
@@ -236,7 +234,6 @@ impl TextInput {
         self.last_layout = None;
         self.layout_cache = None;
         self.last_bounds = None;
-        self.measured_visual_lines = 1;
         self.scroll_x = 0.;
         self.scroll_y = 0.;
         self.vertical_inset = 0.;
@@ -250,16 +247,6 @@ impl TextInput {
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.history_group = None;
-    }
-
-    pub(super) fn viewport_height(&self) -> f32 {
-        match self.mode {
-            TextInputMode::SingleLine => SINGLE_LINE_HEIGHT,
-            TextInputMode::AutoGrow { max_lines } => {
-                let lines = self.measured_visual_lines.clamp(1, max_lines.max(1));
-                (lines as f32 * LINE_HEIGHT).max(SINGLE_LINE_HEIGHT)
-            }
-        }
     }
 
     pub(super) fn snapshot(&self) -> InputSnapshot {
@@ -691,7 +678,9 @@ impl Render for TextInput {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_scroll(cx.listener(Self::scroll))
             .w_full()
-            .h(px(self.viewport_height()))
+            .when(!self.mode.is_multiline(), |input| {
+                input.h(px(SINGLE_LINE_HEIGHT))
+            })
             .line_height(px(LINE_HEIGHT))
             .text_size(px(14.))
             .text_color(theme::ink())
@@ -726,8 +715,6 @@ mod tests {
             input.set_content(text.to_owned(), cx);
             window.focus(&input.focus, cx);
         });
-        // The second pass lays the text out at its grown height.
-        redraw(cx);
         redraw(cx);
         (input, cx)
     }
@@ -788,6 +775,19 @@ mod tests {
             assert_eq!(input.caret(), row_end);
             input.move_cursor(&Move(Motion::LineStart), window, cx);
             assert_eq!(input.caret(), Caret::at(row_start));
+        });
+    }
+
+    #[gpui::test]
+    fn a_new_line_grows_the_editor_in_the_same_frame(cx: &mut TestAppContext) {
+        let (input, cx) = editor("first", TextInputMode::AutoGrow { max_lines: 12 }, cx);
+        input.update_in(cx, |input, window, cx| {
+            input.insert_newline(&InsertNewline, window, cx);
+        });
+        redraw(cx);
+        input.read_with(cx, |input, _| {
+            assert_eq!(input.last_bounds.unwrap().size.height, px(2. * LINE_HEIGHT));
+            assert_eq!(input.scroll_y, 0.);
         });
     }
 

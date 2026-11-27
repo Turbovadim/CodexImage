@@ -14,8 +14,9 @@ use crate::APP_NAME;
 use crate::model::NewNodesRequest;
 use anyhow::{Context as _, Result};
 use gpui::{
-    AnyElement, App, Context, Div, Focusable, FontWeight, Image, ImageFormat, ObjectFit,
-    PathPromptOptions, Role, SharedString, Stateful, StyledImage, Window, div, img, prelude::*, px,
+    AnyElement, App, Context, Div, ExternalPaths, Focusable, FontWeight, Image, ImageFormat,
+    ObjectFit, PathPromptOptions, Role, SharedString, Stateful, StyledImage, Window, div, img,
+    prelude::*, px,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -120,8 +121,11 @@ pub(super) fn attachment_thumb(
     removable: bool,
     on_remove: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
+    // A block parent lets the image's aspect ratio override its height; as a
+    // flex item it keeps the requested square.
     div()
         .relative()
+        .flex()
         .child(
             img(path)
                 .size(px(42.))
@@ -221,6 +225,23 @@ pub(super) fn bar_divider() -> AnyElement {
 }
 
 impl AppView {
+    /// Makes `target` take dropped files as attachments, outlined while a drag
+    /// hovers it. Occluding surfaces need this themselves: a drop only reaches
+    /// elements whose hitbox is hovered.
+    pub(super) fn accept_attachment_drops<E: InteractiveElement>(
+        &self,
+        target: E,
+        cx: &mut Context<Self>,
+    ) -> E {
+        target
+            .can_drop(|value, _, _| value.downcast_ref::<ExternalPaths>().is_some())
+            .drag_over::<ExternalPaths>(|style, _, _, _| style.border_color(theme::accent()))
+            .on_drop(cx.listener(|this, dropped: &ExternalPaths, _, cx| {
+                this.queue_attachments(dropped.paths().to_vec(), cx);
+                cx.notify();
+            }))
+    }
+
     pub(super) fn handle_input_event(&mut self, event: &TextInputEvent, cx: &mut Context<Self>) {
         match event {
             TextInputEvent::PastedImages(images) => {
@@ -546,6 +567,7 @@ impl AppView {
             .bg(theme::raised().opacity(0.97))
             .p_3()
             .occlude();
+        composer = self.accept_attachment_drops(composer, cx);
         for (index, target) in self.targets.iter().enumerate() {
             let cancel_id = target.node_id.clone();
             composer = composer.child(

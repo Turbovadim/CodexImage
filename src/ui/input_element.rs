@@ -1,12 +1,13 @@
 //! The custom element that shapes, scrolls, and paints the editor's text.
 
-use super::input::{LINE_HEIGHT, RevealKey, TextInput, TextInputMode};
+use super::input::{LINE_HEIGHT, RevealKey, SINGLE_LINE_HEIGHT, TextInput, TextInputMode};
 use super::input_layout::{TextLayout, selection_quads};
 use super::theme;
 use gpui::{
-    App, Bounds, ContentMask, DispatchPhase, Element, ElementId, ElementInputHandler, Entity, Font,
-    GlobalElementId, Hsla, LayoutId, MouseMoveEvent, PaintQuad, Pixels, Point, SharedString, Style,
-    TextRun, UnderlineStyle, Window, fill, point, px, relative, size,
+    App, AvailableSpace, Bounds, ContentMask, DispatchPhase, Element, ElementId,
+    ElementInputHandler, Entity, Font, GlobalElementId, Hsla, LayoutId, MouseMoveEvent, PaintQuad,
+    Pixels, Point, SharedString, Style, TextRun, TextStyle, UnderlineStyle, Window, fill, point,
+    px, relative, size,
 };
 use std::ops::Range;
 use std::sync::Arc;
@@ -69,8 +70,29 @@ impl Element for TextElement {
     ) -> (LayoutId, ()) {
         let mut style = Style::default();
         style.size.width = relative(1.).into();
-        style.size.height = relative(1.).into();
-        (window.request_layout(style, [], cx), ())
+        let TextInputMode::AutoGrow { max_lines } = self.input.read(cx).mode else {
+            style.size.height = relative(1.).into();
+            return (window.request_layout(style, [], cx), ());
+        };
+        // Measured during layout so a new line grows the editor in the same
+        // frame it appears. The text style is captured now because the style
+        // stack is gone by the time layout runs.
+        let text_style = window.text_style();
+        let input = self.input.clone();
+        let layout_id =
+            window.request_measured_layout(style, move |known, available, window, cx| {
+                let width = known.width.or(match available.width {
+                    AvailableSpace::Definite(width) => Some(width),
+                    _ => None,
+                });
+                let (_, layout) = shape(input.read(cx), &text_style, width, window);
+                let lines = layout.visual_line_count.min(max_lines.max(1));
+                size(
+                    width.unwrap_or(layout.max_width),
+                    px((lines as f32 * LINE_HEIGHT).max(SINGLE_LINE_HEIGHT)),
+                )
+            });
+        (layout_id, ())
     }
 
     fn prepaint(
@@ -83,11 +105,9 @@ impl Element for TextElement {
         cx: &mut App,
     ) -> Prepaint {
         let input = self.input.read(cx);
-        let style = window.text_style();
         let content = input.content.clone();
         let selected = input.selected.clone();
         let cursor = input.caret();
-        let marked = input.marked.clone();
         let mode = input.mode;
         let focused = input.focus.is_focused(window);
         let draws_caret = input.draws_caret(window);
@@ -96,74 +116,12 @@ impl Element for TextElement {
         let previous_scroll_x = input.scroll_x;
         let previous_scroll_y = input.scroll_y;
         let previously_revealed = input.revealed;
-        let placeholder = input.placeholder.clone();
-
-        let is_placeholder = content.is_empty();
-        let (display_text, color) = if is_placeholder {
-            (placeholder, theme::faint())
-        } else {
-            (content.clone(), style.color)
-        };
-        let font_size = style.font_size.to_pixels(window.rem_size());
-        let shape_key = TextShapeKey {
-            display_text: display_text.clone(),
-            is_placeholder,
-            marked: marked.clone(),
-            mode,
-            wrap_width: mode.is_multiline().then_some(bounds.size.width),
-            font: style.font(),
-            font_size,
-            color,
-        };
-        let layout = input
-            .layout_cache
-            .as_ref()
-            .filter(|cache| cache.key == shape_key)
-            .map(|cache| Arc::clone(&cache.layout))
-            .unwrap_or_else(|| {
-                let base = TextRun {
-                    len: display_text.len(),
-                    font: shape_key.font.clone(),
-                    color,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                };
-                let marked = marked.clone().filter(|_| !is_placeholder);
-                let runs: Vec<TextRun> = match marked {
-                    Some(marked) => [
-                        TextRun {
-                            len: marked.start,
-                            ..base.clone()
-                        },
-                        TextRun {
-                            len: marked.len(),
-                            underline: Some(UnderlineStyle {
-                                color: Some(color),
-                                thickness: px(1.),
-                                wavy: false,
-                            }),
-                            ..base.clone()
-                        },
-                        TextRun {
-                            len: display_text.len() - marked.end,
-                            ..base
-                        },
-                    ]
-                    .into_iter()
-                    .filter(|run| run.len > 0)
-                    .collect(),
-                    None => vec![base],
-                };
-                let shaped = window
-                    .text_system()
-                    .shape_text(display_text, font_size, &runs, shape_key.wrap_width, None)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect();
-                let logical_content = if is_placeholder { "" } else { &content };
-                Arc::new(TextLayout::new(shaped, logical_content, px(LINE_HEIGHT)))
-            });
+        let (shape_key, layout) = shape(
+            input,
+            &window.text_style(),
+            mode.is_multiline().then_some(bounds.size.width),
+            window,
+        );
         let viewport_width = f32::from(bounds.size.width).max(0.);
         let viewport_height = f32::from(bounds.size.height).max(0.);
         let total_height = f32::from(layout.total_height);
@@ -301,11 +259,10 @@ impl Element for TextElement {
             }
             paint_scrollbar(bounds, prepaint, window);
         });
-        let grew = self.input.update(cx, |input, cx| {
+        self.input.update(cx, |input, cx| {
             if prepaint.restart_blink {
                 input.restart_caret_blink(window, cx);
             }
-            let height_changed = input.measured_visual_lines != prepaint.layout.visual_line_count;
             input.last_layout = Some(prepaint.layout.clone());
             if input
                 .layout_cache
@@ -318,19 +275,86 @@ impl Element for TextElement {
                 });
             }
             input.last_bounds = Some(bounds);
-            input.measured_visual_lines = prepaint.layout.visual_line_count;
             input.scroll_x = prepaint.scroll_x;
             input.scroll_y = prepaint.scroll_y;
             input.vertical_inset = prepaint.vertical_inset;
             input.revealed = prepaint.revealed;
-            height_changed && matches!(input.mode, TextInputMode::AutoGrow { .. })
         });
-        // A notify issued mid-paint marks the view dirty without scheduling a
-        // frame, so the new height would wait for the next input event.
-        if grew {
-            window.request_animation_frame();
-        }
     }
+}
+
+/// Shapes what the editor shows, the content or its placeholder, wrapped to
+/// `wrap_width`. Reuses the last painted layout when nothing it depends on
+/// changed.
+fn shape(
+    input: &TextInput,
+    style: &TextStyle,
+    wrap_width: Option<Pixels>,
+    window: &Window,
+) -> (TextShapeKey, Arc<TextLayout>) {
+    let is_placeholder = input.content.is_empty();
+    let (display_text, color) = if is_placeholder {
+        (input.placeholder.clone(), theme::faint())
+    } else {
+        (input.content.clone(), style.color)
+    };
+    let font_size = style.font_size.to_pixels(window.rem_size());
+    let key = TextShapeKey {
+        display_text: display_text.clone(),
+        is_placeholder,
+        marked: input.marked.clone(),
+        mode: input.mode,
+        wrap_width,
+        font: style.font(),
+        font_size,
+        color,
+    };
+    if let Some(cache) = input.layout_cache.as_ref().filter(|cache| cache.key == key) {
+        return (key, Arc::clone(&cache.layout));
+    }
+    let base = TextRun {
+        len: display_text.len(),
+        font: key.font.clone(),
+        color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let marked = key.marked.clone().filter(|_| !is_placeholder);
+    let runs: Vec<TextRun> = match marked {
+        Some(marked) => [
+            TextRun {
+                len: marked.start,
+                ..base.clone()
+            },
+            TextRun {
+                len: marked.len(),
+                underline: Some(UnderlineStyle {
+                    color: Some(color),
+                    thickness: px(1.),
+                    wavy: false,
+                }),
+                ..base.clone()
+            },
+            TextRun {
+                len: display_text.len() - marked.end,
+                ..base
+            },
+        ]
+        .into_iter()
+        .filter(|run| run.len > 0)
+        .collect(),
+        None => vec![base],
+    };
+    let shaped = window
+        .text_system()
+        .shape_text(display_text, font_size, &runs, wrap_width, None)
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let logical_content = if is_placeholder { "" } else { &input.content };
+    let layout = Arc::new(TextLayout::new(shaped, logical_content, px(LINE_HEIGHT)));
+    (key, layout)
 }
 
 /// A slim thumb on the right edge that shows where the viewport sits in a
